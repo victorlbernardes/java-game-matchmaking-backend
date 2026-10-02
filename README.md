@@ -1,8 +1,8 @@
 # game-matchmaking-backend
 
-Backend de matchmaking para jogos multiplayer — monorepo Maven (modular), Java 21, Eclipse Vert.x.
+Backend for matchmaking multiplayer games — modular Maven monorepo, Java 21, Eclipse Vert.x.
 
-## Estrutura
+## Structure
 
 ```
 ├── common/           # common-domain, common-proto, common-redis, common-events
@@ -11,20 +11,20 @@ Backend de matchmaking para jogos multiplayer — monorepo Maven (modular), Java
 └── docker-compose.yml
 ```
 
-## Build e teste
+## Build and test
 
 ```bash
 mvn -B verify
 ```
 
-## Infraestrutura local
+## Local infrastructure
 
 ```bash
 docker compose up -d
 ```
 
-## Documentação
+## Documentation
 
-O vault em `/Users/victor/Projects/AI/OpenCode/Marchmaking/obsidian` é a fonte de verdade
-para escopo, domínio, contrato da API e roadmap. O `AGENTS.md` descreve as convenções
-(código em inglês, enums para estados, domínio puro, sem dependências cruzadas entre serviços).
+The vault at `/Users/victor/Projects/AI/OpenCode/Marchmaking/obsidian` is the source of truth
+for scope, domain, API contract, and roadmap. `AGENTS.md` describes the conventions
+(English code, enums for states, pure domain, no cross-service dependencies).
