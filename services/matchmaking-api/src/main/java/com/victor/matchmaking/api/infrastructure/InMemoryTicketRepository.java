@@ -7,7 +7,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import com.victor.matchmaking.api.application.TicketRepository;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 
-/** In-memory ticket store. Temporary until Redis arrives in W3. */
+import io.vertx.core.Future;
+
+/** In-memory ticket store. Temporary until Redis is wired in tests/dev. */
 public final class InMemoryTicketRepository implements TicketRepository {
 
     private static final int TICKET_ID_LENGTH = 8;
@@ -16,22 +18,23 @@ public final class InMemoryTicketRepository implements TicketRepository {
     private final ConcurrentHashMap<String, String> idempotencyIndex = new ConcurrentHashMap<>();
 
     @Override
-    public MatchmakingTicket findById(String ticketId) {
-        return ticketsById.get(ticketId);
+    public Future<MatchmakingTicket> findById(String ticketId) {
+        return Future.succeededFuture(ticketsById.get(ticketId));
     }
 
     @Override
-    public MatchmakingTicket findByIdempotencyKey(String key) {
+    public Future<MatchmakingTicket> findByIdempotencyKey(String key) {
         String ticketId = idempotencyIndex.get(key);
-        return ticketId != null ? ticketsById.get(ticketId) : null;
+        return Future.succeededFuture(ticketId != null ? ticketsById.get(ticketId) : null);
     }
 
     @Override
-    public void save(String idempotencyKey, MatchmakingTicket ticket) {
+    public Future<Void> save(String idempotencyKey, MatchmakingTicket ticket) {
         ticketsById.put(ticket.id(), ticket);
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
             idempotencyIndex.put(idempotencyKey, ticket.id());
         }
+        return Future.succeededFuture();
     }
 
     @Override

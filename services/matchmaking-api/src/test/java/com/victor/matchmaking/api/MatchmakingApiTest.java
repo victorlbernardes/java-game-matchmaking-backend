@@ -132,6 +132,34 @@ class MatchmakingApiTest {
     }
 
     @Test
+    void deleteTicketCancelsAndSecondDeleteReturns409() throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+        String token = issueToken("player-9");
+        HttpResponse<String> created = client.send(HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"gameMode\":\"5v5\",\"region\":\"EU\",\"maxLatencyMs\":40}"))
+                .header("Authorization", "Bearer " + token)
+                .header("content-type", "application/json").build(),
+                HttpResponse.BodyHandlers.ofString());
+        String id = new JsonObject(created.body()).getString("ticketId");
+
+        HttpResponse<String> cancelled = client.send(HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets/" + id))
+                .DELETE()
+                .header("Authorization", "Bearer " + token).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, cancelled.statusCode());
+        assertEquals("CANCELLED", new JsonObject(cancelled.body()).getString("status"));
+
+        HttpResponse<String> again = client.send(HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets/" + id))
+                .DELETE()
+                .header("Authorization", "Bearer " + token).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(409, again.statusCode());
+    }
+
+    @Test
     void createTicketWithoutTokenReturns401() throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         HttpResponse<String> response = client.send(HttpRequest.newBuilder()

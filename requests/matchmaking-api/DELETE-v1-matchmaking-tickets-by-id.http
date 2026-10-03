@@ -1,0 +1,26 @@
+### DELETE /v1/matchmaking/tickets/{ticketId} — cancel a search
+###
+### When to use: when the player gives up searching for a match. Only accepted
+### while the ticket is SEARCHING and belongs to the authenticated player —
+### otherwise 409 or 403. The ticket is marked CANCELLED and removed from the
+### Redis queue.
+###
+### How to use: run POST /v1/matchmaking/tickets first (captures `ticketId`),
+### then run the request below.
+###
+### Expected: 200 with the ticket JSON (status: "CANCELLED").
+### Error cases: unknown id → 404; other player's ticket → 403; not SEARCHING → 409.
+
+@apiBaseUrl = http://localhost:8080
+
+### Happy path — expect 200 with status CANCELLED
+DELETE {{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}
+Authorization: Bearer {{token}}
+
+### Error case — second cancel → expect 409
+DELETE {{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}
+Authorization: Bearer {{token}}
+
+### Error case — unknown id → expect 404
+DELETE {{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist
+Authorization: Bearer {{token}}

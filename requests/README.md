@@ -9,7 +9,7 @@ change an endpoint, update the matching `.http` file in the same change.
 ```
 requests/
 ├── auth-service/       # POST /v1/auth/login, GET /.well-known/jwks.json
-└── matchmaking-api/    # GET /health, POST/GET /v1/matchmaking/tickets
+└── matchmaking-api/    # GET /health, POST/GET/DELETE /v1/matchmaking/tickets
 ```
 
 Each `.http` file starts with a comment block explaining **when** to use the

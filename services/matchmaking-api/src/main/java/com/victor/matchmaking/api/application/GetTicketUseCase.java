@@ -2,6 +2,8 @@ package com.victor.matchmaking.api.application;
 
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 
+import io.vertx.core.Future;
+
 /** Fetches a ticket, enforcing ownership. */
 public final class GetTicketUseCase {
 
@@ -11,15 +13,16 @@ public final class GetTicketUseCase {
         this.repository = repository;
     }
 
-    public MatchmakingTicket execute(String ticketId, String playerId) {
-        MatchmakingTicket ticket = repository.findById(ticketId);
-        if (ticket == null) {
-            throw new TicketNotFoundException("ticket not found");
-        }
-        if (!ticket.playerId().equals(playerId)) {
-            throw new TicketForbiddenException("ticket belongs to another player");
-        }
-        return ticket;
+    public Future<MatchmakingTicket> execute(String ticketId, String playerId) {
+        return repository.findById(ticketId).map(ticket -> {
+            if (ticket == null) {
+                throw new TicketNotFoundException("ticket not found");
+            }
+            if (!ticket.playerId().equals(playerId)) {
+                throw new TicketForbiddenException("ticket belongs to another player");
+            }
+            return ticket;
+        });
     }
 
     public static final class TicketNotFoundException extends RuntimeException {

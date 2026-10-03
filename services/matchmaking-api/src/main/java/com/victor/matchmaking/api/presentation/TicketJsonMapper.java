@@ -1,6 +1,11 @@
 package com.victor.matchmaking.api.presentation;
 
+import java.time.Instant;
+
+import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
+import com.victor.matchmaking.domain.ticket.Region;
+import com.victor.matchmaking.domain.ticket.TicketState;
 
 import io.vertx.core.json.JsonObject;
 
@@ -23,7 +28,31 @@ public final class TicketJsonMapper {
                 .put("maxLatencyMs", ticket.maxLatencyMs())
                 .put("queuedAt", ticket.queuedAt().toString())
                 .put("skill", ticket.skill())
+                .put("version", ticket.version())
                 .put("searchRange", searchRange(ticket.skill()));
+    }
+
+    /** Deserializes the JSON stored in Redis back into the domain record. */
+    public static MatchmakingTicket fromJson(JsonObject json) {
+        return new MatchmakingTicket(
+                json.getString("ticketId"),
+                json.getString("playerId"),
+                parseGameMode(json.getString("gameMode")),
+                Region.valueOf(json.getString("region")),
+                json.getInteger("maxLatencyMs"),
+                json.getInteger("skill"),
+                Instant.parse(json.getString("queuedAt")),
+                TicketState.valueOf(json.getString("status")),
+                json.getInteger("version", 0));
+    }
+
+    private static GameMode parseGameMode(String label) {
+        for (GameMode mode : GameMode.values()) {
+            if (mode.label().equals(label)) {
+                return mode;
+            }
+        }
+        throw new IllegalArgumentException("unknown gameMode label: " + label);
     }
 
     public static JsonObject toCreateResponse(MatchmakingTicket ticket) {

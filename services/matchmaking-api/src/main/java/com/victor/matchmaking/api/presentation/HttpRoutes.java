@@ -1,5 +1,6 @@
 package com.victor.matchmaking.api.presentation;
 
+import com.victor.matchmaking.api.application.CancelTicketUseCase;
 import com.victor.matchmaking.api.application.CreateTicketCommand;
 import com.victor.matchmaking.api.application.CreateTicketUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
@@ -20,9 +21,13 @@ public final class HttpRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth) {
-        TicketRepository repository = new InMemoryTicketRepository();
+        return createRouter(vertx, jwtAuth, new InMemoryTicketRepository());
+    }
+
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
         CreateTicketUseCase createTicket = new CreateTicketUseCase(repository);
         GetTicketUseCase getTicket = new GetTicketUseCase(repository);
+        CancelTicketUseCase cancelTicket = new CancelTicketUseCase(repository);
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
@@ -36,33 +41,29 @@ public final class HttpRoutes {
                     try {
                         CreateTicketCommand command = TicketRequestParser.parseCreate(
                                 ctx.body() != null ? ctx.body().asJsonObject() : null);
-                        CreateTicketUseCase.Result result = createTicket.execute(user.subject(), command,
-                                ctx.request().getHeader("Idempotency-Key"));
-                        if (!result.created()) {
-                            ctx.response().putHeader("content-type", "application/json")
-                                    .end(TicketJsonMapper.toJson(result.ticket()).encode());
-                            return;
-                        }
-                        ctx.response().setStatusCode(201)
-                                .putHeader("content-type", "application/json")
-                                .end(TicketJsonMapper.toCreateResponse(result.ticket()).encode());
+                        createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
+                                .onSuccess(result -> {
+                                    if (!result.created()) {
+                                        respond(ctx, 200, TicketJsonMapper.toJson(result.ticket()));
+                                        return;
+                                    }
+                                    respond(ctx, 201, TicketJsonMapper.toCreateResponse(result.ticket()));
+                                })
+                                .onFailure(err -> fail(ctx, 500, err.getMessage()));
                     } catch (IllegalArgumentException e) {
                         fail(ctx, 400, e.getMessage());
                     }
                 }));
 
         router.get("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
-                authenticate(ctx, jwtAuth, user -> {
-                    try {
-                        var ticket = getTicket.execute(ctx.pathParam("ticketId"), user.subject());
-                        ctx.response().putHeader("content-type", "application/json")
-                                .end(TicketJsonMapper.toJson(ticket).encode());
-                    } catch (GetTicketUseCase.TicketNotFoundException e) {
-                        fail(ctx, 404, e.getMessage());
-                    } catch (GetTicketUseCase.TicketForbiddenException e) {
-                        fail(ctx, 403, e.getMessage());
-                    }
-                }));
+                authenticate(ctx, jwtAuth, user -> getTicket.execute(ctx.pathParam("ticketId"), user.subject())
+                        .onSuccess(ticket -> respond(ctx, 200, TicketJsonMapper.toJson(ticket)))
+                        .onFailure(err -> failWithDomainError(ctx, err))));
+
+        router.delete("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> cancelTicket.execute(ctx.pathParam("ticketId"), user.subject())
+                        .onSuccess(ticket -> respond(ctx, 200, TicketJsonMapper.toJson(ticket)))
+                        .onFailure(err -> failWithDomainError(ctx, err))));
 
         return router;
     }
@@ -78,6 +79,24 @@ public final class HttpRoutes {
         jwtAuth.authenticate(new TokenCredentials(token))
                 .onSuccess(onAuthorized::accept)
                 .onFailure(err -> fail(ctx, 401, "invalid token: " + err.getMessage()));
+    }
+
+    private static void failWithDomainError(RoutingContext ctx, Throwable err) {
+        if (err instanceof GetTicketUseCase.TicketNotFoundException) {
+            fail(ctx, 404, err.getMessage());
+        } else if (err instanceof GetTicketUseCase.TicketForbiddenException) {
+            fail(ctx, 403, err.getMessage());
+        } else if (err instanceof CancelTicketUseCase.TicketConflictException) {
+            fail(ctx, 409, err.getMessage());
+        } else {
+            fail(ctx, 500, err.getMessage());
+        }
+    }
+
+    private static void respond(RoutingContext ctx, int statusCode, io.vertx.core.json.JsonObject body) {
+        ctx.response().setStatusCode(statusCode)
+                .putHeader("content-type", "application/json")
+                .end(body.encode());
     }
 
     private static void fail(RoutingContext ctx, int statusCode, String message) {
