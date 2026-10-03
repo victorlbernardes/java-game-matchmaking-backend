@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.ticket;
 
 /** Supported game modes. The wire label matches the API contract (e.g. "5v5"). */
 public enum GameMode {

@@ -29,3 +29,6 @@ target/
 # IntelliJ IDEA
 .idea/
 *.iml
+
+# Obsidian
+.obsidian

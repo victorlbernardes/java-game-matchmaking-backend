@@ -1,0 +1,27 @@
+### GET /v1/matchmaking/tickets/{ticketId} — fetch ticket status
+###
+### When to use: to poll the current state of a matchmaking ticket (status,
+### skill, searchRange). Requires a Bearer token; the ticket must belong to the
+### authenticated player.
+###
+### How to use: run POST /v1/matchmaking/tickets first (captures `ticketId`),
+### then run the request below.
+###
+### Expected: 200 with the ticket JSON.
+### Error cases: unknown id → 404; ticket owned by another player → 403.
+
+@apiBaseUrl = http://localhost:8080
+
+### Happy path — expect 200
+GET {{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}
+Authorization: Bearer {{token}}
+
+### Error case — unknown id → expect 404
+GET {{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist
+Authorization: Bearer {{token}}
+
+### Error case — ticket of another player → expect 403
+### (log in as a different playerId in auth-service and use that token,
+### querying a ticketId created by player-1)
+GET {{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}
+Authorization: Bearer {{token}}

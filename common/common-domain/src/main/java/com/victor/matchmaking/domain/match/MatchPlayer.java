@@ -1,4 +1,6 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.match;
+
+import com.victor.matchmaking.domain.player.Player;
 
 /** Relates a player to a match. */
 public record MatchPlayer(String matchId, String playerId, String team, int skillAtMatch) {

@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.ticket;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
@@ -8,6 +8,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+
+import com.victor.matchmaking.domain.match.Match;
+import com.victor.matchmaking.domain.match.MatchPlayer;
+import com.victor.matchmaking.domain.match.MatchStatus;
+import com.victor.matchmaking.domain.player.Party;
+import com.victor.matchmaking.domain.player.Player;
 
 /**
  * Verifies common-domain stays framework-free: compiled classes must not reference

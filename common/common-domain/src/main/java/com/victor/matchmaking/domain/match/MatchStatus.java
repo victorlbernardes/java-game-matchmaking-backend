@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.match;
 
 /** Match lifecycle states. */
 public enum MatchStatus {

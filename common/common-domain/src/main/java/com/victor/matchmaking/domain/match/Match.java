@@ -1,6 +1,9 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.match;
 
 import java.time.Instant;
+
+import com.victor.matchmaking.domain.ticket.GameMode;
+import com.victor.matchmaking.domain.ticket.Region;
 
 /** A match created by the matchmaker. */
 public record Match(

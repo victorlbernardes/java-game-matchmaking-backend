@@ -7,6 +7,7 @@ Backend for matchmaking multiplayer games — modular Maven monorepo, Java 21, E
 ```
 ├── common/           # common-domain, common-proto, common-redis, common-events
 ├── services/         # matchmaking-api, matchmaking-engine, auth-service, skill-service, match-orchestrator
+├── requests/         # .http collections per service to test every endpoint manually
 ├── docs/adr/         # Architecture Decision Records
 └── docker-compose.yml
 ```
@@ -16,6 +17,9 @@ Backend for matchmaking multiplayer games — modular Maven monorepo, Java 21, E
 ```bash
 mvn -B verify
 ```
+
+Every endpoint must be covered by unit/integration tests **and** by a runnable
+HTTP request in `requests/` — see `requests/README.md`.
 
 ## Local infrastructure
 

@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.player;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;

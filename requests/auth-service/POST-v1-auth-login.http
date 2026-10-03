@@ -1,0 +1,33 @@
+### POST /v1/auth/login — issue a session token
+###
+### When to use: whenever you need a JWT to call protected endpoints
+### (matchmaking-api). In dev, the login auto-provisions the player — there is
+### no separate registration endpoint.
+###
+### How to use:
+###   1. Start auth-service:
+###      mvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication
+###   2. Run the "happy path" request below.
+###   3. The response token is captured into the `token` client variable,
+###      used by the matchmaking-api requests.
+###
+### Expected: 200 with { "token": "...", "expiresIn": 3600 }.
+### Error case: missing/blank playerId returns 400.
+
+@authBaseUrl = http://localhost:8081
+
+### Happy path — expect 200
+POST {{authBaseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{
+  "playerId": "player-1"
+}
+
+> {% client.global.set("token", response.body.token); %}
+
+### Error case — expect 400
+POST {{authBaseUrl}}/v1/auth/login
+Content-Type: application/json
+
+{}

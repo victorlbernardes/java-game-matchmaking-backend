@@ -1,6 +1,9 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.ticket;
+
 
 import java.time.Instant;
+
+import com.victor.matchmaking.domain.player.Player;
 
 /** A matchmaking request. `status` always starts as SEARCHING. */
 public record MatchmakingTicket(

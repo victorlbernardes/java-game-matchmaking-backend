@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.ticket;
 
 import java.util.Map;
 import java.util.Set;

@@ -1,4 +1,4 @@
-package com.victor.matchmaking.domain;
+package com.victor.matchmaking.domain.ticket;
 
 /** Error thrown when a ticket state transition is not allowed. */
 public class InvalidStateTransitionException extends RuntimeException {

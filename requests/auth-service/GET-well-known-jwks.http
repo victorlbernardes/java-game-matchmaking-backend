@@ -1,0 +1,13 @@
+### GET /.well-known/jwks.json — public keys for offline JWT validation
+###
+### When to use: to inspect which public key auth-service uses to sign tokens,
+### and to confirm what matchmaking-api fetches on startup. You normally only
+### run this for troubleshooting auth issues — matchmaking-api reads it
+### automatically.
+###
+### How to use: start auth-service, then run the request below.
+### Expected: 200 with { "keys": [ { "kty": "RSA", "alg": "RS256", "kid": ... } ] }.
+
+@authBaseUrl = http://localhost:8081
+
+GET {{authBaseUrl}}/.well-known/jwks.json

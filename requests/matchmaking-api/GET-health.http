@@ -1,0 +1,11 @@
+### GET /health — liveness probe
+###
+### When to use: to confirm matchmaking-api is up before running any other
+### request, or as a healthcheck in scripts/monitoring.
+###
+### How to use: start matchmaking-api, then run the request below.
+### Expected: 200 with { "status": "UP" }. No authentication required.
+
+@apiBaseUrl = http://localhost:8080
+
+GET {{apiBaseUrl}}/health
