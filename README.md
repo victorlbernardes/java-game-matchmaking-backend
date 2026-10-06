@@ -5,7 +5,7 @@ Backend for matchmaking multiplayer games — modular Maven monorepo, Java 21, E
 ## Structure
 
 ```
-├── common/           # common-domain, common-proto, common-redis, common-events
+├── common/           # common-domain, common-proto, common-redis, common-events, common-db
 ├── services/         # matchmaking-api, matchmaking-engine, auth-service, skill-service, match-orchestrator
 ├── requests/         # .http collections per service to test every endpoint manually
 ├── docs/adr/         # Architecture Decision Records

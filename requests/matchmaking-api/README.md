@@ -19,6 +19,7 @@ mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaki
 | `POST-v1-matchmaking-tickets.http` | `POST /v1/matchmaking/tickets` | Create ticket; idempotency; 400/401 cases |
 | `GET-v1-matchmaking-tickets-by-id.http` | `GET /v1/matchmaking/tickets/{id}` | Fetch ticket; 403/404 cases |
 | `DELETE-v1-matchmaking-tickets-by-id.http` | `DELETE /v1/matchmaking/tickets/{id}` | Cancel; 403/404/409 cases |
+| `GET-v1-players-playerId-matches.http` | `GET /v1/players/{playerId}/matches` | Cursor-paginated history |
 | `WS-v1-ws.http` | `WS /v1/ws` | Push channel; IntelliJ-only (see below) |
 
 ## WebSocket (`GET /v1/ws`)

@@ -4,6 +4,7 @@ import com.victor.matchmaking.api.application.CancelTicketUseCase;
 import com.victor.matchmaking.api.application.CreateTicketCommand;
 import com.victor.matchmaking.api.application.CreateTicketUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
+import com.victor.matchmaking.db.MatchRepository;
 import com.victor.matchmaking.redis.TicketRepository;
 import com.victor.matchmaking.api.infrastructure.InMemoryTicketRepository;
 import com.victor.matchmaking.redis.TicketCodec;
@@ -28,7 +29,7 @@ public final class HttpRoutes {
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
         return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository), new WsHub(null));
+                new CancelTicketUseCase(repository), new WsHub(null), null);
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, RedisPublisher publisher) {
@@ -36,17 +37,24 @@ public final class HttpRoutes {
         GetTicketUseCase getTicket = new GetTicketUseCase(repository);
         CancelTicketUseCase cancelTicket = new CancelTicketUseCase(repository);
         WsHub wsHub = new WsHub(publisher);
-        return buildRouter(vertx, jwtAuth, createTicket, getTicket, cancelTicket, wsHub);
+        return buildRouter(vertx, jwtAuth, createTicket, getTicket, cancelTicket, wsHub, null);
     }
 
     /** Full injection used by main: caller keeps the WsHub to route Pub/Sub notifications. */
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub) {
         return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository), wsHub);
+                new CancelTicketUseCase(repository), wsHub, null);
+    }
+
+    /** Full injection used by main when history is backed by PostgreSQL. */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+            MatchRepository matchRepository) {
+        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
+                new CancelTicketUseCase(repository), wsHub, matchRepository);
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
-            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub) {
+            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub, MatchRepository matchRepository) {
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
@@ -104,6 +112,39 @@ public final class HttpRoutes {
                 authenticate(ctx, jwtAuth, user -> cancelTicket.execute(ctx.pathParam("ticketId"), user.subject())
                         .onSuccess(ticket -> respond(ctx, 200, TicketCodec.toJson(ticket)))
                         .onFailure(err -> failWithDomainError(ctx, err))));
+
+        router.get("/v1/players/:playerId/matches").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> {
+                    if (!ctx.pathParam("playerId").equals(user.subject())) {
+                        fail(ctx, 403, "history belongs to another player");
+                        return;
+                    }
+                    if (matchRepository == null) {
+                        fail(ctx, 503, "history store unavailable");
+                        return;
+                    }
+                    int limit;
+                    try {
+                        String limitParam = ctx.request().getParam("limit");
+                        limit = limitParam == null || limitParam.isBlank() ? 20 : Integer.parseInt(limitParam);
+                        if (limit < 1 || limit > 100) {
+                            fail(ctx, 400, "limit must be between 1 and 100");
+                            return;
+                        }
+                    } catch (NumberFormatException e) {
+                        fail(ctx, 400, "limit must be a number");
+                        return;
+                    }
+                    String cursorParam = ctx.request().getParam("cursor");
+                    try {
+                        // cursor is validated by the repository's codec
+                        matchRepository.historyForPlayer(user.subject(), cursorParam, limit)
+                                .onSuccess(page -> respond(ctx, 200, page.toJson()))
+                                .onFailure(err -> fail(ctx, 500, "history store error: " + err.getMessage()));
+                    } catch (IllegalArgumentException e) {
+                        fail(ctx, 400, e.getMessage());
+                    }
+                }));
 
         return router;
     }

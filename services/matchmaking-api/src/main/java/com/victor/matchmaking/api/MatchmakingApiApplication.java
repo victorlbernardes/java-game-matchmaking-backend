@@ -38,11 +38,15 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);
         com.victor.matchmaking.api.presentation.WsHub wsHub =
                 new com.victor.matchmaking.api.presentation.WsHub(publisher);
+        com.victor.matchmaking.db.DatabaseConfig dbConfig = com.victor.matchmaking.db.DatabaseConfig.fromEnv();
+        com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
+        com.victor.matchmaking.db.MatchRepository matchRepository =
+                com.victor.matchmaking.db.MatchRepository.connect(vertx, dbConfig);
         com.victor.matchmaking.redis.RedisSubscriber.subscribe(vertx, redisUri,
                 com.victor.matchmaking.redis.RedisKeys.CHANNEL_PLAYER_NOTIFICATIONS,
                 msg -> wsHub.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
         JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().addJwk(fetchPublicJwk(jwksUrl)));
-        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub);
+        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository);
 
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)

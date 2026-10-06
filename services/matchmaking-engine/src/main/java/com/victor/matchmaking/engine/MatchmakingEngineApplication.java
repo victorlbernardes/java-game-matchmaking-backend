@@ -1,6 +1,7 @@
 package com.victor.matchmaking.engine;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -48,9 +49,13 @@ public final class MatchmakingEngineApplication {
         PendingMatchStore pending = new RedisPendingMatchStore(redis);
         RedisPublisher publisher = new RedisPublisher(redis);
         RedisPlayerNotifier notifier = new RedisPlayerNotifier(publisher);
+        com.victor.matchmaking.db.DatabaseConfig dbConfig = com.victor.matchmaking.db.DatabaseConfig.fromEnv();
+        com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
+        com.victor.matchmaking.db.MatchRepository matches =
+                com.victor.matchmaking.db.MatchRepository.connect(vertx, dbConfig);
 
         RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
-                msg -> handleConfirmation(msg, tickets, pending, notifier));
+                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, matches));
 
         vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier));
         vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier));
@@ -114,8 +119,9 @@ public final class MatchmakingEngineApplication {
         }).onFailure(Throwable::printStackTrace);
     }
 
-    private static void handleConfirmation(JsonObject msg, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier) {
+    private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
+            TicketRepository tickets, PendingMatchStore pending,
+            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches) {
         Payloads.MatchConfirmation command;
         try {
             command = Payloads.MatchConfirmation.fromJson(msg);
@@ -133,43 +139,63 @@ public final class MatchmakingEngineApplication {
                 return;
             }
             if ("DECLINE".equals(action)) {
-                dissolve(pm, "declined by " + playerId, tickets, pending, notifier);
+                dissolve(pm, "declined by " + playerId, tickets, pending, notifier, redis);
                 return;
             }
             if ("CONFIRM".equals(action)) {
-                if (pm.hasConfirmed(playerId) || !pm.playerIds().contains(playerId)) {
+                if (!pm.playerIds().contains(playerId)) {
                     return;
                 }
-                PendingMatch updated = pm.withConfirmation(playerId);
-                if (updated.isComplete()) {
-                    confirm(updated, tickets, pending, notifier);
-                } else {
-                    pending.save(updated).onFailure(Throwable::printStackTrace);
-                }
+                String confirmedKey = "match-confirmed:" + matchId;
+                redisCommands(redis, Request.cmd(Command.SADD).arg(confirmedKey).arg(playerId))
+                        .flatMap(v -> redisCommands(redis, Request.cmd(Command.SCARD).arg(confirmedKey)))
+                        .onSuccess(count -> {
+                            if (count.toLong() != null && count.toLong() >= pm.players().size()) {
+                                confirm(pm, tickets, pending, notifier, matches);
+                            }
+                        })
+                        .onFailure(Throwable::printStackTrace);
             }
         }).onFailure(Throwable::printStackTrace);
     }
 
     private static void confirm(PendingMatch pm, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier) {
-        for (PendingMatch.PendingPlayer player : pm.players()) {
-            tickets.findById(player.ticketId()).onSuccess(ticket -> {
-                if (ticket != null && ticket.status() == TicketState.CONFIRMING) {
-                    tickets.save(null, transition(ticket, TicketState.CONFIRMED))
-                            .onFailure(Throwable::printStackTrace);
-                }
-            }).onFailure(Throwable::printStackTrace);
-        }
-        pending.delete(pm.matchId()).onFailure(Throwable::printStackTrace);
-        for (PendingMatch.PendingPlayer player : pm.players()) {
-            notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CONFIRMED", new Payloads.MatchConfirmed(pm.matchId())),
-                    Payloads.MatchConfirmed::toJson)
-                    .onFailure(Throwable::printStackTrace);
-        }
+            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches) {
+        // Load both tickets, then transition them and persist the durable match row.
+        List<Future<MatchmakingTicket>> loaded = pm.players().stream()
+                .map(p -> tickets.findById(p.ticketId()))
+                .toList();
+        Future.all(loaded).onSuccess(cf -> {
+            List<MatchmakingTicket> found = loaded.stream().map(Future::result).toList();
+            if (found.stream().anyMatch(t -> t == null || t.status() != TicketState.CONFIRMING)) {
+                System.err.println("cannot confirm match " + pm.matchId() + ": tickets not in CONFIRMING");
+                return;
+            }
+            MatchmakingTicket first = found.get(0);
+            for (MatchmakingTicket t : found) {
+                tickets.save(null, transition(t, TicketState.CONFIRMED))
+                        .onFailure(Throwable::printStackTrace);
+            }
+            List<com.victor.matchmaking.domain.match.MatchPlayer> players = new ArrayList<>();
+            for (int i = 0; i < pm.players().size(); i++) {
+                players.add(new com.victor.matchmaking.domain.match.MatchPlayer(pm.matchId(),
+                        pm.players().get(i).playerId(), i == 0 ? "A" : "B", found.get(i).skill()));
+            }
+            com.victor.matchmaking.domain.match.Match match = new com.victor.matchmaking.domain.match.Match(
+                    pm.matchId(), first.gameMode(), first.region(),
+                    com.victor.matchmaking.domain.match.MatchStatus.PENDING, Instant.now(), null, null);
+            matches.save(match, players).onFailure(Throwable::printStackTrace);
+            pending.delete(pm.matchId()).onFailure(Throwable::printStackTrace);
+            for (PendingMatch.PendingPlayer player : pm.players()) {
+                notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CONFIRMED",
+                        new Payloads.MatchConfirmed(pm.matchId())), Payloads.MatchConfirmed::toJson)
+                        .onFailure(Throwable::printStackTrace);
+            }
+        }).onFailure(Throwable::printStackTrace);
     }
 
     private static void dissolve(PendingMatch pm, String reason, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier) {
+            RedisPlayerNotifier notifier, io.vertx.redis.client.Redis redis) {
         for (PendingMatch.PendingPlayer player : pm.players()) {
             tickets.findById(player.ticketId()).onSuccess(ticket -> {
                 if (ticket != null && ticket.status() == TicketState.CONFIRMING) {
@@ -179,11 +205,17 @@ public final class MatchmakingEngineApplication {
             }).onFailure(Throwable::printStackTrace);
         }
         pending.delete(pm.matchId()).onFailure(Throwable::printStackTrace);
+        redis.send(Request.cmd(Command.DEL).arg("match-confirmed:" + pm.matchId()))
+                .onFailure(Throwable::printStackTrace);
         for (PendingMatch.PendingPlayer player : pm.players()) {
             notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CANCELLED",
                     new Payloads.MatchCancelled(pm.matchId(), reason)), Payloads.MatchCancelled::toJson)
                     .onFailure(Throwable::printStackTrace);
         }
+    }
+
+    private static Future<Response> redisCommands(io.vertx.redis.client.Redis redis, Request cmd) {
+        return redis.send(cmd);
     }
 
     private static MatchmakingTicket transition(MatchmakingTicket ticket, TicketState target) {
@@ -202,7 +234,7 @@ public final class MatchmakingEngineApplication {
                     pending.findById(key.substring("match-pending:".length()))
                             .onSuccess(pm -> {
                                 if (pm != null && Instant.now().isAfter(pm.expiresAt())) {
-                                    dissolve(pm, "timeout", tickets, pending, notifier);
+                                    dissolve(pm, "timeout", tickets, pending, notifier, redis);
                                 }
                             })
                             .onFailure(Throwable::printStackTrace);
