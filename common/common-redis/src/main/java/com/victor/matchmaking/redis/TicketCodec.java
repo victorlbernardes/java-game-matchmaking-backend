@@ -1,4 +1,4 @@
-package com.victor.matchmaking.api.presentation;
+package com.victor.matchmaking.redis;
 
 import java.time.Instant;
 
@@ -10,12 +10,12 @@ import com.victor.matchmaking.domain.ticket.TicketState;
 import io.vertx.core.json.JsonObject;
 
 /** Single place where domain objects become HTTP JSON. */
-public final class TicketJsonMapper {
+public final class TicketCodec {
 
     private static final int SKILL_RANGE_HALF_WIDTH = 2;
     private static final int MAX_SKILL = 100;
 
-    private TicketJsonMapper() {
+    private TicketCodec() {
     }
 
     public static JsonObject toJson(MatchmakingTicket ticket) {

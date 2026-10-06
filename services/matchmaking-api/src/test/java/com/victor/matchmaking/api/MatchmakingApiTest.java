@@ -82,7 +82,7 @@ class MatchmakingApiTest {
 
     @Test
     void createTicketReturns201AndIdempotentKeyReturnsSameTicket() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         String token = issueToken("player-2");
         String body = "{\"gameMode\":\"5v5\",\"region\":\"SA\",\"maxLatencyMs\":60}";
 
@@ -109,11 +109,12 @@ class MatchmakingApiTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(200, retry.statusCode());
         assertEquals(created.getString("ticketId"), new JsonObject(retry.body()).getString("ticketId"));
+        }
     }
 
     @Test
     void getTicketByIdReturnsOwnerState() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         String token = issueToken("player-7");
         HttpResponse<String> created = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
@@ -129,11 +130,12 @@ class MatchmakingApiTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(200, fetched.statusCode());
         assertEquals(id, new JsonObject(fetched.body()).getString("ticketId"));
+        }
     }
 
     @Test
     void deleteTicketCancelsAndSecondDeleteReturns409() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         String token = issueToken("player-9");
         HttpResponse<String> created = client.send(HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
@@ -157,27 +159,30 @@ class MatchmakingApiTest {
                 .header("Authorization", "Bearer " + token).build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(409, again.statusCode());
+        }
     }
 
     @Test
     void createTicketWithoutTokenReturns401() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         HttpResponse<String> response = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
                         .POST(HttpRequest.BodyPublishers.ofString("{\"gameMode\":\"1v1\",\"region\":\"NA\",\"maxLatencyMs\":80}"))
                         .header("content-type", "application/json").build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(401, response.statusCode());
+        }
     }
 
     @Test
     void getUnknownTicketReturns404() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         String token = issueToken("player-1");
         HttpResponse<String> response = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets/ticket-nope"))
                         .header("Authorization", "Bearer " + token).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(404, response.statusCode());
+        }
     }
 }

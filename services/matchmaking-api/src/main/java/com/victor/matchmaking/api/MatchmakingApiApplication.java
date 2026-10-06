@@ -5,7 +5,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.URI;
 
-import com.victor.matchmaking.api.infrastructure.RedisTicketRepository;
+import com.victor.matchmaking.redis.RedisTicketRepository;
 import com.victor.matchmaking.api.presentation.HttpRoutes;
 
 import io.vertx.core.Vertx;
@@ -31,10 +31,18 @@ public final class MatchmakingApiApplication {
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", String.valueOf(DEFAULT_PORT)));
         String jwksUrl = System.getenv().getOrDefault("AUTH_JWKS_URL", "http://localhost:8081/.well-known/jwks.json");
 
-        com.victor.matchmaking.api.application.TicketRepository repository = new RedisTicketRepository(Redis.createClient(vertx,
-                new RedisOptions().setConnectionString(System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379"))));
+        String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
+        Redis redis = Redis.createClient(vertx, new RedisOptions().setConnectionString(redisUri));
+        com.victor.matchmaking.redis.TicketRepository repository =
+                new RedisTicketRepository(redis);
+        com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);
+        com.victor.matchmaking.api.presentation.WsHub wsHub =
+                new com.victor.matchmaking.api.presentation.WsHub(publisher);
+        com.victor.matchmaking.redis.RedisSubscriber.subscribe(vertx, redisUri,
+                com.victor.matchmaking.redis.RedisKeys.CHANNEL_PLAYER_NOTIFICATIONS,
+                msg -> wsHub.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
         JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().addJwk(fetchPublicJwk(jwksUrl)));
-        Router router = createRouter(vertx, jwtAuth, repository);
+        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub);
 
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)
@@ -43,7 +51,7 @@ public final class MatchmakingApiApplication {
                 .onFailure(Throwable::printStackTrace);
     }
 
-    static Router createRouter(Vertx vertx, JWTAuth jwtAuth, com.victor.matchmaking.api.application.TicketRepository repository) {
+    static Router createRouter(Vertx vertx, JWTAuth jwtAuth, com.victor.matchmaking.redis.TicketRepository repository) {
         return HttpRoutes.createRouter(vertx, jwtAuth, repository);
     }
 
@@ -52,17 +60,18 @@ public final class MatchmakingApiApplication {
     }
 
     private static JsonObject fetchPublicJwk(String jwksUrl) throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
-        HttpResponse<String> response = client.send(
-                HttpRequest.newBuilder().uri(URI.create(jwksUrl)).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() != 200) {
-            throw new IllegalStateException("failed to fetch JWKS: HTTP " + response.statusCode());
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            HttpResponse<String> response = client.send(
+                    HttpRequest.newBuilder().uri(URI.create(jwksUrl)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                throw new IllegalStateException("failed to fetch JWKS: HTTP " + response.statusCode());
+            }
+            JsonArray keys = new JsonObject(response.body()).getJsonArray("keys");
+            if (keys == null || keys.isEmpty()) {
+                throw new IllegalStateException("JWKS has no keys");
+            }
+            return keys.getJsonObject(0);
         }
-        JsonArray keys = new JsonObject(response.body()).getJsonArray("keys");
-        if (keys == null || keys.isEmpty()) {
-            throw new IllegalStateException("JWKS has no keys");
-        }
-        return keys.getJsonObject(0);
     }
 }

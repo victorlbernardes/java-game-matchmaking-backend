@@ -4,8 +4,10 @@ import com.victor.matchmaking.api.application.CancelTicketUseCase;
 import com.victor.matchmaking.api.application.CreateTicketCommand;
 import com.victor.matchmaking.api.application.CreateTicketUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
-import com.victor.matchmaking.api.application.TicketRepository;
+import com.victor.matchmaking.redis.TicketRepository;
 import com.victor.matchmaking.api.infrastructure.InMemoryTicketRepository;
+import com.victor.matchmaking.redis.TicketCodec;
+import com.victor.matchmaking.redis.RedisPublisher;
 
 import io.vertx.core.Vertx;
 import io.vertx.ext.auth.authentication.TokenCredentials;
@@ -25,9 +27,26 @@ public final class HttpRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
+        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
+                new CancelTicketUseCase(repository), new WsHub(null));
+    }
+
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, RedisPublisher publisher) {
         CreateTicketUseCase createTicket = new CreateTicketUseCase(repository);
         GetTicketUseCase getTicket = new GetTicketUseCase(repository);
         CancelTicketUseCase cancelTicket = new CancelTicketUseCase(repository);
+        WsHub wsHub = new WsHub(publisher);
+        return buildRouter(vertx, jwtAuth, createTicket, getTicket, cancelTicket, wsHub);
+    }
+
+    /** Full injection used by main: caller keeps the WsHub to route Pub/Sub notifications. */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub) {
+        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
+                new CancelTicketUseCase(repository), wsHub);
+    }
+
+    private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
+            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub) {
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
@@ -35,6 +54,27 @@ public final class HttpRoutes {
         router.get("/health").handler(ctx -> ctx.response()
                 .putHeader("content-type", "application/json")
                 .end("{\"status\":\"UP\"}"));
+
+        router.get("/v1/ws").handler(ctx -> {
+            String token = bearerToken(ctx);
+            if (token == null) {
+                ctx.response().setStatusCode(401).putHeader("content-type", "application/json")
+                        .end("{\"error\":\"missing token\"}");
+                return;
+            }
+            jwtAuth.authenticate(new TokenCredentials(token))
+                    .onSuccess(user -> ctx.request().toWebSocket()
+                            .onSuccess(ws -> {
+                                String playerId = user.subject();
+                                wsHub.register(playerId, ws);
+                                ws.textMessageHandler(text -> wsHub.handleClientMessage(playerId, ws, text));
+                                ws.closeHandler(v -> wsHub.unregister(playerId, ws));
+                                ws.exceptionHandler(err -> wsHub.unregister(playerId, ws));
+                            })
+                            .onFailure(err -> ctx.fail(400)))
+                    .onFailure(err -> ctx.response().setStatusCode(401).putHeader("content-type", "application/json")
+                            .end(new io.vertx.core.json.JsonObject().put("error", "invalid token").encode()));
+        });
 
         router.post("/v1/matchmaking/tickets").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> {
@@ -44,10 +84,10 @@ public final class HttpRoutes {
                         createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
                                 .onSuccess(result -> {
                                     if (!result.created()) {
-                                        respond(ctx, 200, TicketJsonMapper.toJson(result.ticket()));
+                                        respond(ctx, 200, TicketCodec.toJson(result.ticket()));
                                         return;
                                     }
-                                    respond(ctx, 201, TicketJsonMapper.toCreateResponse(result.ticket()));
+                                    respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
                                 })
                                 .onFailure(err -> fail(ctx, 500, err.getMessage()));
                     } catch (IllegalArgumentException e) {
@@ -57,15 +97,24 @@ public final class HttpRoutes {
 
         router.get("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> getTicket.execute(ctx.pathParam("ticketId"), user.subject())
-                        .onSuccess(ticket -> respond(ctx, 200, TicketJsonMapper.toJson(ticket)))
+                        .onSuccess(ticket -> respond(ctx, 200, TicketCodec.toJson(ticket)))
                         .onFailure(err -> failWithDomainError(ctx, err))));
 
         router.delete("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> cancelTicket.execute(ctx.pathParam("ticketId"), user.subject())
-                        .onSuccess(ticket -> respond(ctx, 200, TicketJsonMapper.toJson(ticket)))
+                        .onSuccess(ticket -> respond(ctx, 200, TicketCodec.toJson(ticket)))
                         .onFailure(err -> failWithDomainError(ctx, err))));
 
         return router;
+    }
+
+    private static String bearerToken(RoutingContext ctx) {
+        String header = ctx.request().getHeader("Authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            return header.substring("Bearer ".length());
+        }
+        String queryToken = ctx.request().getParam("token");
+        return queryToken != null && !queryToken.isBlank() ? queryToken : null;
     }
 
     private static void authenticate(RoutingContext ctx, JWTAuth jwtAuth,

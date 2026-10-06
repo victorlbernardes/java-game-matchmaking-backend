@@ -74,7 +74,7 @@ class AuthServiceTest {
 
     @Test
     void loginIssuesTokenAndJwksExposesPublicKey() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
 
         HttpResponse<String> login = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/auth/login"))
@@ -94,16 +94,18 @@ class AuthServiceTest {
         assertEquals("RS256", key.getString("alg"));
         assertEquals("dev-key-1", key.getString("kid"));
         assertTrue(key.containsKey("n"));
+        }
     }
 
     @Test
     void loginWithoutPlayerIdReturns400() throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
+        try (HttpClient client = HttpClient.newHttpClient()) {
         HttpResponse<String> response = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/auth/login"))
                         .POST(HttpRequest.BodyPublishers.ofString("{}"))
                         .header("content-type", "application/json").build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(400, response.statusCode());
+        }
     }
 }

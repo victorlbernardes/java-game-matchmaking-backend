@@ -4,7 +4,7 @@ import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import com.victor.matchmaking.api.application.TicketRepository;
+import com.victor.matchmaking.redis.TicketRepository;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 
 import io.vertx.core.Future;

@@ -1,4 +1,4 @@
-package com.victor.matchmaking.api.application;
+package com.victor.matchmaking.redis;
 
 import java.time.Instant;
 

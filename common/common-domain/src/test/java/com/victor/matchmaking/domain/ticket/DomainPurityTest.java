@@ -1,6 +1,7 @@
 package com.victor.matchmaking.domain.ticket;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -34,6 +35,7 @@ class DomainPurityTest {
         for (Class<?> type : domainTypes) {
             String resource = type.getName().replace('.', '/') + ".class";
             try (InputStream in = type.getClassLoader().getResourceAsStream(resource)) {
+                assertNotNull(in, type.getSimpleName() + " class resource not found on classpath");
                 byte[] bytes = in.readAllBytes();
                 String content = new String(bytes, StandardCharsets.ISO_8859_1);
                 for (String forbidden : FORBIDDEN_PACKAGES) {

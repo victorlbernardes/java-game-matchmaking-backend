@@ -1,6 +1,7 @@
 package com.victor.matchmaking.api.application;
 
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
+import com.victor.matchmaking.redis.TicketRepository;
 
 import io.vertx.core.Future;
 

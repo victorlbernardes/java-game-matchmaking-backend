@@ -1,10 +1,8 @@
-package com.victor.matchmaking.api.infrastructure;
+package com.victor.matchmaking.redis;
 
 import java.time.Instant;
 import java.util.UUID;
 
-import com.victor.matchmaking.api.application.TicketRepository;
-import com.victor.matchmaking.api.presentation.TicketJsonMapper;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.domain.ticket.TicketState;
 
@@ -31,7 +29,7 @@ public final class RedisTicketRepository implements TicketRepository {
     @Override
     public Future<MatchmakingTicket> findById(String ticketId) {
         return client.send(Request.cmd(Command.GET).arg(ticketKey(ticketId)))
-                .map(response -> response != null ? TicketJsonMapper.fromJson(new JsonObject(response.toString())) : null);
+                .map(response -> response != null ? TicketCodec.fromJson(new JsonObject(response.toString())) : null);
     }
 
     @Override
@@ -46,7 +44,7 @@ public final class RedisTicketRepository implements TicketRepository {
     public Future<Void> save(String idempotencyKey, MatchmakingTicket ticket) {
         Future<Response> stored = client.send(Request.cmd(Command.SET)
                 .arg(ticketKey(ticket.id()))
-                .arg(TicketJsonMapper.toJson(ticket).encode())
+                .arg(TicketCodec.toJson(ticket).encode())
                 .arg("EX").arg(TICKET_TTL_SECONDS));
         Future<Response> queue = ticket.status() == TicketState.SEARCHING
                 ? client.send(Request.cmd(Command.ZADD)
@@ -74,14 +72,14 @@ public final class RedisTicketRepository implements TicketRepository {
     }
 
     private static String ticketKey(String ticketId) {
-        return "ticket:" + ticketId;
+        return RedisKeys.ticketKey(ticketId);
     }
 
     private static String idempotencyKey(String key) {
-        return "idem:" + key;
+        return RedisKeys.idempotencyKey(key);
     }
 
     private static String queueKey(MatchmakingTicket ticket) {
-        return "queue:" + ticket.gameMode().label() + ":" + ticket.region().name();
+        return RedisKeys.queueKey(ticket.gameMode().label(), ticket.region().name());
     }
 }
