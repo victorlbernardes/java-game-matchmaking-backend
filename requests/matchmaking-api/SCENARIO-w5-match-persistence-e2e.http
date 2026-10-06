@@ -1,0 +1,106 @@
+### SCENARIO — W5: match persisted to PostgreSQL + cursor-paginated history (E2E)
+###
+### When to use: to validate the whole W5 flow end to end — two players
+### queue, get paired over WebSocket, confirm, and the durable match
+### lands in PostgreSQL and shows up in the paginated history.
+###
+### Prerequisites:
+###   docker compose up -d redis postgres
+###   mvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication
+###   mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication
+###   mvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication
+###
+### How to use (IntelliJ IDEA HTTP Client): run the sections top to bottom.
+### Each WEBSOCKET line opens its own session; the message sections that
+### follow it are sent on that session. Watch both Response panels for the
+### pushed frames. Steps marked "observe" are assertions you verify visually.
+### VS Code REST Client has no WebSocket — use the Python snippet in the
+### folder README for the WS parts and run the HTTP parts here.
+###
+### Expected: two rounds are shown below; one round = 1 match in PostgreSQL
+### (1 row in `matches`, 2 rows in `match_players`) and 1 page of history.
+
+### 1. Login p1 — expect 200, captures {{tokenP1}}
+POST http://localhost:8081/v1/auth/login
+Content-Type: application/json
+
+{ "playerId": "p1" }
+
+> {% client.global.set("tokenP1", response.body.token); %}
+
+### 2. Login p2 — expect 200, captures {{tokenP2}}
+POST http://localhost:8081/v1/auth/login
+Content-Type: application/json
+
+{ "playerId": "p2" }
+
+> {% client.global.set("tokenP2", response.body.token); %}
+
+### 3. Open WebSocket for p1 (keep session open)
+WEBSOCKET ws://localhost:8080/v1/ws?token={{tokenP1}}
+
+### 4. PING on p1 session — observe PONG frame
+{"type":"PING","payload":{}}
+
+### 5. Open WebSocket for p2 (keep session open)
+WEBSOCKET ws://localhost:8080/v1/ws?token={{tokenP2}}
+
+### 6. PING on p2 session — observe PONG frame
+{"type":"PING","payload":{}}
+
+### 7. p1 queues (1v1/NA) — expect 201
+POST http://localhost:8080/v1/matchmaking/tickets
+Authorization: Bearer {{tokenP1}}
+Content-Type: application/json
+Idempotency-Key: w5-e2e-{{$timestamp}}-p1
+
+{ "gameMode": "1v1", "region": "NA", "maxLatencyMs": 80 }
+
+### 8. p2 queues (1v1/NA) — expect 201
+POST http://localhost:8080/v1/matchmaking/tickets
+Authorization: Bearer {{tokenP2}}
+Content-Type: application/json
+Idempotency-Key: w5-e2e-{{$timestamp}}-p2
+
+{ "gameMode": "1v1", "region": "NA", "maxLatencyMs": 80 }
+
+### 9. Observe: both WS sessions receive MATCH_PENDING_CONFIRMATION with the
+###    SAME matchId (engine pairs within ~1s; pairing loop runs every 500ms).
+###    Copy that matchId into the two MATCH_CONFIRM frames below.
+
+### 10. p1 confirms — replace matchId, observe MATCH_CONFIRMED frame
+{"type":"MATCH_CONFIRM","payload":{"matchId":"match-dea54ed7"}}
+
+### 11. p2 confirms — same matchId, observe MATCH_CONFIRMED frame
+{"type":"MATCH_CONFIRM","payload":{"matchId":"match-REPLACE_ME"}}
+
+### 12. Verify durability in PostgreSQL (run in a terminal, not HTTP):
+###     PGPASSWORD=matchmaking psql -h localhost -U matchmaking -d matchmaking \
+###       -c "SELECT id, game_mode, region, status FROM matches ORDER BY created_at DESC LIMIT 2;"
+###     PGPASSWORD=matchmaking psql -h localhost -U matchmaking -d matchmaking \
+###       -c "SELECT match_id, player_id, team FROM match_players ORDER BY match_id DESC LIMIT 4;"
+###     Expected: 1 new row in `matches` (status PENDING) + 2 rows in
+###     `match_players` (p1 team A, p2 team B).
+
+### 13. History page 1 for p1 (limit=1) — expect 200, captures {{nextCursor}}
+GET http://localhost:8080/v1/players/p1/matches?limit=1
+Authorization: Bearer {{tokenP1}}
+
+> {% client.global.set("nextCursor", response.body.nextCursor); %}
+
+### 14. History page 2 (cursor from step 13) — expect 200 with the older
+###      match; nextCursor is null on the last page
+GET http://localhost:8080/v1/players/p1/matches?limit=1&cursor={{nextCursor}}
+Authorization: Bearer {{tokenP1}}
+
+### 15. Another player's history with p1's token — expect 403
+GET http://localhost:8080/v1/players/p2/matches
+Authorization: Bearer {{tokenP1}}
+
+### 16. limit out of range — expect 400
+GET http://localhost:8080/v1/players/p1/matches?limit=500
+Authorization: Bearer {{tokenP1}}
+
+### 17. Invalid cursor — expect 400
+GET http://localhost:8080/v1/players/p1/matches?cursor=!!!invalid!!!
+Authorization: Bearer {{tokenP1}}

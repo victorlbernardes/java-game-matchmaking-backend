@@ -20,6 +20,7 @@ mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaki
 | `GET-v1-matchmaking-tickets-by-id.http` | `GET /v1/matchmaking/tickets/{id}` | Fetch ticket; 403/404 cases |
 | `DELETE-v1-matchmaking-tickets-by-id.http` | `DELETE /v1/matchmaking/tickets/{id}` | Cancel; 403/404/409 cases |
 | `GET-v1-players-playerId-matches.http` | `GET /v1/players/{playerId}/matches` | Cursor-paginated history |
+| `SCENARIO-w5-match-persistence-e2e.http` | E2E flow (login ×2 → WS → pair → confirm → psql → history) | W5 validation scenario (two WS sessions in one file) |
 | `WS-v1-ws.http` | `WS /v1/ws` | Push channel; IntelliJ-only (see below) |
 
 ## WebSocket (`GET /v1/ws`)
