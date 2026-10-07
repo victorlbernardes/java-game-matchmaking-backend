@@ -15,7 +15,6 @@ import java.util.logging.Handler;
 import java.util.logging.LogManager;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-
 import org.junit.jupiter.api.Test;
 
 import io.vertx.core.Vertx;
@@ -29,6 +28,8 @@ class StructuredLoggingTest {
 
     @Test
     void requestLogEmitsStructuredLine() throws Exception {
+        // Force class loading so the static LOG field initializes the named logger
+        Class.forName("com.victor.matchmaking.api.presentation.HttpRoutes");
         Logger httpLogger = LogManager.getLogManager().getLogger("matchmaking.api.http");
         List<LogRecord> records = new CopyOnWriteArrayList<>();
         Handler capture = new Handler() {
