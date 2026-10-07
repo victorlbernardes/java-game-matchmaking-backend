@@ -20,6 +20,8 @@ import io.vertx.ext.web.handler.BodyHandler;
 /** HTTP routes for the matchmaking gateway. */
 public final class HttpRoutes {
 
+    private static final System.Logger LOG = System.getLogger("matchmaking.api.http");
+
     private HttpRoutes() {
     }
 
@@ -57,6 +59,16 @@ public final class HttpRoutes {
             GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub, MatchRepository matchRepository) {
 
         Router router = Router.router(vertx);
+        router.route().handler(ctx -> {
+            long start = System.nanoTime();
+            ctx.response().endHandler(v -> LOG.log(System.Logger.Level.INFO,
+                    "http {0} {1} -> {2} in {3}ms sub={4}",
+                    ctx.request().method().name(), ctx.normalizedPath(),
+                    String.valueOf(ctx.response().getStatusCode()),
+                    String.valueOf((System.nanoTime() - start) / 1_000_000),
+                    ctx.get("playerId") != null ? ctx.get("playerId") : "-"));
+            ctx.next();
+        });
         router.route().handler(BodyHandler.create());
 
         router.get("/health").handler(ctx -> ctx.response()
@@ -71,7 +83,9 @@ public final class HttpRoutes {
                 return;
             }
             jwtAuth.authenticate(new TokenCredentials(token))
-                    .onSuccess(user -> ctx.request().toWebSocket()
+                    .onSuccess(user -> {
+                        ctx.put("playerId", user.subject());
+                        ctx.request().toWebSocket()
                             .onSuccess(ws -> {
                                 String playerId = user.subject();
                                 wsHub.register(playerId, ws);
@@ -79,7 +93,8 @@ public final class HttpRoutes {
                                 ws.closeHandler(v -> wsHub.unregister(playerId, ws));
                                 ws.exceptionHandler(err -> wsHub.unregister(playerId, ws));
                             })
-                            .onFailure(err -> ctx.fail(400)))
+                            .onFailure(err -> ctx.fail(400));
+                    })
                     .onFailure(err -> ctx.response().setStatusCode(401).putHeader("content-type", "application/json")
                             .end(new io.vertx.core.json.JsonObject().put("error", "invalid token").encode()));
         });
@@ -167,7 +182,10 @@ public final class HttpRoutes {
         }
         String token = header.substring("Bearer ".length());
         jwtAuth.authenticate(new TokenCredentials(token))
-                .onSuccess(onAuthorized::accept)
+                .onSuccess(user -> {
+                    ctx.put("playerId", user.subject());
+                    onAuthorized.accept(user);
+                })
                 .onFailure(err -> fail(ctx, 401, "invalid token: " + err.getMessage()));
     }
 
@@ -190,6 +208,11 @@ public final class HttpRoutes {
     }
 
     private static void fail(RoutingContext ctx, int statusCode, String message) {
+        if (statusCode >= 400) {
+            LOG.log(System.Logger.Level.WARNING, "http.error {0} {1} -> {2} reason={3}",
+                    ctx.request().method().name(), ctx.normalizedPath(),
+                    String.valueOf(statusCode), message);
+        }
         ctx.response().setStatusCode(statusCode)
                 .putHeader("content-type", "application/json")
                 .end(new io.vertx.core.json.JsonObject().put("error", message).encode());

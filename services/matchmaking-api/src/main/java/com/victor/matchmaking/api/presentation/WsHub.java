@@ -15,6 +15,7 @@ import io.vertx.core.json.JsonObject;
 /** Local WebSocket registry: playerId → connection. Receives Pub/Sub notifications and forwards them. */
 public final class WsHub {
 
+    private static final System.Logger LOG = System.getLogger("matchmaking.api.ws");
     private static final String TYPE_MATCH_CONFIRM = "MATCH_CONFIRM";
     private static final String TYPE_MATCH_DECLINE = "MATCH_DECLINE";
     private static final String TYPE_PING = "PING";
@@ -27,6 +28,7 @@ public final class WsHub {
     }
 
     public void register(String playerId, ServerWebSocket ws) {
+        LOG.log(System.Logger.Level.INFO, "ws.connected playerId={0}", playerId);
         ServerWebSocket previous = byPlayer.put(playerId, ws);
         if (previous != null && previous != ws) {
             previous.close();
@@ -34,13 +36,18 @@ public final class WsHub {
     }
 
     public void unregister(String playerId, ServerWebSocket ws) {
-        byPlayer.remove(playerId, ws);
+        if (byPlayer.remove(playerId, ws)) {
+            LOG.log(System.Logger.Level.INFO, "ws.disconnected playerId={0}", playerId);
+        }
     }
 
     /** Forward a Pub/Sub notification frame to the right local connection. */
     public void deliver(RoutedEnvelope routed) {
         ServerWebSocket ws = byPlayer.get(routed.targetPlayerId());
         if (ws != null) {
+            String type = new JsonObject(routed.envelopeJson()).getString("type");
+            LOG.log(System.Logger.Level.INFO, "ws.push playerId={0} type={1}",
+                    routed.targetPlayerId(), type);
             ws.writeTextMessage(routed.envelopeJson());
         }
     }
@@ -50,6 +57,7 @@ public final class WsHub {
         try {
             frame = ClientFrame.parse(text);
         } catch (Exception e) {
+            LOG.log(System.Logger.Level.WARNING, "ws.frame playerId={0} error=invalid JSON", playerId);
             sendError(ws, "invalid JSON");
             return;
         }
@@ -58,6 +66,8 @@ public final class WsHub {
                     Envelope.of("PONG", new Payloads.Empty()).toJson(Payloads.Empty::toJson).encode());
             case TYPE_MATCH_CONFIRM, TYPE_MATCH_DECLINE -> {
                 if (frame.matchId() == null || frame.matchId().isBlank()) {
+                    LOG.log(System.Logger.Level.WARNING,
+                            "ws.frame playerId={0} type={1} error=matchId is required", playerId, frame.type());
                     sendError(ws, "matchId is required");
                     return;
                 }
@@ -65,6 +75,8 @@ public final class WsHub {
                     sendError(ws, "confirmations unavailable in this environment");
                     return;
                 }
+                LOG.log(System.Logger.Level.INFO, "ws.frame playerId={0} type={1} matchId={2}",
+                        playerId, frame.type(), frame.matchId());
                 Payloads.MatchConfirmation command = new Payloads.MatchConfirmation(frame.matchId(), playerId,
                         TYPE_MATCH_CONFIRM.equals(frame.type())
                                 ? Payloads.MatchConfirmation.Action.CONFIRM
@@ -72,7 +84,11 @@ public final class WsHub {
                 publisher.publish(RedisKeys.CHANNEL_MATCH_CONFIRMATIONS, command.toJson().encode())
                         .onFailure(err -> sendError(ws, "publish failed: " + err.getMessage()));
             }
-            default -> sendError(ws, "unknown type: " + frame.type());
+            default -> {
+                LOG.log(System.Logger.Level.WARNING, "ws.frame playerId={0} type=unknown value={1}",
+                        playerId, frame.type());
+                sendError(ws, "unknown type: " + frame.type());
+            }
         }
     }
 

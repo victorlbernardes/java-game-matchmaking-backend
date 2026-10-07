@@ -22,11 +22,15 @@ import io.vertx.ext.web.Router;
 public final class MatchmakingApiApplication {
 
     private static final int DEFAULT_PORT = 8080;
+    private static final System.Logger LOG = System.getLogger("matchmaking.api");
 
     private MatchmakingApiApplication() {
     }
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("java.util.logging.SimpleFormatter.format",
+                "%1$tF %1$tT %4$s %5$s%n");
+        java.util.Locale.setDefault(java.util.Locale.ENGLISH);
         Vertx vertx = Vertx.vertx();
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", String.valueOf(DEFAULT_PORT)));
         String jwksUrl = System.getenv().getOrDefault("AUTH_JWKS_URL", "http://localhost:8081/.well-known/jwks.json");
@@ -51,8 +55,9 @@ public final class MatchmakingApiApplication {
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)
                 .listen(port)
-                .onSuccess(s -> System.out.println("matchmaking-api listening on :" + s.actualPort()))
-                .onFailure(Throwable::printStackTrace);
+                .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
+                        "api.started port={0} jwksUrl={1}", String.valueOf(s.actualPort()), jwksUrl))
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "api.start.failed port=" + port, err));
     }
 
     static Router createRouter(Vertx vertx, JWTAuth jwtAuth, com.victor.matchmaking.redis.TicketRepository repository) {

@@ -1,29 +1,36 @@
-# HTTP Request Collections
+# Request Collection
 
-Every endpoint must be exercisable both by unit/integration tests **and** by a
-runnable HTTP request in this folder, grouped per service. When you add or
-change an endpoint, update the matching `.http` file in the same change.
+Single Postman/Insomnia collection for the entire matchmaking backend.
 
-## Layout
+## Import
+
+1. **File → Import** → select `matchmaking.postman_collection.json`
+2. **File → Import** → select `matchmaking.postman_environment.json`
+3. Select the `matchmaking` environment (top-right dropdown)
+
+## Collection structure
 
 ```
-requests/
-├── auth-service/       # POST /v1/auth/login, GET /.well-known/jwks.json
-└── matchmaking-api/    # GET /health, POST/GET/DELETE /v1/matchmaking/tickets
+matchmaking/
+├── auth-service/          # POST /v1/auth/login, GET /.well-known/jwks.json
+└── matchmaking-api/
+    ├── health/            # GET /health
+    ├── tickets/           # POST/GET/DELETE /v1/matchmaking/tickets (+ error cases)
+    ├── history/           # GET /v1/players/{id}/matches (+ error cases)
+    ├── websocket/         # WS /v1/ws (PING, MATCH_CONFIRM, MATCH_DECLINE)
+    └── e2e-w5/            # Full W5 E2E flow (login ×2 → WS → pair → confirm → history)
 ```
 
-Each `.http` file starts with a comment block explaining **when** to use the
-endpoint, **how** to run it, and the expected success/error responses. Each
-service folder has its own `README.md` with start commands and the suggested
-execution order.
+## Start services (order matters)
 
-## How to run
+```bash
+mvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication
+mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication
+mvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication
+```
 
-These files use the IntelliJ IDEA / VS Code REST Client `.http` format.
+## Typical flow
 
-1. Start auth-service (see `auth-service/README.md`).
-2. Run `auth-service/POST-v1-auth-login.http` — it captures the JWT into the
-   `token` client variable.
-3. Start matchmaking-api (see `matchmaking-api/README.md`).
-4. Run the matchmaking-api requests in the order listed in its README.
-   `POST-v1-matchmaking-tickets.http` captures `ticketId` for follow-ups.
+1. `auth-service` → `POST /v1/auth/login` (captures `token`)
+2. `matchmaking-api` → `health` → `tickets` → `history` → `websocket`
+3. For E2E: run the `e2e-w5` folder top to bottom

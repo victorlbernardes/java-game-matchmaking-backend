@@ -15,6 +15,8 @@ import io.vertx.ext.web.handler.BodyHandler;
 /** HTTP routes for the auth stub. */
 public final class AuthRoutes {
 
+    private static final System.Logger LOG = System.getLogger("matchmaking.auth");
+
     private AuthRoutes() {
     }
 
@@ -27,12 +29,14 @@ public final class AuthRoutes {
         router.post("/v1/auth/login").handler(ctx -> {
             String playerId = parsePlayerId(ctx.body() != null ? ctx.body().asJsonObject() : null);
             if (playerId == null) {
+                LOG.log(System.Logger.Level.WARNING, "login.rejected reason=playerId is required");
                 ctx.response().setStatusCode(400)
                         .putHeader("content-type", "application/json")
                         .end("{\"error\":\"playerId is required\"}");
                 return;
             }
             SessionTokenIssuer.IssuedToken token = issuer.issue(playerId);
+            LOG.log(System.Logger.Level.INFO, "login.issued playerId={0}", playerId);
             ctx.response().putHeader("content-type", "application/json")
                     .end(new TokenResponse(token.token(), token.expiresInSeconds()).toJson().encode());
         });

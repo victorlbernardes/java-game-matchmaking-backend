@@ -15,11 +15,15 @@ import io.vertx.ext.web.Router;
 public final class AuthServiceApplication {
 
     private static final int DEFAULT_PORT = 8081;
+    private static final System.Logger LOG = System.getLogger("matchmaking.auth");
 
     private AuthServiceApplication() {
     }
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("java.util.logging.SimpleFormatter.format",
+                "%1$tF %1$tT %4$s %5$s%n");
+        java.util.Locale.setDefault(java.util.Locale.ENGLISH);
         Vertx vertx = Vertx.vertx();
         int port = Integer.parseInt(System.getenv().getOrDefault("AUTH_PORT", String.valueOf(DEFAULT_PORT)));
 
@@ -30,8 +34,8 @@ public final class AuthServiceApplication {
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)
                 .listen(port)
-                .onSuccess(s -> System.out.println("auth-service listening on :" + s.actualPort()))
-                .onFailure(Throwable::printStackTrace);
+                .onSuccess(s -> LOG.log(System.Logger.Level.INFO, "auth.started port={0}", String.valueOf(s.actualPort())))
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "auth.start.failed port=" + port, err));
     }
 
     static Router createRouter(Vertx vertx, JWTAuth jwtAuth, KeyPair keyPair) {
