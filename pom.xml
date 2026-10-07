@@ -14,6 +14,7 @@
         <module>common/common-domain</module>
         <module>common/common-proto</module>
         <module>common/common-redis</module>
+        <module>common/common-db</module>
         <module>common/common-events</module>
         <module>services/matchmaking-api</module>
         <module>services/matchmaking-engine</module>
@@ -27,6 +28,12 @@
         <maven.compiler.release>21</maven.compiler.release>
         <vertx.version>5.2.0</vertx.version>
         <junit.version>5.11.4</junit.version>
+        <!-- Override transitive Jackson (CVE-2026-89407, CVE-2026-89425, CVE-2026-91776, CVE-2026-91777) -->
+        <jackson.version>2.22.3</jackson.version>
+        <jackson3.version>3.2.3</jackson3.version>
+        <netty.version>4.2.18.Final</netty.version>
+        <flyway.version>12.11.0</flyway.version>
+        <postgres.version>42.7.13</postgres.version>
     </properties>
 
     <dependencyManagement>
@@ -45,6 +52,31 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson.core</groupId>
+                <artifactId>jackson-annotations</artifactId>
+                <version>2.22</version>
+            </dependency>
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>${jackson3.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>${jackson3.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -60,8 +92,32 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>3.5.2</version>
+                    <configuration>
+                        <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    </configuration>
                 </plugin>
             </plugins>
         </pluginManagement>
     </build>
+
+    <profiles>
+        <!-- macOS only: native DNS resolver (osx-x86_64 / osx-aarch_64). On Windows/Linux the
+             provider does not exist, so the artifact must not be resolved there. -->
+        <profile>
+            <id>macos-dns-resolver</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                </os>
+            </activation>
+            <dependencies>
+                <dependency>
+                    <groupId>io.netty</groupId>
+                    <artifactId>netty-resolver-dns-native-macos</artifactId>
+                    <version>${netty.version}</version>
+                    <classifier>osx-${os.arch}</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>
