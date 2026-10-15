@@ -1,7 +1,9 @@
 package com.victor.matchmaking.redis;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.domain.ticket.TicketState;
@@ -21,9 +23,52 @@ public final class RedisTicketRepository implements TicketRepository {
     private static final int TICKET_TTL_SECONDS = 900;
 
     private final Redis client;
+    private final AtomicReference<String> createScriptSha = new AtomicReference<>();
 
     public RedisTicketRepository(Redis client) {
         this.client = client;
+    }
+
+    @Override
+    public Future<String> createIdempotent(String idempotencyKey, MatchmakingTicket ticket) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return save(null, ticket).map(v -> ticket.id());
+        }
+        String sha = createScriptSha.get();
+        if (sha != null) {
+            return evalCreateScript(sha, idempotencyKey, ticket);
+        }
+        return loadCreateScript().flatMap(loadedSha -> evalCreateScript(loadedSha, idempotencyKey, ticket));
+    }
+
+    private Future<String> loadCreateScript() {
+        try {
+            String script = new String(getClass().getResourceAsStream("/create.lua").readAllBytes(),
+                    StandardCharsets.UTF_8);
+            return client.send(Request.cmd(Command.SCRIPT).arg("LOAD").arg(script))
+                    .map(resp -> {
+                        String sha = resp != null ? resp.toString() : null;
+                        if (sha != null) {
+                            createScriptSha.set(sha);
+                        }
+                        return sha;
+                    });
+        } catch (Exception e) {
+            return Future.failedFuture(e);
+        }
+    }
+
+    private Future<String> evalCreateScript(String sha, String idempotencyKey, MatchmakingTicket ticket) {
+        String queuedAt = String.valueOf(ticket.queuedAt().toEpochMilli());
+        return client.send(Request.cmd(Command.EVALSHA).arg(sha)
+                        .arg("1").arg(idempotencyKey(idempotencyKey))
+                        .arg(TicketCodec.toJson(ticket).encode())
+                        .arg(ticket.id())
+                        .arg(queueKey(ticket))
+                        .arg(queuedAt)
+                        .arg(String.valueOf(TICKET_TTL_SECONDS))
+                        .arg(String.valueOf(TICKET_TTL_SECONDS)))
+                .map(resp -> resp != null ? resp.toString() : null);
     }
 
     @Override

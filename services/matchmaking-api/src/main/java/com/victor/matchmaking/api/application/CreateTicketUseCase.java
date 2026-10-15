@@ -22,25 +22,24 @@ public final class CreateTicketUseCase {
     }
 
     public Future<Result> execute(String playerId, CreateTicketCommand command, String idempotencyKey) {
-        Future<MatchmakingTicket> existing = (idempotencyKey != null && !idempotencyKey.isBlank())
-                ? repository.findByIdempotencyKey(idempotencyKey)
-                : Future.succeededFuture(null);
-        return existing.flatMap(found -> {
-            if (found != null) {
-                return Future.succeededFuture(new Result(found, false));
-            }
-            MatchmakingTicket ticket = new MatchmakingTicket(
-                    repository.newTicketId(),
-                    playerId,
-                    command.gameMode(),
-                    command.region(),
-                    command.maxLatencyMs(),
-                    DEV_SKILL,
-                    repository.now(),
-                    TicketState.SEARCHING,
-                    INITIAL_VERSION);
-            return repository.save(idempotencyKey, ticket)
-                    .map(v -> new Result(ticket, true));
-        });
+        MatchmakingTicket ticket = new MatchmakingTicket(
+                repository.newTicketId(),
+                playerId,
+                command.gameMode(),
+                command.region(),
+                command.maxLatencyMs(),
+                DEV_SKILL,
+                repository.now(),
+                TicketState.SEARCHING,
+                INITIAL_VERSION);
+        return repository.createIdempotent(idempotencyKey, ticket)
+                .flatMap(ticketId -> {
+                    boolean created = ticketId.equals(ticket.id());
+                    if (created) {
+                        return Future.succeededFuture(new Result(ticket, true));
+                    }
+                    return repository.findById(ticketId)
+                            .map(found -> new Result(found, false));
+                });
     }
 }

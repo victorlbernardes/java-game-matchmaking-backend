@@ -38,6 +38,17 @@ public final class InMemoryTicketRepository implements TicketRepository {
     }
 
     @Override
+    public Future<String> createIdempotent(String idempotencyKey, MatchmakingTicket ticket) {
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            String existingId = idempotencyIndex.get(idempotencyKey);
+            if (existingId != null) {
+                return Future.succeededFuture(existingId);
+            }
+        }
+        return save(idempotencyKey, ticket).map(v -> ticket.id());
+    }
+
+    @Override
     public String newTicketId() {
         return "ticket-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
     }
