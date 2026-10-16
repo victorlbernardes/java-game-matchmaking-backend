@@ -27,8 +27,3 @@ HTTP request in `requests/` — see `requests/README.md`.
 docker compose up -d
 ```
 
-## Documentation
-
-The vault at `/Users/victor/Projects/AI/OpenCode/Marchmaking/obsidian` is the source of truth
-for scope, domain, API contract, and roadmap. `AGENTS.md` describes the conventions
-(English code, enums for states, pure domain, no cross-service dependencies).
