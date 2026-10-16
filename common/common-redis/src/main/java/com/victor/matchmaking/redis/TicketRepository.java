@@ -15,6 +15,9 @@ public interface TicketRepository {
 
     Future<Void> save(String idempotencyKey, MatchmakingTicket ticket);
 
+    /** Atomic idempotent create: GET idem:{key} + SET ticket + ZADD queue + SET idem in one Lua script. */
+    Future<String> createIdempotent(String idempotencyKey, MatchmakingTicket ticket);
+
     String newTicketId();
 
     Instant now();

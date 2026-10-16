@@ -37,6 +37,7 @@ public final class MatchmakingEngineApplication {
     private static final long SWEEP_INTERVAL_MS = 1000;
     private static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
     private static final int TICKET_ID_LENGTH = 8;
+    private static volatile String PAIR_SCRIPT_SHA = "";
 
     private MatchmakingEngineApplication() {
     }
@@ -61,12 +62,27 @@ public final class MatchmakingEngineApplication {
         RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
                 msg -> handleConfirmation(msg, redis, tickets, pending, notifier, matches));
 
-        vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier));
-        vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier));
+        // Load the atomic pairing script before starting the pairing loop
+        loadPairScript(redis).onSuccess(sha -> {
+            PAIR_SCRIPT_SHA = sha;
+            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier));
+            vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier));
 
-        LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2}",
-                String.valueOf(PAIRING_INTERVAL_MS), String.valueOf(SWEEP_INTERVAL_MS),
-                String.valueOf(CONFIRMATION_TIMEOUT_SECONDS));
+            LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2} pairScript={3}",
+                    String.valueOf(PAIRING_INTERVAL_MS), String.valueOf(SWEEP_INTERVAL_MS),
+                    String.valueOf(CONFIRMATION_TIMEOUT_SECONDS), sha);
+        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadPairScript", err));
+    }
+
+    private static Future<String> loadPairScript(io.vertx.redis.client.Redis redis) {
+        String script;
+        try {
+            script = new String(MatchmakingEngineApplication.class.getResourceAsStream("/pair.lua").readAllBytes());
+        } catch (Exception e) {
+            return Future.failedFuture(e);
+        }
+        return redis.send(Request.cmd(Command.SCRIPT).arg("LOAD").arg(script))
+                .map(resp -> resp != null ? resp.toString() : null);
     }
 
     private static void scanAndPair(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
@@ -99,7 +115,7 @@ public final class MatchmakingEngineApplication {
                         MatchmakingTicket b = candidates.get(j);
                         if (a != null && b != null && a.status() == TicketState.SEARCHING
                                 && b.status() == TicketState.SEARCHING && PairingPolicy.canPair(a, b)) {
-                            pair(a, b, tickets, pending, notifier);
+                            pair(a, b, queueKey, redis, tickets, pending, notifier);
                             return;
                         }
                     }
@@ -110,34 +126,43 @@ public final class MatchmakingEngineApplication {
                 "engine.error stage=readQueue queue={0}", err, queueKey));
     }
 
-    private static void pair(MatchmakingTicket a, MatchmakingTicket b, TicketRepository tickets,
+    private static void pair(MatchmakingTicket a, MatchmakingTicket b, String queueKey,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier) {
-        MatchmakingTicket aConfirming = transition(a, TicketState.CONFIRMING);
-        MatchmakingTicket bConfirming = transition(b, TicketState.CONFIRMING);
-        Future<Void> saveA = tickets.save(null, aConfirming);
-        Future<Void> saveB = tickets.save(null, bConfirming);
-        Future.all(saveA, saveB).onSuccess(v -> {
-            String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
-            PendingMatch pm = new PendingMatch(matchId,
-                    List.of(new PendingMatch.PendingPlayer(a.playerId(), a.id()),
-                            new PendingMatch.PendingPlayer(b.playerId(), b.id())),
-                    List.of(), Instant.now().plusSeconds(CONFIRMATION_TIMEOUT_SECONDS));
-            pending.save(pm).onSuccess(ignored -> {
-                Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId, pm.playerIds());
-                LOG.log(System.Logger.Level.INFO,
-                        "pair.created matchId={0} players={1} gameMode={2} region={3} skillA={4} skillB={5}",
-                        matchId, pm.playerIds(), a.gameMode().label(), a.region().name(),
-                        String.valueOf(a.skill()), String.valueOf(b.skill()));
-                notifier.notifyPlayer(a.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
-                        .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                "engine.error stage=notifyPending playerId=" + a.playerId(), err));
-                notifier.notifyPlayer(b.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
-                        .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                "engine.error stage=notifyPending playerId=" + b.playerId(), err));
-            }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                    "engine.error stage=savePendingMatch matchId=" + matchId, err));
-        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                "engine.error stage=saveConfirmingTickets", err));
+        String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
+        PendingMatch pm = new PendingMatch(matchId,
+                List.of(new PendingMatch.PendingPlayer(a.playerId(), a.id()),
+                        new PendingMatch.PendingPlayer(b.playerId(), b.id())),
+                List.of(), Instant.now().plusSeconds(CONFIRMATION_TIMEOUT_SECONDS));
+
+        // Atomic pairing: ZREM from queue + SET pending match in one Lua script.
+        // If another worker won the race, the script returns nil and we skip.
+        redis.send(Request.cmd(Command.EVALSHA).arg(PAIR_SCRIPT_SHA)
+                .arg("1").arg(queueKey)
+                .arg(pm.matchId()).arg(pm.toJson().encode())
+                .arg(String.valueOf(CONFIRMATION_TIMEOUT_SECONDS)))
+                .onSuccess(result -> {
+                    if (result == null) {
+                        // Another worker already removed these tickets from the queue
+                        return;
+                    }
+                    // Paired! Transition to CONFIRMING and notify both players.
+                    tickets.save(null, transition(a, TicketState.CONFIRMING));
+                    tickets.save(null, transition(b, TicketState.CONFIRMING));
+                    Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId, pm.playerIds());
+                    LOG.log(System.Logger.Level.INFO,
+                            "pair.created matchId={0} players={1} gameMode={2} region={3} skillA={4} skillB={5}",
+                            matchId, pm.playerIds(), a.gameMode().label(), a.region().name(),
+                            String.valueOf(a.skill()), String.valueOf(b.skill()));
+                    notifier.notifyPlayer(a.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
+                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                    "engine.error stage=notifyPending playerId=" + a.playerId(), err));
+                    notifier.notifyPlayer(b.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
+                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                    "engine.error stage=notifyPending playerId=" + b.playerId(), err));
+                })
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                        "engine.error stage=pairScript matchId=" + matchId, err));
     }
 
     private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
