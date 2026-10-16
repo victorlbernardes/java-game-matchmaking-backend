@@ -2,17 +2,59 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+      - 'hotfix/**'
+      - 'chore/**'
+      - 'refactor/**'
+      - 'docs/**'
+      - 'test/**'
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  branch-name:
+    name: Validate branch name
     runs-on: ubuntu-latest
+    permissions:
+      contents: none
+    outputs:
+      valid: ${{ steps.check.outputs.valid }}
+    steps:
+      - id: check
+        name: Check branch name convention
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH="${{ github.head_ref }}"
+          else
+            BRANCH="${GITHUB_REF_NAME}"
+          fi
+          echo "Branch: $BRANCH"
+          if echo "$BRANCH" | grep -qE '^(feature|fix|hotfix|chore|refactor|docs|test)/[0-9]+-[a-z0-9-]+$|^main$'; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            echo "Branch name is valid"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Branch name '$BRANCH' does not follow the convention: <type>/<number>-<description>"
+            echo "::error::Allowed types: feature, fix, hotfix, chore, refactor, docs, test"
+            exit 1
+          fi
+
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    needs: branch-name
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Set up JDK 21 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -20,4 +62,19 @@ jobs:
           cache: maven
 
       - name: Build and test
-        run: mvn -B verify
+        run: mvn -B clean verify
+
+      - name: List build artifacts
+        if: always()
+        run: |
+          echo "Build artifacts:"
+          find . -path '*/target/*.jar' -type f 2>/dev/null | head -20 || echo "(none)"
+
+      - name: Upload build artifacts
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-artifacts-${{ github.sha }}
+          path: |
+            */target/*.jar
+          retention-days: 30

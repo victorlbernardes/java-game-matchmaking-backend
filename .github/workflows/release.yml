@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        id: tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "Tag: $TAG"
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag format is valid"
+            echo "name=$TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Tag '$TAG' does not follow vMAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+
+      - name: Verify tag belongs to main
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git fetch origin main --depth=1
+          if git merge-base --is-ancestor "origin/main" "refs/tags/$TAG" 2>/dev/null || \
+             git rev-parse "origin/main" 2>/dev/null | grep -q "$(git rev-parse "refs/tags/$TAG" 2>/dev/null | cut -c1-7)"; then
+            echo "Tag $TAG belongs to main history"
+          else
+            echo "::error::Tag $TAG does not point to a commit in main"
+            exit 1
+          fi
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and verify
+        run: mvn -B clean verify
+
+      - name: Collect artifacts
+        id: artifacts
+        run: |
+          mkdir -p release-artifacts
+          JARS=$(find . -path '*/target/*.jar' -type f 2>/dev/null)
+          if [ -z "$JARS" ]; then
+            echo "::error::No JAR artifacts found after build"
+            exit 1
+          fi
+          echo "Artifacts found:"
+          echo "$JARS"
+          for jar in $JARS; do
+            cp "$jar" release-artifacts/
+          done
+          ls -la release-artifacts/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            NOTES=$(git log --oneline --no-decorate "$PREV_TAG".."$TAG" 2>/dev/null || git log --oneline -10)
+          else
+            NOTES=$(git log --oneline --no-decorate -20)
+          fi
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$NOTES"
+            echo ""
+            echo "## Artifacts"
+            echo "JAR files for all modules are attached to this release."
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --notes-file release-notes.md \
+            release-artifacts/*.jar
+          echo "Release $TAG published successfully"

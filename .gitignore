@@ -32,3 +32,10 @@ target/
 
 # Obsidian
 .obsidian
+
+# macOS
+.DS_Store
+
+# Project
+*.http
+!.gitkeep
