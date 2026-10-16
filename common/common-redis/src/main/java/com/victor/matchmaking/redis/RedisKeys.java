@@ -24,4 +24,8 @@ public final class RedisKeys {
     public static String matchPendingKey(String matchId) {
         return "match-pending:" + matchId;
     }
+
+    public static String partyKey(String partyId) {
+        return "party:" + partyId;
+    }
 }

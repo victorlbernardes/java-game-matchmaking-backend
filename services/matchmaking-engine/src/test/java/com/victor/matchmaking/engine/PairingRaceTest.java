@@ -51,7 +51,7 @@ class PairingRaceTest {
             // Worker 1 pairs the 2 tickets (atomic ZREM + SET)
             Object result1 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                             .arg("1").arg(queueKey)
-                            .arg("match-race-1").arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}").arg("30"))
+                            .arg("match-race-1").arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}").arg("30").arg("2"))
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
             assertNotNull(result1, "worker1 must return a result");
             assertEquals("match-race-1", result1.toString(), "worker1 must win the race");
@@ -59,7 +59,7 @@ class PairingRaceTest {
             // Worker 2 tries to pair the same 2 tickets — but they are already removed from the queue
             Object result2 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                             .arg("1").arg(queueKey)
-                            .arg("match-race-2").arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}").arg("30"))
+                            .arg("match-race-2").arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}").arg("30").arg("2"))
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
             assertNull(result2, "worker2 must lose the race (tickets already removed by worker1)");
 

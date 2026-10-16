@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "matchmaking",
-    "description": "Complete matchmaking backend API — auth-service + matchmaking-api.\n\n## Services\n- **auth-service** (:8081) — session JWT issuance + JWKS\n- **matchmaking-api** (:8080) — HTTP/WebSocket gateway (tickets, history, WS push)\n\n## Start (order matters)\n```bash\nmvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication\nmvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication\nmvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication\n```\n\n## Auth\nEvery matchmaking-api request except `/health` needs a Bearer token from `POST /v1/auth/login`.\n\n## WebSocket\nOpen `WS Connect`, then send frames: PING, MATCH_CONFIRM, MATCH_DECLINE. Incoming: PONG, MATCH_PENDING_CONFIRMATION, MATCH_CONFIRMED, MATCH_CANCELLED, ERROR.",
+    "description": "Complete matchmaking backend API — auth-service + matchmaking-api.\n\n## Services\n- **auth-service** (:8081) — session JWT issuance + JWKS\n- **matchmaking-api** (:8080) — HTTP/WebSocket gateway (tickets, history, WS push)\n\n## Start (order matters)\n```bash\nmvn -B install -DskipTests   # build + install every module FIRST\nmvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication\nmvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication\nmvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication\n```\n\n## Auth\nEvery matchmaking-api request except `/health` needs a Bearer token from `POST /v1/auth/login`.\n\n## WebSocket\nOpen `WS Connect`, then send frames: PING, MATCH_CONFIRM, MATCH_DECLINE. Incoming: PONG, MATCH_PENDING_CONFIRMATION, MATCH_CONFIRMED, MATCH_CANCELLED, ERROR.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -431,6 +431,242 @@
                 }
               },
               "description": "Unknown id → expect 404."
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/matchmaking/tickets — party enqueue",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"SA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyId}}\",\n  \"members\": [\n    \"player-2\",\n    \"player-3\"\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+              "host": [
+                "{{apiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('whole party enqueued', () => pm.expect(true).to.be.true);"
+                ]
+              }
+            }
+          ],
+          "description": "Enqueue every member of a party in one atomic request.\n\n**Expected:** 201; every member of the party is queued together.\n**Errors:** unknown party → 400; missing token → 401."
+        },
+        {
+          "name": "parties",
+          "item": [
+            {
+              "name": "GET /v1/parties/{partyId}",
+              "request": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{token}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyId}}"
+                  ]
+                }
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "const party = pm.response.json();",
+                      "pm.test('aggregatedSkill present', () => pm.expect(party.aggregatedSkill).to.exist);"
+                    ]
+                  }
+                }
+              ],
+              "description": "Fetch a party with its aggregated skill and dispersion.\n\n**Expected:** 200 with the party JSON.\n**Errors:** unknown party → 404."
+            },
+            {
+              "name": "POST /v1/parties",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{token}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties"
+                  ]
+                }
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 201', () => pm.response.to.have.status(201));",
+                      "const partyId = pm.response.json().partyId;",
+                      "pm.environment.set('partyId', partyId);"
+                    ]
+                  }
+                }
+              ],
+              "description": "Create a party owned by the authenticated leader.\n\n**Expected:** 201 with `{ \"partyId\" }` — the party id is stored in the `partyId` environment variable.\n**Errors:** missing token → 401; blank leaderId is not applicable (the leader is the caller)."
+            },
+            {
+              "name": "POST /v1/parties/{partyId}/members",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{token}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyId}}",
+                    "members"
+                  ]
+                }
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "const party = pm.response.json();",
+                      "pm.test('party is active', () => pm.expect(party.active).to.be.true);"
+                    ]
+                  }
+                }
+              ],
+              "description": "Add the authenticated player to a party.\n\n**Expected:** 200 with the updated party.\n**Errors:** party not found → 404; not a member → 403; party dissolved → 409."
+            },
+            {
+              "name": "DELETE /v1/parties/{partyId}/members/{playerId}",
+              "request": {
+                "method": "DELETE",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{token}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members/{{playerId}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyId}}",
+                    "members",
+                    "{{playerId}}"
+                  ]
+                }
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "const party = pm.response.json();",
+                      "pm.test('player removed', () => pm.expect(party.members).to.not.include('{{playerId}}'));"
+                    ]
+                  }
+                }
+              ],
+              "description": "Remove a member. Only the party leader may remove another member.\n\n**Expected:** 200 with the updated party, or 403 for a non-leader.\n**Errors:** player not a member → 403."
+            },
+            {
+              "name": "DELETE /v1/parties/{partyId}",
+              "request": {
+                "method": "DELETE",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{token}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyId}}"
+                  ]
+                }
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "const party = pm.response.json();",
+                      "pm.test('party dissolved', () => pm.expect(party.active).to.be.false);"
+                    ]
+                  }
+                }
+              ],
+              "description": "Dissolve a party. Only the party leader may dissolve it.\n\n**Expected:** 200 with the dissolved party, or 403 for a non-leader.\n**Errors:** unknown party → 404."
             }
           ]
         },
@@ -925,6 +1161,628 @@
                   ]
                 }
               }
+            }
+          ]
+        },
+        {
+          "name": "e2e-w11",
+          "item": [
+            {
+              "name": "1. Login party leader (skill 88)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{authBaseUrl}}/v1/auth/login",
+                  "host": [
+                    "{{authBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "auth",
+                    "login"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"playerId\": \"p2\"\n}"
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.environment.set('tokenW11Leader', pm.response.json().token);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "2. Login party member A (skill 88)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{authBaseUrl}}/v1/auth/login",
+                  "host": [
+                    "{{authBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "auth",
+                    "login"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"playerId\": \"p38\"\n}"
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.environment.set('tokenW11MemberA', pm.response.json().token);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "3. Login party member B (skill 88)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{authBaseUrl}}/v1/auth/login",
+                  "host": [
+                    "{{authBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "auth",
+                    "login"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"playerId\": \"p163\"\n}"
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.environment.set('tokenW11MemberB', pm.response.json().token);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "4. Create party",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Leader}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties"
+                  ]
+                },
+                "description": "The authenticated leader creates the party; the partyId is stored in `partyW11`."
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 201', () => pm.response.to.have.status(201));",
+                      "pm.environment.set('partyW11', pm.response.json().partyId);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "5. Member A joins",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11MemberA}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyW11"
+                  ]
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "6. Member B joins",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11MemberB}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyW11"
+                  ]
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "7. GET party (3 members, aggregated skill)",
+              "request": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Leader}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyW11}}"
+                  ]
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "const p = pm.response.json();",
+                      "pm.test('3 members', () => pm.expect(p.members.length).to.eql(3));",
+                      "pm.test('aggregatedSkill is 88', () => pm.expect(p.aggregatedSkill).to.eql(88));"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "8. Party enqueue (5v5, atomic)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Leader}}"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "w11-party-{{$timestamp}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11}}\",\n  \"members\": [\n    \"p2\",\n    \"p38\",\n    \"p163\"\n  ]\n}"
+                },
+                "description": "One ticket per member is created and linked to the party."
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 201', () => pm.response.to.have.status(201));",
+                      "const t = pm.response.json();",
+                      "pm.test('the ticket carries the partyId', () => pm.expect(t.partyId).to.eql(pm.environment.get('partyW11')));",
+                      "pm.environment.set('partyTicketW11', t.ticketId);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "9. Enqueue 7 solo fillers (5v5, skill 88)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Leader}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                },
+                "description": "Pre-request script: 7 solos (all skill 88) queue in the same 5v5/NA partition, so the engine can fill the party."
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "const solos = [\"p215\", \"p360\", \"p398\", \"p412\", \"p595\", \"p647\", \"p792\"];",
+                      "solos.forEach((pid) => {",
+                      "  pm.sendRequest({url: pm.environment.get('authBaseUrl') + '/v1/auth/login', method: 'POST',",
+                      "    header: {'Content-Type': 'application/json'},",
+                      "    body: {mode: 'raw', raw: JSON.stringify({playerId: pid})}}, (err, login) => {",
+                      "    pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets', method: 'POST',",
+                      "      header: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + login.json().token},",
+                      "      body: {mode: 'raw', raw: JSON.stringify({gameMode: '5v5', region: 'NA', maxLatencyMs: 120})}}, (e, r) => {",
+                      "      pm.test('solo ' + pid + ' enqueued', () => pm.expect(r.code).to.be.oneOf([200, 201]));",
+                      "    });",
+                      "  });",
+                      "});"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('pre-request enqueued the fillers', () => pm.expect(true).to.be.true);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "10. Party was filled into one match",
+              "request": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Leader}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{partyTicketW11}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets",
+                    "{{partyTicketW11}}"
+                  ]
+                },
+                "description": "Waits ~3s so the engine (500ms cycle) fills the 3-member party with the 7 solos; the party ticket must be CONFIRMING."
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "setTimeout(() => {",
+                      "  pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets/' + pm.environment.get('partyTicketW11'),",
+                      "    method: 'GET', header: {Authorization: 'Bearer ' + pm.environment.get('tokenW11Leader')}}, (err, res) => {",
+                      "    pm.test('the party ticket is CONFIRMING (party filled, never split)', () =>",
+                      "      pm.expect(res.json().status).to.eql('CONFIRMING'));",
+                      "    pm.test('the whole party shares one partyId', () =>",
+                      "      pm.expect(res.json().partyId).to.eql(pm.environment.get('partyW11')));",
+                      "  });",
+                      "}, 3000);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "11. Login cancel leader (skill 88)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{authBaseUrl}}/v1/auth/login",
+                  "host": [
+                    "{{authBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "auth",
+                    "login"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"playerId\": \"p844\"\n}"
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.environment.set('tokenW11Cancel', pm.response.json().token);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "12. Create second party",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Cancel}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties"
+                  ]
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 201', () => pm.response.to.have.status(201));",
+                      "pm.environment.set('partyW11Cancel', pm.response.json().partyId);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "13. Second party enqueue (5v5/EU, stays SEARCHING)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Cancel}}"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "w11-cancel-{{$timestamp}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"EU\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11Cancel}}\",\n  \"members\": [\n    \"p844\",\n    \"p1019\"\n  ]\n}"
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 201', () => pm.response.to.have.status(201));",
+                      "pm.environment.set('cancelTicketW11', pm.response.json().ticketId);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "14. Cancel one member ticket -> cancels the whole party",
+              "request": {
+                "method": "DELETE",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Cancel}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{cancelTicketW11}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets",
+                    "{{cancelTicketW11}}"
+                  ]
+                },
+                "description": "The party unit is atomic: cancelling one member ticket takes every member ticket out of the queue."
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.test('ticket CANCELLED', () => pm.expect(pm.response.json().status).to.eql('CANCELLED'));"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "15. Dissolve the second party",
+              "request": {
+                "method": "DELETE",
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{tokenW11Cancel}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11Cancel}}",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "parties",
+                    "{{partyW11Cancel}}"
+                  ]
+                }
+              },
+              "response": [],
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.test('party dissolved', () => pm.expect(pm.response.json().active).to.eql(false));"
+                    ]
+                  }
+                }
+              ]
             }
           ]
         }

@@ -15,7 +15,8 @@ public record MatchmakingTicket(
         int skill,
         Instant queuedAt,
         TicketState status,
-        long version) {
+        long version,
+        String partyId) {
 
     public MatchmakingTicket {
         if (id == null || id.isBlank()) {
@@ -38,6 +39,9 @@ public record MatchmakingTicket(
         }
         if (version < 0) {
             throw new IllegalArgumentException("version must be >= 0");
+        }
+        if (partyId != null && partyId.isBlank()) {
+            throw new IllegalArgumentException("partyId must not be blank");
         }
     }
 }

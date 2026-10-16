@@ -50,7 +50,13 @@ public final class MatchmakingApiApplication {
                 com.victor.matchmaking.redis.RedisKeys.CHANNEL_PLAYER_NOTIFICATIONS,
                 msg -> wsHub.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
         JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().addJwk(fetchPublicJwk(jwksUrl)));
-        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository);
+        // One shared, Redis-backed party store: a party created by one route must
+        // be the same party the ticket (enqueue/cancel) routes resolve.
+        com.victor.matchmaking.redis.PartyStore partyStore = new com.victor.matchmaking.redis.RedisPartyStore(redis);
+        com.victor.matchmaking.domain.player.SkillProvider skillProvider =
+                new com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider();
+        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository,
+                skillProvider, partyStore);
 
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)

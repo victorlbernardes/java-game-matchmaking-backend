@@ -97,9 +97,8 @@ class MatchmakingApiTest {
         JsonObject created = new JsonObject(first.body());
         assertNotNull(created.getString("ticketId"));
         assertEquals("SEARCHING", created.getString("status"));
-        assertEquals(48, created.getJsonObject("searchRange").getInteger("minSkill"));
-        assertEquals(52, created.getJsonObject("searchRange").getInteger("maxSkill"));
-
+        assertEquals(58, created.getJsonObject("searchRange").getInteger("minSkill"));
+        assertEquals(62, created.getJsonObject("searchRange").getInteger("maxSkill"));
         HttpResponse<String> retry = client.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
                         .POST(HttpRequest.BodyPublishers.ofString(body))
@@ -183,6 +182,42 @@ class MatchmakingApiTest {
                         .header("Authorization", "Bearer " + token).GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(404, response.statusCode());
+        }
+    }
+
+    @Test
+    void partyEnqueueReachesThePartyCreatedByThePartyRoute() throws Exception {
+        try (HttpClient client = HttpClient.newHttpClient()) {
+        String leader = issueToken("party-leader");
+        String member = issueToken("party-member");
+
+        // The party is created by one route...
+        HttpResponse<String> created = client.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/v1/parties"))
+                        .POST(HttpRequest.BodyPublishers.noBody())
+                        .header("Authorization", "Bearer " + leader).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, created.statusCode());
+        String partyId = new JsonObject(created.body()).getString("partyId");
+
+        HttpResponse<String> joined = client.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/v1/parties/" + partyId + "/members"))
+                        .POST(HttpRequest.BodyPublishers.noBody())
+                        .header("Authorization", "Bearer " + member).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, joined.statusCode());
+
+        // ...and the ticket route must resolve the very same party (shared store).
+        String body = "{\"gameMode\":\"1v1\",\"region\":\"NA\",\"maxLatencyMs\":80,"
+                + "\"partyId\":\"" + partyId + "\",\"members\":[\"party-leader\",\"party-member\"]}";
+        HttpResponse<String> enqueued = client.send(HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/v1/matchmaking/tickets"))
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .header("Authorization", "Bearer " + leader)
+                        .header("content-type", "application/json").build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, enqueued.statusCode());
+        assertEquals(partyId, new JsonObject(enqueued.body()).getString("partyId"));
         }
     }
 }

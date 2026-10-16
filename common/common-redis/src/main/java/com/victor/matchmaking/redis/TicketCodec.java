@@ -19,7 +19,7 @@ public final class TicketCodec {
     }
 
     public static JsonObject toJson(MatchmakingTicket ticket) {
-        return new JsonObject()
+        JsonObject json = new JsonObject()
                 .put("ticketId", ticket.id())
                 .put("playerId", ticket.playerId())
                 .put("status", ticket.status().name())
@@ -28,8 +28,11 @@ public final class TicketCodec {
                 .put("maxLatencyMs", ticket.maxLatencyMs())
                 .put("queuedAt", ticket.queuedAt().toString())
                 .put("skill", ticket.skill())
-                .put("version", ticket.version())
-                .put("searchRange", searchRange(ticket.skill()));
+                .put("version", ticket.version());
+        if (ticket.partyId() != null) {
+            json.put("partyId", ticket.partyId());
+        }
+        return json.put("searchRange", searchRange(ticket.skill()));
     }
 
     /** Deserializes the JSON stored in Redis back into the domain record. */
@@ -43,7 +46,8 @@ public final class TicketCodec {
                 json.getInteger("skill"),
                 Instant.parse(json.getString("queuedAt")),
                 TicketState.valueOf(json.getString("status")),
-                json.getInteger("version", 0));
+                json.getInteger("version", 0),
+                json.getString("partyId"));
     }
 
     private static GameMode parseGameMode(String label) {

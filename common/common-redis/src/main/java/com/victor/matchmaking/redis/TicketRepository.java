@@ -1,6 +1,7 @@
 package com.victor.matchmaking.redis;
 
 import java.time.Instant;
+import java.util.List;
 
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 
@@ -17,6 +18,12 @@ public interface TicketRepository {
 
     /** Atomic idempotent create: GET idem:{key} + SET ticket + ZADD queue + SET idem in one Lua script. */
     Future<String> createIdempotent(String idempotencyKey, MatchmakingTicket ticket);
+
+    /**
+     * Saves every ticket of a party in one go and returns the created ticket ids
+     * in creation order. The caller links them to the party afterwards.
+     */
+    Future<List<String>> createPartyTickets(List<MatchmakingTicket> tickets);
 
     String newTicketId();
 
