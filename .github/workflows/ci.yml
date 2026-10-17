@@ -159,6 +159,9 @@ jobs:
       - name: Event contracts (this change against its merge base)
         run: bash requests/kafka/check_contract_gate.sh
 
+      - name: Contract evolution rules (the breaks the registry accepts)
+        run: bash requests/kafka/check_proto_evolution.sh
+
       - name: Container logs on failure
         if: failure()
         run: docker compose -p game-matchmaking-backend logs --tail 50

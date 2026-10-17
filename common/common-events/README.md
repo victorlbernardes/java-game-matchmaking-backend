@@ -23,6 +23,16 @@ src/main/java/com/victor/matchmaking/events/
 - **The `.proto` is the contract.** Field numbers are permanent; a published number is
   never reused or renumbered. `EventMetadata.schemaVersion` is bumped only when the
   *meaning* of a field changes (the registry version is derived from the schema itself).
+  Growing a contract is **additive**: a new field takes a number that was never used. To
+  retire a field, stop writing it and `reserved` **both** its number and its name — the
+  number of a field is what a reader resolves, the name is only what the registry tracks.
+  To change a field's kind, add a new field and stop writing the old one.
+- **Those three rules are enforced in CI**, not just written here:
+  `requests/kafka/check_proto_evolution.sh` compiles the merge base and the change with
+  `protoc` into descriptor sets and compares them with `ProtoContractDiff`, which refuses a
+  renumbering, a removal without `reserved`, a kind change and an enum value that moved —
+  the breaks the registry's `FULL` accepts (ADR 0015 measured that; ADR 0017 is the rule).
+  It prints `contract.diff … verdict=compatible|breaking` and exits non-zero on a break.
 - **Events carry identifiers and snapshots, not entities.** A consumer must not need
   `Match`, `MatchmakingTicket` or the queue to act on an event.
 - **The mapper is pure** (no clock, no broker): the caller passes `occurredAt` and
@@ -51,7 +61,8 @@ so a red build says which field the registry refused instead of just "failed".
 The CI gate is `requests/kafka/check_contract_gate.sh` (job `contracts`): it registers
 the contracts of the merge base, then the contracts of the change, and fails when the
 registry refuses. See `docs/adr/0015-protobuf-vs-avro-ci-gate.md` — including what
-`FULL` does *not* catch (renumbering, removal and renaming of a field are accepted).
+`FULL` does *not* catch (renumbering, removal and renaming of a field are accepted), which
+is what `requests/kafka/check_proto_evolution.sh` (same job) closes, per ADR 0017.
 
 Reading an event back (bytes → registry → JSON): `requests/kafka/verify_match_confirmed.sh`.
 

@@ -33,6 +33,7 @@ requests/
 ├── e2e/check_confirmation_sweep.py    # focused confirmation-timeout timeline
 ├── kafka/check_kafka.sh               # infrastructure: containers, registry, log round-trip
 ├── kafka/check_contract_gate.sh       # contract: is this change compatible with its base?
+├── kafka/check_proto_evolution.sh     # contract: the rules the registry does not check (W13)
 ├── kafka/verify_match_confirmed.sh    # event: MATCH_CONFIRMED decodes through the registry
 ├── kafka/verify_idempotent_consumer.sh # consumer: a replay must not apply anything twice (W13)
 └── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
@@ -225,6 +226,45 @@ case (one build + registrar + both controls); the baseline adds one more build (
 and one more registrar run (6 s); `check_kafka.sh` 25 s. See
 `docs/adr/0015-protobuf-vs-avro-ci-gate.md`.
 
+### The evolution rules (W13 task 3)
+
+```bash
+bash requests/kafka/check_proto_evolution.sh                  # this change vs origin/main
+BASE_REF=HEAD bash requests/kafka/check_proto_evolution.sh    # this change vs the last commit
+```
+
+The registry gate answers *"is this change compatible by the registry's rules?"*. This
+script answers the question the registry cannot: **does this change break a reader of the
+previous contract?** A Protobuf field is tracked by the registry by *name*, so a
+renumbering, a removal and a rename all pass `FULL` (measured, ADR 0015) — and those are
+exactly the breaks, because the wire is read by *number*.
+
+How it runs, and why it needs no registry: both sides are compiled with `protoc` into a
+`FileDescriptorSet` (`--include_imports`, so a change in `matchmaking/common/types.proto`
+is compared too) and `ProtoContractDiff` compares the descriptors — the wire view.
+Comments, formatting and field order are invisible to both, which is the point.
+
+Each run prints what was compared and a verdict, and the CI step reads the verdict:
+
+```text
+contract.diff files=3 messages=4 fields=15 enums=2 enumValues=7 violations=0 advisories=0 verdict=compatible
+FIELD_RENUMBERED MatchConfirmed.players: field number 5 became 6; the wire is read by number, so a
+  reader of the old contract decodes whatever else took that number. Add a new field and stop writing
+  the old one instead.
+```
+
+Two severities: a **violation** fails the build; an **advisory** is printed and does not
+(`FIELD_NAME_NOT_RESERVED` — the number is reserved but the name is not;
+`FIELD_PRESENCE_CHANGED` — a field became explicitly `optional`). Five mutations are fed
+to the checker on every run — renumbering, removal without `reserved`, kind change,
+renumbered enum value (in the imported types) — and it must refuse all of them; two
+changes are fed to it and must be **accepted** (a field added with a free number, and a
+removal done with `reserved <number>` + `reserved "<name>"`). A checker that refuses
+everything gets bypassed the first time it is inconvenient.
+
+See `docs/adr/0017-schema-evolution.md` for the rules themselves and
+`common/common-events/README.md` for what a producer must do instead.
+
 ### The idempotent consumer (W13 task 1)
 
 ```bash
@@ -313,6 +353,8 @@ docker exec game-matchmaking-backend-kafka-1 kafka-topics --bootstrap-server loc
    `requests/kafka/verify_match_confirmed.sh`
 7. Changing a contract (W12 task 3): `bash requests/kafka/check_contract_gate.sh`
    before opening the PR — the same script the `contracts` CI job runs
+8. The same change (W13 task 3): `bash requests/kafka/check_proto_evolution.sh`
+   refuses what the registry accepts (renumbering, removal without `reserved`, rename)
 8. Consumers (W13): start `match-orchestrator`, confirm a match (E2E S11) and watch the
    projection row appear; then `requests/kafka/verify_idempotent_consumer.sh` to rewind
    the group and prove a full replay applies nothing twice
