@@ -11,11 +11,67 @@
     </parent>
     <artifactId>common-events</artifactId>
     <name>common-events</name>
+    <!-- Event contracts (Protobuf), the domain->event mappers and the schema
+         registration step that versions those contracts in the Schema Registry. -->
     <dependencies>
         <dependency>
             <groupId>com.victor.matchmaking</groupId>
             <artifactId>common-proto</artifactId>
             <version>0.2.0-SNAPSHOT</version>
         </dependency>
+        <dependency>
+            <groupId>com.victor.matchmaking</groupId>
+            <artifactId>common-domain</artifactId>
+            <version>0.2.0-SNAPSHOT</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+        </dependency>
+        <!-- Confluent serializers: the runtime producer serializes with
+             KafkaProtobufSerializer and the build-time registrar uses the same
+             serializer to register the schema (see SchemaRegistrar). -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-protobuf-serializer</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-schema-registry-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
+    <build>
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>${os.maven.plugin.version}</version>
+            </extension>
+        </extensions>
+        <plugins>
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <configuration>
+                    <!-- The event protos import the shared types from common-proto.
+                         protoc resolves imports from a path, not from the classpath. -->
+                    <additionalProtoPathElements>
+                        <additionalProtoPathElement>${project.basedir}/../common-proto/src/main/proto</additionalProtoPathElement>
+                    </additionalProtoPathElements>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>

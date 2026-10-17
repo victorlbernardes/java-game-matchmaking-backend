@@ -34,6 +34,15 @@
         <netty.version>4.2.18.Final</netty.version>
         <flyway.version>12.11.0</flyway.version>
         <postgres.version>42.7.13</postgres.version>
+        <!-- Events (W12). The Confluent provider 7.7.1 declares protobuf 3.25.4, so
+             protoc must be the same version; the Kafka client must be the fork the
+             Confluent serializer was compiled against (7.7.1-ccs, Kafka 3.7 base);
+             see ADR 0016 for why it is not the Vert.x Kafka client. -->
+        <protobuf.version>3.25.4</protobuf.version>
+        <confluent.version>7.7.1</confluent.version>
+        <kafka.clients.version>7.7.1-ccs</kafka.clients.version>
+        <protobuf.maven.plugin.version>0.6.1</protobuf.maven.plugin.version>
+        <os.maven.plugin.version>1.7.1</os.maven.plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -77,8 +86,38 @@
                 <artifactId>jackson-databind</artifactId>
                 <version>${jackson3.version}</version>
             </dependency>
+            <dependency>
+                <groupId>com.google.protobuf</groupId>
+                <artifactId>protobuf-java</artifactId>
+                <version>${protobuf.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.confluent</groupId>
+                <artifactId>kafka-schema-registry-client</artifactId>
+                <version>${confluent.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.confluent</groupId>
+                <artifactId>kafka-protobuf-serializer</artifactId>
+                <version>${confluent.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.kafka</groupId>
+                <artifactId>kafka-clients</artifactId>
+                <version>${kafka.clients.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
+
+    <!-- The Confluent client artifacts (schema-registry-client, protobuf serializer)
+         are not published to Maven Central; they live in Confluent's public Maven
+         repository. No credentials are needed for the community edition. -->
+    <repositories>
+        <repository>
+            <id>confluent</id>
+            <url>https://packages.confluent.io/maven/</url>
+        </repository>
+    </repositories>
 
     <build>
         <pluginManagement>
@@ -94,6 +133,17 @@
                     <version>3.5.2</version>
                     <configuration>
                         <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    </configuration>
+                </plugin>
+                <!-- Generates Java classes from the .proto contracts. ${os.detected.classifier}
+                     comes from the os-maven-plugin extension declared in each module that
+                     compiles protos, so protoc is picked per platform (macOS/Windows/Linux). -->
+                <plugin>
+                    <groupId>org.xolstice.maven.plugins</groupId>
+                    <artifactId>protobuf-maven-plugin</artifactId>
+                    <version>${protobuf.maven.plugin.version}</version>
+                    <configuration>
+                        <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
                     </configuration>
                 </plugin>
             </plugins>

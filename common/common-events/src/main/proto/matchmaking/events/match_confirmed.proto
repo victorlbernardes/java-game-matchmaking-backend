@@ -1,0 +1,32 @@
+// Contract of the `matchmaking.events.match-confirmed` topic - one file per event
+// type, one topic per event type (ADR 0016). The subject in the Schema Registry is
+// `matchmaking.events.match-confirmed-value` (TopicNameStrategy).
+syntax = "proto3";
+
+package matchmaking.events;
+
+import "matchmaking/common/types.proto";
+
+option java_package = "com.victor.matchmaking.events";
+option java_outer_classname = "MatchConfirmedEvent";
+option java_multiple_files = true;
+
+// A match reached the required number of confirmations and was persisted.
+//
+// It carries identifiers and a skill snapshot, not the matchmaker's entities: a
+// consumer (orchestrator, telemetry, skill recalculation) must not need to know
+// `Match`, `MatchmakingTicket` or the queue to act on this event. That low
+// coupling is what keeps the contract stable across refactors.
+message MatchConfirmed {
+  matchmaking.common.EventMetadata meta = 1;
+  string match_id = 2;
+  matchmaking.common.GameMode game_mode = 3;
+  matchmaking.common.Region region = 4;
+  repeated MatchPlayerState players = 5;
+}
+
+message MatchPlayerState {
+  string player_id = 1;
+  int32 team = 2;                         // 1 or 2 (the domain labels them A/B)
+  int32 skill_at_match = 3;               // skill snapshot at match time
+}

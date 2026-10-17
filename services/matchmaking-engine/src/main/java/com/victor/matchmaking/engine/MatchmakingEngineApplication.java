@@ -12,9 +12,11 @@ import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.domain.ticket.TicketState;
 import com.victor.matchmaking.domain.ticket.TicketStateMachine;
 import com.victor.matchmaking.engine.application.FillPolicy;
+import com.victor.matchmaking.engine.application.MatchEventPublisher;
 import com.victor.matchmaking.engine.application.PairingPolicy;
 import com.victor.matchmaking.engine.application.PendingMatch;
 import com.victor.matchmaking.engine.application.PendingMatchStore;
+import com.victor.matchmaking.engine.infrastructure.KafkaMatchEventPublisher;
 import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
@@ -70,8 +72,13 @@ public final class MatchmakingEngineApplication {
         com.victor.matchmaking.db.MatchRepository matches =
                 com.victor.matchmaking.db.MatchRepository.connect(vertx, dbConfig);
 
+        // Durable event log (Kafka): Redis carries the live push to the API, Kafka the
+        // event every other consumer (orchestrator, analytics) reads. See ADR 0014/0016.
+        KafkaMatchEventPublisher events = KafkaMatchEventPublisher.fromEnv();
+        Runtime.getRuntime().addShutdownHook(new Thread(events::close, "kafka-event-publisher-close"));
+
         RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
-                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, matches));
+                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, matches, events));
 
         // Load the atomic pairing script before starting the pairing loop
         loadPairScript(redis).onSuccess(sha -> {
@@ -242,7 +249,8 @@ public final class MatchmakingEngineApplication {
 
     private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
             TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches) {
+            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches,
+            MatchEventPublisher events) {
         Payloads.MatchConfirmation command;
         try {
             command = Payloads.MatchConfirmation.fromJson(msg);
@@ -284,7 +292,7 @@ public final class MatchmakingEngineApplication {
                                     matchId, playerId, String.valueOf(confirmed),
                                     String.valueOf(pm.players().size()));
                             if (confirmed >= pm.players().size()) {
-                                confirm(pm, tickets, pending, notifier, matches);
+                                confirm(pm, tickets, pending, notifier, matches, events);
                             }
                         })
                         .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -295,7 +303,8 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void confirm(PendingMatch pm, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches) {
+            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches,
+            MatchEventPublisher events) {
         // Load both tickets, then transition them and persist the durable match row.
         List<Future<MatchmakingTicket>> loaded = pm.players().stream()
                 .map(p -> tickets.findById(p.ticketId()))
@@ -323,11 +332,17 @@ public final class MatchmakingEngineApplication {
                     pm.matchId(), first.gameMode(), first.region(),
                     com.victor.matchmaking.domain.match.MatchStatus.PENDING, Instant.now(), null, null);
             matches.save(match, players)
-                    .onSuccess(v -> LOG.log(System.Logger.Level.INFO,
-                            "match.confirmed matchId={0} players={1} persisted=true",
-                            pm.matchId(), pm.playerIds()))
+                    // Publish only after the row is durable, and only report the match as
+                    // confirmed once the broker acknowledged the event: the log is what
+                    // every other service acts on. (Atomicity between the two writes is
+                    // the Transactional Outbox, W14 - today a crash in between can lose
+                    // the event.)
+                    .compose(v -> events.publishConfirmed(match, players))
+                    .onSuccess(eventId -> LOG.log(System.Logger.Level.INFO,
+                            "match.confirmed matchId={0} players={1} persisted=true eventId={2}",
+                            pm.matchId(), pm.playerIds(), eventId))
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                            "engine.error stage=persistMatch matchId=" + pm.matchId(), err));
+                            "engine.error stage=persistOrPublishMatch matchId=" + pm.matchId(), err));
             pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                     "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
             for (PendingMatch.PendingPlayer player : pm.players()) {
