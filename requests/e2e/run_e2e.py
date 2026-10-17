@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""End-to-end validation of the matchmaking backend (W9/W10/W11) against the
-running services and the real Redis/Postgres from docker-compose."""
+"""End-to-end validation of the matchmaking backend (W9/W10/W11/W12/W13) against the
+running services and the real Redis/Postgres/Kafka from docker-compose."""
 import json
 import subprocess
 import time
@@ -10,6 +10,7 @@ import urllib.request
 API = "http://localhost:8080"
 AUTH = "http://localhost:8081"
 REDIS_CONTAINER = "game-matchmaking-backend-redis-1"
+POSTGRES_CONTAINER = "game-matchmaking-backend-postgres-1"
 KAFKA_VERIFIER = "requests/kafka/verify_match_confirmed.sh"
 
 PASS, FAIL = [], []
@@ -344,6 +345,62 @@ def verify_match_confirmed(expected_match_id):
     return out.returncode, event, create_time_ms
 
 
+def s_match_projected():
+    """W13: the confirmed match reaches the orchestrator's projection exactly once."""
+    scenario("S11 idempotent consumer (W13): one projection row per confirmed match")
+    s, pair = skill_group(2)
+    a, b = pair
+    enqueue(a), enqueue(b)
+    pm = wait_until(lambda: pending_matches() or None, 8)
+    if not pm:
+        check("a pending match exists to confirm", False, "(engine not pairing)")
+        return
+    match_id = pm[0][0]
+    for pid in (a, b):
+        redis("publish", "match_confirmations",
+              json.dumps({"matchId": match_id, "playerId": pid, "action": "CONFIRM"}))
+    wait_until(lambda: redis("exists", f"match-pending:{match_id}") == "0", 10)
+
+    rc, event, _ = verify_match_confirmed(match_id)
+    check("the event is on the log, so the consumer has something to read", rc == 0)
+    if rc != 0 or not event:
+        return
+    event_id = (event.get("meta") or {}).get("eventId")
+
+    # The consumer is a separate process: it has to poll, project and commit. The
+    # check is on the database, because that is where the effect is - the log line
+    # only says what the consumer intended.
+    def projection():
+        return psql(f"SELECT count(*) FROM match_allocations WHERE match_id = '{match_id}'")
+
+    check("the orchestrator projected the confirmed match",
+          wait_until(lambda: projection() == "1", 20) is not None,
+          f"rows={projection()} (start the orchestrator: see requests/README.md)")
+
+    row = psql(f"SELECT game_mode || '|' || region || '|' || player_count || '|' || status "
+               f"FROM match_allocations WHERE match_id = '{match_id}'")
+    check("the projection carries mode, region, roster size and its own state",
+          row == "1v1|NA|2|PENDING_ALLOCATION", row)
+
+    inbox = psql(f"SELECT count(*) FROM processed_events WHERE event_id = '{event_id}' "
+                 f"AND consumer_group = 'match-orchestrator'")
+    check("the event is recorded in the inbox of the consumer group", inbox == "1", f"rows={inbox}")
+
+    # A consumer that projected the same match twice would show up here, and this is
+    # the shape the replay check (requests/kafka/verify_idempotent_consumer.sh) proves
+    # for the whole topic.
+    time.sleep(2)
+    check("still exactly one row after the consumer committed and moved on",
+          projection() == "1", f"rows={projection()}")
+
+
+def psql(query):
+    out = subprocess.run(["docker", "exec", POSTGRES_CONTAINER, "psql", "-U", "matchmaking",
+                          "-d", "matchmaking", "-tAc", query],
+                         capture_output=True, text=True, check=False)
+    return out.stdout.strip()
+
+
 def main():
     print("E2E validation of the matchmaking backend")
     s_health()
@@ -357,6 +414,7 @@ def main():
     s_widening()
     s_timeout()
     s_match_confirmed()
+    s_match_projected()
     print(f"\n===== RESULT: {len(PASS)} passed, {len(FAIL)} failed =====")
     for f in FAIL:
         print("  FAILED:", f)

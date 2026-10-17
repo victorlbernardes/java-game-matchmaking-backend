@@ -11,8 +11,6 @@ import com.victor.matchmaking.domain.match.MatchPlayer;
 
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
-import io.vertx.jdbcclient.JDBCConnectOptions;
-import io.vertx.jdbcclient.JDBCPool;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
@@ -28,11 +26,7 @@ public final class MatchRepository {
     }
 
     public static MatchRepository connect(Vertx vertx, DatabaseConfig config) {
-        Pool pool = JDBCPool.pool(vertx, new JDBCConnectOptions()
-                .setJdbcUrl(config.jdbcUrl())
-                .setUser(config.user())
-                .setPassword(config.password()), new io.vertx.sqlclient.PoolOptions());
-        return new MatchRepository(pool);
+        return new MatchRepository(DatabasePool.connect(vertx, config));
     }
 
     /** Inserts a match and its players. Idempotent on match id (retry-safe for W7/W8). */

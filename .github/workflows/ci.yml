@@ -55,6 +55,10 @@ jobs:
     # pair.lua (SET NX / EVALSHA), the ZSET ordering and the match-pending TTL.
     # They read REDIS_URI (default redis://localhost:6379), so the job needs a
     # real Redis — a mock would delete the property under test.
+    #
+    # Postgres for the same reason: the orchestrator's idempotent consumer is
+    # guaranteed by a unique index and a transaction (W13). Asserting "the same
+    # event applies once" against a fake database would assert the fake.
     services:
       redis:
         image: redis:7-alpine
@@ -62,6 +66,19 @@ jobs:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: matchmaking
+          POSTGRES_PASSWORD: matchmaking
+          POSTGRES_DB: matchmaking
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U matchmaking"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
