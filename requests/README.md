@@ -36,7 +36,8 @@ requests/
 ├── kafka/check_proto_evolution.sh     # contract: the rules the registry does not check (W13)
 ├── kafka/verify_match_confirmed.sh    # event: MATCH_CONFIRMED decodes through the registry
 ├── kafka/verify_idempotent_consumer.sh # consumer: a replay must not apply anything twice (W13)
-└── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
+├── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
+└── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
 ```
 
 ## Party flow (W11)
@@ -265,6 +266,38 @@ everything gets bypassed the first time it is inconvenient.
 See `docs/adr/0017-schema-evolution.md` for the rules themselves and
 `common/common-events/README.md` for what a producer must do instead.
 
+### The transactional outbox (W14)
+
+```bash
+bash requests/kafka/verify_outbox.sh
+```
+
+`docs/adr/0018-transactional-outbox.md`. The engine no longer publishes on the confirmation
+path: the match, its roster and the event that announces it are one transaction, and a relay
+publishes what the table holds. The script proves the property the old path could not have —
+**an event whose publisher never ran is not lost** — and the one that keeps the queue honest: a
+row no code can handle is parked with its reason and does not block the row behind it.
+
+It stops the engine, rewinds the newest published row to `PENDING` (what a crash between the
+commit and the publish leaves behind), watches it stay there with nobody running, starts the
+engine again and requires the event back on the topic **with the same event id**, decoded through
+the registry by `verify_match_confirmed.sh`. It then inserts a row whose topic does not exist and
+requires it to end `PARKED`, with `last_error` saying why, while a good row behind it still goes
+out. Preconditions: the docker stack plus at least one confirmed match in `outbox_events` (E2E
+S11 or any confirmation); the script runs `mvn install` itself and leaves the engine running. 14
+checks, ~90 s.
+
+Reading the queue by hand:
+
+```sql
+SELECT status, count(*) FROM outbox_events GROUP BY status;          -- backlog, log, park lot
+SELECT event_id, partition_key, attempts, last_error, claimed_by
+  FROM outbox_events WHERE status = 'PARKED';                        -- what needs a human
+-- requeue a parked event (it will be published on the next pass):
+UPDATE outbox_events SET status = 'PENDING', attempts = 0, next_attempt_at = NULL
+ WHERE event_id = '<uuid>';
+```
+
 ### The idempotent consumer (W13 task 1)
 
 ```bash
@@ -355,6 +388,8 @@ docker exec game-matchmaking-backend-kafka-1 kafka-topics --bootstrap-server loc
    before opening the PR — the same script the `contracts` CI job runs
 8. The same change (W13 task 3): `bash requests/kafka/check_proto_evolution.sh`
    refuses what the registry accepts (renumbering, removal without `reserved`, rename)
+9. Publisher durability (W14): `bash requests/kafka/verify_outbox.sh` — a row with no engine
+   running is still published after the restart, and a poison row is parked instead of stalling
 8. Consumers (W13): start `match-orchestrator`, confirm a match (E2E S11) and watch the
    projection row appear; then `requests/kafka/verify_idempotent_consumer.sh` to rewind
    the group and prove a full replay applies nothing twice

@@ -12,11 +12,14 @@ import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.domain.ticket.TicketState;
 import com.victor.matchmaking.domain.ticket.TicketStateMachine;
 import com.victor.matchmaking.engine.application.FillPolicy;
-import com.victor.matchmaking.engine.application.MatchEventPublisher;
+import com.victor.matchmaking.engine.application.OutboxQueue;
+import com.victor.matchmaking.engine.application.OutboxRecord;
+import com.victor.matchmaking.engine.application.OutboxRelay;
 import com.victor.matchmaking.engine.application.PairingPolicy;
 import com.victor.matchmaking.engine.application.PendingMatch;
 import com.victor.matchmaking.engine.application.PendingMatchStore;
-import com.victor.matchmaking.engine.infrastructure.KafkaMatchEventPublisher;
+import com.victor.matchmaking.engine.infrastructure.KafkaEventPublisher;
+import com.victor.matchmaking.engine.infrastructure.PostgresOutboxQueue;
 import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
@@ -41,6 +44,12 @@ public final class MatchmakingEngineApplication {
     private static final System.Logger LOG = System.getLogger("matchmaking.engine");
     private static final long PAIRING_INTERVAL_MS = 500;
     private static final long SWEEP_INTERVAL_MS = 1000;
+    /**
+     * How often the outbox relay looks for events to publish (W14). Short enough that the
+     * added lag is well under the refresh of the WebSocket push, long enough not to poll
+     * a table 10 times a second for nothing.
+     */
+    private static final long OUTBOX_INTERVAL_MS = 250;
     static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
     /**
      * The pending-match Redis key must outlive its confirmation deadline,
@@ -69,22 +78,30 @@ public final class MatchmakingEngineApplication {
         RedisPlayerNotifier notifier = new RedisPlayerNotifier(publisher);
         com.victor.matchmaking.db.DatabaseConfig dbConfig = com.victor.matchmaking.db.DatabaseConfig.fromEnv();
         com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
-        com.victor.matchmaking.db.MatchRepository matches =
-                com.victor.matchmaking.db.MatchRepository.connect(vertx, dbConfig);
+        PostgresOutboxQueue outbox = PostgresOutboxQueue.connect(vertx, dbConfig);
 
         // Durable event log (Kafka): Redis carries the live push to the API, Kafka the
         // event every other consumer (orchestrator, analytics) reads. See ADR 0014/0016.
-        KafkaMatchEventPublisher events = KafkaMatchEventPublisher.fromEnv();
-        Runtime.getRuntime().addShutdownHook(new Thread(events::close, "kafka-event-publisher-close"));
+        // Since W14 the engine does not publish on the confirmation path: the event is a
+        // row written in the same transaction as the match, and this relay publishes it
+        // (ADR 0018), so a broker outage delays the event instead of losing it.
+        KafkaEventPublisher kafkaPublisher = KafkaEventPublisher.fromEnv();
+        OutboxRelay relay = new OutboxRelay(outbox, kafkaPublisher, java.time.Clock.systemUTC(), relayId());
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            kafkaPublisher.close();
+            outbox.close();
+        }, "engine-outbox-close"));
 
         RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
-                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, matches, events));
+                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, outbox));
 
         // Load the atomic pairing script before starting the pairing loop
         loadPairScript(redis).onSuccess(sha -> {
             PAIR_SCRIPT_SHA = sha;
             vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier));
             vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier));
+            vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
+                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=outboxDrain", err)));
 
             LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2} pairScript={3}",
                     String.valueOf(PAIRING_INTERVAL_MS), String.valueOf(SWEEP_INTERVAL_MS),
@@ -247,10 +264,20 @@ public final class MatchmakingEngineApplication {
         return assignments;
     }
 
+    /** The event's own clock, so the relay's lag is measured against the fact, not against the write. */
+    private static Instant occurredAtOf(com.victor.matchmaking.events.MatchConfirmed event) {
+        return Instant.ofEpochSecond(
+                event.getMeta().getOccurredAt().getSeconds(), event.getMeta().getOccurredAt().getNanos());
+    }
+
+    /** Identifies this relay on the rows it claims, for whoever has to read a stuck queue later. */
+    private static String relayId() {
+        return "engine-" + ProcessHandle.current().pid();
+    }
+
     private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
             TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches,
-            MatchEventPublisher events) {
+            RedisPlayerNotifier notifier, OutboxQueue outbox) {
         Payloads.MatchConfirmation command;
         try {
             command = Payloads.MatchConfirmation.fromJson(msg);
@@ -292,7 +319,7 @@ public final class MatchmakingEngineApplication {
                                     matchId, playerId, String.valueOf(confirmed),
                                     String.valueOf(pm.players().size()));
                             if (confirmed >= pm.players().size()) {
-                                confirm(pm, tickets, pending, notifier, matches, events);
+                                confirm(pm, tickets, pending, notifier, outbox);
                             }
                         })
                         .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -303,8 +330,7 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void confirm(PendingMatch pm, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, com.victor.matchmaking.db.MatchRepository matches,
-            MatchEventPublisher events) {
+            RedisPlayerNotifier notifier, OutboxQueue outbox) {
         // Load both tickets, then transition them and persist the durable match row.
         List<Future<MatchmakingTicket>> loaded = pm.players().stream()
                 .map(p -> tickets.findById(p.ticketId()))
@@ -331,18 +357,28 @@ public final class MatchmakingEngineApplication {
             com.victor.matchmaking.domain.match.Match match = new com.victor.matchmaking.domain.match.Match(
                     pm.matchId(), first.gameMode(), first.region(),
                     com.victor.matchmaking.domain.match.MatchStatus.PENDING, Instant.now(), null, null);
-            matches.save(match, players)
-                    // Publish only after the row is durable, and only report the match as
-                    // confirmed once the broker acknowledged the event: the log is what
-                    // every other service acts on. (Atomicity between the two writes is
-                    // the Transactional Outbox, W14 - today a crash in between can lose
-                    // the event.)
-                    .compose(v -> events.publishConfirmed(match, players))
-                    .onSuccess(eventId -> LOG.log(System.Logger.Level.INFO,
-                            "match.confirmed matchId={0} players={1} persisted=true eventId={2}",
-                            pm.matchId(), pm.playerIds(), eventId))
+            // The event is built here, at the moment the fact happens, and stored as bytes
+            // next to the match: the same transaction writes both, so a crash can no longer
+            // leave a match nobody was told about (W14, ADR 0018). Publishing is the
+            // relay's job, and the event id is what tells a consumer this event is this
+            // event (ADR 0038).
+            com.victor.matchmaking.events.MatchConfirmed event =
+                    com.victor.matchmaking.events.MatchConfirmedMapper.toEvent(match, players, Instant.now(), pm.matchId());
+            OutboxRecord record = new OutboxRecord(
+                    event.getMeta().getEventId(),
+                    com.victor.matchmaking.events.EventTopics.MATCH_CONFIRMED,
+                    match.id(),
+                    event.getMeta().getEventType(),
+                    event.toByteArray(),
+                    occurredAtOf(event),
+                    Instant.now(),
+                    0);
+            outbox.writeMatchWithEvent(match, players, record)
+                    .onSuccess(ignored -> LOG.log(System.Logger.Level.INFO,
+                            "match.confirmed matchId={0} players={1} persisted=true eventId={2} outbox=PENDING",
+                            pm.matchId(), pm.playerIds(), record.eventId()))
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                            "engine.error stage=persistOrPublishMatch matchId=" + pm.matchId(), err));
+                            "engine.error stage=persistMatchWithEvent matchId=" + pm.matchId(), err));
             pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                     "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
             for (PendingMatch.PendingPlayer player : pm.players()) {
