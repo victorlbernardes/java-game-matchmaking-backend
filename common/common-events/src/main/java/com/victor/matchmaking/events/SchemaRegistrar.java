@@ -53,6 +53,12 @@ public final class SchemaRegistrar {
             }
         } catch (Exception e) {
             System.err.println("schema.registration.failed registry=" + registryUrl + " error=" + e);
+            // The message alone does not carry the registry's verdict: without the
+            // cause chain a red CI build says "registration failed" and hides which
+            // field the registry considered incompatible.
+            for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
+                System.err.println("schema.registration.cause: " + cause);
+            }
             System.exit(1);
         }
         if (registered < CONTRACTS.size()) {

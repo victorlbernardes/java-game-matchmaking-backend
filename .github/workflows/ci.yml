@@ -92,3 +92,56 @@ jobs:
           path: |
             */target/*.jar
           retention-days: 30
+
+  contracts:
+    name: Event contract gate
+    runs-on: ubuntu-latest
+    needs: branch-name
+    permissions:
+      contents: read
+    # The gate needs a real Schema Registry: the compatibility verdict is the
+    # registry's, so a mock would delete the property under test. The stack comes
+    # from the same docker-compose.yml used in development — a hand-written
+    # services block would duplicate the Kafka topology (listeners, FULL) and the
+    # two would drift. The fixed project name keeps the container names the
+    # scripts already know.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate compares the change against its merge base, so the base ref
+          # has to be present locally.
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Start Kafka, Zookeeper and Schema Registry
+        run: docker compose -p game-matchmaking-backend up -d zookeeper kafka schema-registry
+
+      - name: Wait for the stack to be healthy
+        run: |
+          for service in zookeeper kafka schema-registry; do
+            status=missing
+            for _ in $(seq 1 60); do
+              status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                "game-matchmaking-backend-$service-1" 2>/dev/null || echo missing)"
+              [ "$status" = "healthy" ] && break
+              sleep 2
+            done
+            echo "$service: $status"
+            [ "$status" = "healthy" ] || exit 1
+          done
+
+      - name: Kafka + Schema Registry smoke check
+        run: bash requests/kafka/check_kafka.sh
+
+      - name: Event contracts (this change against its merge base)
+        run: bash requests/kafka/check_contract_gate.sh
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -p game-matchmaking-backend logs --tail 50

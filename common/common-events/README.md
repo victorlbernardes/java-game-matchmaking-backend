@@ -45,6 +45,12 @@ mvn -B -pl common/common-events exec:java -Dexec.mainClass=com.victor.matchmakin
 It runs the real serializer with registration enabled, so the schema and its imports
 (`matchmaking/common/types.proto`) are registered exactly as the runtime serializer
 resolves them. The registry is `FULL`, so an incompatible change is rejected and the
-build fails — the CI gate of W12 task 3 wires this in.
+registrar exits non-zero — and the cause chain is printed (`schema.registration.cause`),
+so a red build says which field the registry refused instead of just "failed".
+
+The CI gate is `requests/kafka/check_contract_gate.sh` (job `contracts`): it registers
+the contracts of the merge base, then the contracts of the change, and fails when the
+registry refuses. See `docs/adr/0015-protobuf-vs-avro-ci-gate.md` — including what
+`FULL` does *not* catch (renumbering, removal and renaming of a field are accepted).
 
 Reading an event back (bytes → registry → JSON): `requests/kafka/verify_match_confirmed.sh`.
