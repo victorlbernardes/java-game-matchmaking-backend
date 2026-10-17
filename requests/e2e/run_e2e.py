@@ -10,6 +10,7 @@ import urllib.request
 API = "http://localhost:8080"
 AUTH = "http://localhost:8081"
 REDIS_CONTAINER = "game-matchmaking-backend-redis-1"
+KAFKA_VERIFIER = "requests/kafka/verify_match_confirmed.sh"
 
 PASS, FAIL = [], []
 
@@ -273,6 +274,76 @@ def s_timeout():
     check("tickets were swept and re-queued/re-paired (version >= 3)", all(v >= 3 for v in versions), str(versions))
 
 
+def s_match_confirmed():
+    scenario("S10 confirmed match (W12): MATCH_CONFIRMED lands on the log as a typed Protobuf event")
+    s, pair = skill_group(2)
+    a, b = pair
+    ta, tb = enqueue(a, region="NA"), enqueue(b, region="NA")
+    pm = wait_until(lambda: (pending_matches() or None), 8)
+    check("a pending match was created", bool(pm), str(pm))
+    if not pm:
+        return
+    match_id = pm[0][0]
+
+    # The engine's input contract is the match_confirmations channel; the API
+    # translates a WS MATCH_CONFIRM into exactly this message (see WsHub, and the
+    # e2e-w5 folder of the Postman collection for the same flow over WebSocket).
+    confirmed_at = time.time()
+    for pid in (a, b):
+        redis("publish", "match_confirmations",
+              json.dumps({"matchId": match_id, "playerId": pid, "action": "CONFIRM"}))
+
+    wait_until(lambda: redis("exists", f"match-pending:{match_id}") == "0", 10)
+    statuses = [json.loads(redis("get", f"ticket:{t}"))["status"] for t in (ta, tb)]
+    check("both tickets reached CONFIRMED", statuses == ["CONFIRMED"] * 2, str(statuses))
+
+    # The match row must be durable: the engine publishes only after the insert, so
+    # the event is never ahead of the source of truth.
+    st, body = call("GET", API + f"/v1/players/{a}/matches", token(a))
+    check("the match is readable through the history API", st == 200 and match_id in json.dumps(body),
+          f"{st} {json.dumps(body)[:140]}")
+
+    # The durable event, decoded by the standalone verifier (single source of truth
+    # for reading the log through the Schema Registry).
+    rc, event, create_time_ms = verify_match_confirmed(match_id)
+    check("MATCH_CONFIRMED decodes from the log with the registered schema", rc == 0)
+    if rc != 0 or not event:
+        return
+
+    check("the event carries the confirmed match id", event.get("matchId") == match_id, str(event.get("matchId")))
+    meta = event.get("meta") or {}
+    check("the envelope carries type, contract version and a fresh event id",
+          meta.get("eventType") == "MATCH_CONFIRMED" and meta.get("schemaVersion") == 1
+          and bool(meta.get("eventId")) and bool(meta.get("occurredAt")), json.dumps(meta))
+    check("correlationId groups the events of one match", meta.get("correlationId") == match_id,
+          str(meta.get("correlationId")))
+
+    published = {p["playerId"]: (p.get("team", 0), p.get("skillAtMatch", 0)) for p in event.get("players", [])}
+    check("the roster carries both players, one team each (1|2)",
+          set(published) == {a, b} and published.get(a, (0,))[0] != published.get(b, (0,))[0]
+          and all(t in (1, 2) for t, _ in published.values()), str(published))
+    check("the skill snapshot is the skill the engine matched with",
+          all(published.get(p, (0, -1))[1] == skill(p) for p in (a, b)), str(published))
+
+    latency_ms = create_time_ms - int(confirmed_at * 1000)
+    check("the event reached the log within 5s of the confirmation", 0 <= latency_ms <= 5000, f"{latency_ms} ms")
+    print(f"  (measured: CONFIRM published -> MATCH_CONFIRMED on the log = {latency_ms} ms)")
+
+
+def verify_match_confirmed(expected_match_id):
+    """Runs requests/kafka/verify_match_confirmed.sh and returns (rc, event, createTimeMs)."""
+    out = subprocess.run(["bash", KAFKA_VERIFIER, expected_match_id],
+                         capture_output=True, text=True, check=False)
+    print("\n".join("   " + line for line in out.stdout.rstrip().splitlines()))
+    event, create_time_ms = None, None
+    for line in out.stdout.splitlines():
+        if line.startswith("EVENT_JSON="):
+            event = json.loads(line.split("=", 1)[1])
+        elif line.startswith("EVENT_CREATE_TIME_MS="):
+            create_time_ms = int(line.split("=", 1)[1])
+    return out.returncode, event, create_time_ms
+
+
 def main():
     print("E2E validation of the matchmaking backend")
     s_health()
@@ -285,6 +356,7 @@ def main():
     s_dissolve()
     s_widening()
     s_timeout()
+    s_match_confirmed()
     print(f"\n===== RESULT: {len(PASS)} passed, {len(FAIL)} failed =====")
     for f in FAIL:
         print("  FAILED:", f)

@@ -1,0 +1,41 @@
+// Types shared by every Kafka event contract (see `04 - Engenharia Distribuída`).
+//
+// They live here, instead of inside a single event file, so that a new event
+// reuses the same GameMode/Region/EventMetadata definitions: duplicating an enum
+// per event would let the copies drift and would break `FULL` compatibility for
+// reasons that have nothing to do with the event itself.
+syntax = "proto3";
+
+package matchmaking.common;
+
+import "google/protobuf/timestamp.proto";
+
+option java_package = "com.victor.matchmaking.proto.common";
+option java_outer_classname = "CommonTypes";
+option java_multiple_files = true;
+
+// Metadata carried by every event. It is a message (not loose fields repeated in
+// each event) so a consumer resolves a single, self-contained schema per topic.
+message EventMetadata {
+  string event_id = 1;                    // uuid - the basis of idempotency
+  string event_type = 2;                  // "MATCH_CONFIRMED"
+  uint32 schema_version = 3;              // version of the event contract
+  google.protobuf.Timestamp occurred_at = 4;
+  string correlation_id = 5;              // == traceId of OpenTelemetry
+}
+
+// Game modes the matchmaker supports. UNSPECIFIED exists only because a proto3
+// enum always has a zero value; our services never publish it.
+enum GameMode {
+  GAME_MODE_UNSPECIFIED = 0;
+  GAME_MODE_1V1 = 1;
+  GAME_MODE_5V5 = 2;
+}
+
+// Regions the matchmaker supports. Same rule as GameMode for UNSPECIFIED.
+enum Region {
+  REGION_UNSPECIFIED = 0;
+  REGION_SA = 1;
+  REGION_NA = 2;
+  REGION_EU = 3;
+}

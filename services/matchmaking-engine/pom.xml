@@ -28,6 +28,18 @@
             <version>0.2.0-SNAPSHOT</version>
         </dependency>
         <dependency>
+            <groupId>com.victor.matchmaking</groupId>
+            <artifactId>common-events</artifactId>
+            <version>0.2.0-SNAPSHOT</version>
+        </dependency>
+        <!-- Kafka client used directly: see KafkaMatchEventPublisher for why it is not
+             the Vert.x Kafka client. The version is pinned in the parent POM to the
+             fork the Confluent Protobuf serializer was compiled against. -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-core</artifactId>
         </dependency>
