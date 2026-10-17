@@ -63,7 +63,7 @@ class PairingStressTest {
                         .arg("1").arg(queueKey)
                         .arg(matchId)
                         .arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}")
-                        .arg("30")));
+                        .arg("30").arg("2")));
             }
 
             // Wait for all 10 workers to complete
@@ -91,9 +91,11 @@ class PairingStressTest {
                     .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(0L, queueSize.toLong(), "queue must be empty after all pairs are matched");
 
-            // Exactly TICKET_COUNT / 2 = 10 pending matches exist (one per winning worker)
+            // Exactly TICKET_COUNT / 2 = 10 pending matches exist (one per winning worker).
+            // Scoped to this test's own keys so an unrelated pending match (e.g. a live
+            // engine instance or leftover state) cannot make the assertion fail.
             io.vertx.redis.client.Response pendingCount = redis.send(Request.cmd(Command.EVAL)
-                            .arg("local c=0 for _,k in ipairs(redis.call('keys','match-pending:*')) do c=c+1 end return c")
+                            .arg("local c=0 for _,k in ipairs(redis.call('keys','match-pending:match-stress-*')) do c=c+1 end return c")
                             .arg("0"))
                     .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             assertEquals(TICKET_COUNT / 2, pendingCount.toLong(), "exactly 10 pending matches must exist");

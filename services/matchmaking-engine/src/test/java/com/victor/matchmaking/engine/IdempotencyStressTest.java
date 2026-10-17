@@ -59,7 +59,7 @@ class IdempotencyStressTest {
                 MatchmakingTicket ticket = new MatchmakingTicket("ticket-stress-idem-" + i, "p1",
                         com.victor.matchmaking.domain.ticket.GameMode.ONE_V_ONE,
                         com.victor.matchmaking.domain.ticket.Region.NA, 80, 50,
-                        java.time.Instant.now(), TicketState.SEARCHING, 0L);
+                        java.time.Instant.now(), TicketState.SEARCHING, 0L, null);
                 requests.add(redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                         .arg("1").arg(idemRedisKey)
                         .arg(TicketCodec.toJson(ticket).encode())

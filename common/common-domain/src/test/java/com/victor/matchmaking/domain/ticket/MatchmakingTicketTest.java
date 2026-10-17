@@ -11,12 +11,19 @@ class MatchmakingTicketTest {
     @Test
     void requiresPositiveMaxLatency() {
         assertThrows(IllegalArgumentException.class, () -> new MatchmakingTicket(
-                "t1", "p1", GameMode.FIVE_V_FIVE, Region.SA, 0, 50, Instant.now(), TicketState.SEARCHING, 0));
+                "t1", "p1", GameMode.FIVE_V_FIVE, Region.SA, 0, 50, Instant.now(), TicketState.SEARCHING, 0, null));
     }
 
     @Test
     void rejectsNullGameMode() {
         assertThrows(IllegalArgumentException.class, () -> new MatchmakingTicket(
-                "t1", "p1", null, Region.SA, 100, 50, Instant.now(), TicketState.SEARCHING, 0));
+                "t1", "p1", null, Region.SA, 100, 50, Instant.now(), TicketState.SEARCHING, 0, null));
+    }
+
+    @Test
+    void rejectsBlankPartyId() {
+        assertThrows(IllegalArgumentException.class, () -> new MatchmakingTicket(
+                "t1", "p1", GameMode.FIVE_V_FIVE, Region.SA, 100, 50, Instant.now(), TicketState.SEARCHING, 0,
+                " "));
     }
 }

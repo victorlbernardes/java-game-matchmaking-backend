@@ -1,16 +1,27 @@
 package com.victor.matchmaking.api.presentation;
 
+import com.victor.matchmaking.api.application.AddMemberUseCase;
 import com.victor.matchmaking.api.application.CancelTicketUseCase;
+import com.victor.matchmaking.api.application.CreatePartyUseCase;
 import com.victor.matchmaking.api.application.CreateTicketCommand;
 import com.victor.matchmaking.api.application.CreateTicketUseCase;
+import com.victor.matchmaking.api.application.DissolvePartyUseCase;
+import com.victor.matchmaking.api.application.GetPartyUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
+import com.victor.matchmaking.api.application.RemoveMemberUseCase;
+import com.victor.matchmaking.api.application.PartyUseCases;
 import com.victor.matchmaking.db.MatchRepository;
+import com.victor.matchmaking.domain.player.SkillProvider;
+import com.victor.matchmaking.redis.PartyStore;
 import com.victor.matchmaking.redis.TicketRepository;
+import com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider;
+import com.victor.matchmaking.api.infrastructure.InMemoryPartyStore;
 import com.victor.matchmaking.api.infrastructure.InMemoryTicketRepository;
 import com.victor.matchmaking.redis.TicketCodec;
 import com.victor.matchmaking.redis.RedisPublisher;
 
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonObject;
 import io.vertx.ext.auth.authentication.TokenCredentials;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.Router;
@@ -30,33 +41,53 @@ public final class HttpRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
-        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository), new WsHub(null), null);
+        return createRouter(vertx, jwtAuth, repository, new WsHub(null), null);
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, RedisPublisher publisher) {
-        CreateTicketUseCase createTicket = new CreateTicketUseCase(repository);
-        GetTicketUseCase getTicket = new GetTicketUseCase(repository);
-        CancelTicketUseCase cancelTicket = new CancelTicketUseCase(repository);
-        WsHub wsHub = new WsHub(publisher);
-        return buildRouter(vertx, jwtAuth, createTicket, getTicket, cancelTicket, wsHub, null);
+        return createRouter(vertx, jwtAuth, repository, new WsHub(publisher), null);
     }
 
     /** Full injection used by main: caller keeps the WsHub to route Pub/Sub notifications. */
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub) {
-        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository), wsHub, null);
+        return createRouter(vertx, jwtAuth, repository, wsHub, null);
     }
 
     /** Full injection used by main when history is backed by PostgreSQL. */
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
             MatchRepository matchRepository) {
-        return buildRouter(vertx, jwtAuth, new CreateTicketUseCase(repository), new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository), wsHub, matchRepository);
+        return devRouter(vertx, jwtAuth, repository, wsHub, matchRepository);
+    }
+
+    /** Full injection with the real skill provider and party store (main wiring). */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore) {
+        return buildRouter(vertx, jwtAuth,
+                new CreateTicketUseCase(repository, skillProvider, partyStore),
+                new GetTicketUseCase(repository),
+                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
+                new PartyUseCases(partyStore, repository, skillProvider));
+    }
+
+    /**
+     * In-memory wiring for tests and local runs. Every use case shares the same
+     * party store, so a party enqueued through one route is visible to the others
+     * (a party enqueue must reach the same party the create route stored).
+     */
+    private static Router devRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+            MatchRepository matchRepository) {
+        PartyStore partyStore = new InMemoryPartyStore();
+        SkillProvider skillProvider = new DeterministicSkillProvider();
+        return buildRouter(vertx, jwtAuth,
+                new CreateTicketUseCase(repository, skillProvider, partyStore),
+                new GetTicketUseCase(repository),
+                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
+                new PartyUseCases(partyStore, repository, skillProvider));
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
-            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub, MatchRepository matchRepository) {
+            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub,
+            MatchRepository matchRepository, PartyUseCases partyUseCases) {
 
         Router router = Router.router(vertx);
         router.route().handler(ctx -> {
@@ -161,7 +192,64 @@ public final class HttpRoutes {
                     }
                 }));
 
+        // ---- Party routes (W11) ----
+        router.get("/v1/parties/:partyId").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> partyUseCases.getPartyUseCase().execute(ctx.pathParam("partyId"), user.subject())
+                        .onSuccess(view -> respond(ctx, 200, partyViewToJson(view)))
+                        .onFailure(err -> failWithDomainError(ctx, err))));
+
+        router.post("/v1/parties").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> partyUseCases.createPartyUseCase().execute(user.subject())
+                        .onSuccess(partyId -> respond(ctx, 201, partyCreatedToJson(partyId)))
+                        .onFailure(err -> failWithDomainError(ctx, err))));
+
+        router.post("/v1/parties/:partyId/members").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> partyUseCases.addMemberUseCase().execute(ctx.pathParam("partyId"), user.subject())
+                        .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
+                        .onFailure(err -> failWithDomainError(ctx, err))));
+
+        router.delete("/v1/parties/:partyId/members/:playerId").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> {
+                    String targetPlayerId = ctx.pathParam("playerId");
+                    // The leader rule is enforced by removeMemberUseCase itself.
+                    partyUseCases.removeMemberUseCase()
+                            .execute(ctx.pathParam("partyId"), user.subject(), targetPlayerId)
+                            .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
+                            .onFailure(err -> failWithDomainError(ctx, err));
+                }));
+
+        router.delete("/v1/parties/:partyId").handler(ctx ->
+                authenticate(ctx, jwtAuth, user -> {
+                    // The leader rule is enforced by dissolveUseCase itself.
+                    partyUseCases.dissolveUseCase()
+                            .execute(ctx.pathParam("partyId"), user.subject())
+                            .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
+                            .onFailure(err -> failWithDomainError(ctx, err));
+                }));
+
         return router;
+    }
+
+    private static JsonObject partyViewToJson(GetPartyUseCase.PartyView view) {
+        return new io.vertx.core.json.JsonObject()
+                .put("partyId", view.party().id())
+                .put("leaderId", view.party().leaderId())
+                .put("members", new io.vertx.core.json.JsonArray(view.party().members()))
+                .put("active", view.party().active())
+                .put("aggregatedSkill", view.aggregatedSkill())
+                .put("dispersion", view.dispersion());
+    }
+
+    private static JsonObject partyCreatedToJson(String partyId) {
+        return new io.vertx.core.json.JsonObject().put("partyId", partyId);
+    }
+
+    private static JsonObject partyToJson(com.victor.matchmaking.domain.player.Party party) {
+        return new io.vertx.core.json.JsonObject()
+                .put("partyId", party.id())
+                .put("leaderId", party.leaderId())
+                .put("members", new io.vertx.core.json.JsonArray(party.members()))
+                .put("active", party.active());
     }
 
     private static String bearerToken(RoutingContext ctx) {
@@ -196,6 +284,19 @@ public final class HttpRoutes {
             fail(ctx, 403, err.getMessage());
         } else if (err instanceof CancelTicketUseCase.TicketConflictException) {
             fail(ctx, 409, err.getMessage());
+        } else if (err instanceof AddMemberUseCase.AlreadyMemberException
+                || err instanceof AddMemberUseCase.PartyFullException
+                || err instanceof AddMemberUseCase.PartyNotActiveException) {
+            fail(ctx, 409, err.getMessage());
+        } else if (err instanceof GetPartyUseCase.PartyNotFoundException
+                || err instanceof RemoveMemberUseCase.PartyNotFoundException
+                || err instanceof CreateTicketUseCase.PartyNotFoundException
+                || err instanceof DissolvePartyUseCase.PartyNotFoundException) {
+            fail(ctx, 404, err.getMessage());
+        } else if (err instanceof GetPartyUseCase.ForbiddenException
+                || err instanceof RemoveMemberUseCase.ForbiddenException
+                || err instanceof DissolvePartyUseCase.ForbiddenException) {
+            fail(ctx, 403, err.getMessage());
         } else {
             fail(ctx, 500, err.getMessage());
         }
@@ -211,7 +312,7 @@ public final class HttpRoutes {
         if (statusCode >= 400) {
             LOG.log(System.Logger.Level.WARNING, "http.error {0} {1} -> {2} reason={3}",
                     ctx.request().method().name(), ctx.normalizedPath(),
-                    String.valueOf(statusCode), message);
+                    statusCode, message);
         }
         ctx.response().setStatusCode(statusCode)
                 .putHeader("content-type", "application/json")

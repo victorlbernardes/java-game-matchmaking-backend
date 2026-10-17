@@ -54,11 +54,11 @@ class IdempotencyRaceTest {
             MatchmakingTicket ticketA = new MatchmakingTicket("ticket-race-idem-a", "p1",
                     com.victor.matchmaking.domain.ticket.GameMode.ONE_V_ONE,
                     com.victor.matchmaking.domain.ticket.Region.NA, 80, 50,
-                    java.time.Instant.now(), TicketState.SEARCHING, 0L);
+                    java.time.Instant.now(), TicketState.SEARCHING, 0L, null);
             MatchmakingTicket ticketB = new MatchmakingTicket("ticket-race-idem-b", "p1",
                     com.victor.matchmaking.domain.ticket.GameMode.ONE_V_ONE,
                     com.victor.matchmaking.domain.ticket.Region.NA, 80, 50,
-                    java.time.Instant.now(), TicketState.SEARCHING, 0L);
+                    java.time.Instant.now(), TicketState.SEARCHING, 0L, null);
 
             // Request 1: creates the ticket
             Object result1 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)

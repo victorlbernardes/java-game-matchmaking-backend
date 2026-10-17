@@ -26,7 +26,13 @@ Use an atomic Lua script (`pair.lua`) for pairing. The script:
 1. `ZRANGE queueKey 0 1` — takes the first two tickets from the queue.
 2. `ZREM queueKey t1 t2` — removes them atomically.
 3. If `ZREM < 2` → another worker already removed them → return `nil`.
-4. `SET match-pending:{matchId} {json} EX 30` — creates the pending match.
+4. `SET match-pending:{matchId} {json} EX {timeout+grace}` — creates the pending match.
+   The TTL **must be greater than the confirmation deadline** so the sweeper can
+   still read the key, dissolve the match and requeue the tickets when the
+   deadline passes. Storing the key with `EX {timeout}` made it expire exactly at
+   the deadline, so the sweeper never saw it and the tickets stayed `CONFIRMING`
+   forever (fixed in W11; engine constants `CONFIRMATION_TIMEOUT_SECONDS = 30`,
+   `PENDING_KEY_GRACE_SECONDS = 60`).
 5. Returns `matchId` (winner) or `nil` (loser).
 
 If two workers race, the first worker's `ZREM` removes the tickets; the second
@@ -45,6 +51,9 @@ worker's `ZREM` returns 0 and the script returns `nil` — no duplicate match.
   pending match exists and the queue is empty.
 - The test fails if the script is removed (falls back to non-atomic ZRANGE+save,
   which allows duplicates).
+- `PendingMatchTtlTest` — the pair script stores the pending key with
+  `PENDING_KEY_TTL_SECONDS > CONFIRMATION_TIMEOUT_SECONDS`, so the confirmation
+  timeout can actually be swept.
 
 ## Trade-offs
 - Lua scripts are harder to debug than Java code (no IDE breakpoints inside Redis).

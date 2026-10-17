@@ -12,6 +12,18 @@ jobs:
   release:
     name: Publish release
     runs-on: ubuntu-latest
+    # Same reason as ci.yml: `mvn -B clean verify` runs the engine Redis
+    # integration tests, so the job must provide a real Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
         with:

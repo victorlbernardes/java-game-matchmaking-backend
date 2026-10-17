@@ -12,12 +12,19 @@ class PartyTest {
     @Test
     void leaderMustBeMember() {
         assertThrows(IllegalArgumentException.class, () -> new Party(
-                "party-1", "leader", List.of("p1", "p2"), Instant.now(), true));
+                "party-1", "leader", List.of("p1", "p2"), Instant.now(), true, List.of()));
     }
 
     @Test
     void enforcesMaxSize() {
         assertThrows(IllegalArgumentException.class, () -> new Party(
-                "party-1", "leader", List.of("leader", "p1", "p2", "p3", "p4", "p5"), Instant.now(), true));
+                "party-1", "leader", List.of("leader", "p1", "p2", "p3", "p4", "p5"), Instant.now(), true,
+                List.of()));
+    }
+
+    @Test
+    void memberTicketIdsMustNotBeNull() {
+        assertThrows(IllegalArgumentException.class, () -> new Party(
+                "party-1", "leader", List.of("leader"), Instant.now(), true, null));
     }
 }

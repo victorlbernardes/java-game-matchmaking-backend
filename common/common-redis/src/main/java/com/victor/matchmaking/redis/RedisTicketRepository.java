@@ -2,6 +2,8 @@ package com.victor.matchmaking.redis;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -104,6 +106,29 @@ public final class RedisTicketRepository implements TicketRepository {
                         .arg("EX").arg(TICKET_TTL_SECONDS))
                 : Future.succeededFuture();
         return Future.all(stored, queue, idem).mapEmpty();
+    }
+
+    @Override
+    public Future<List<String>> createPartyTickets(List<MatchmakingTicket> tickets) {
+        if (tickets.isEmpty()) {
+            return Future.succeededFuture(List.of());
+        }
+        Future<List<String>> combined = Future.succeededFuture(ticketIds(tickets));
+        for (MatchmakingTicket ticket : tickets) {
+            combined = combined.flatMap(kept -> save(null, ticket)
+                    .map(v -> {
+                        List<String> next = new ArrayList<>(kept);
+                        next.add(ticket.id());
+                        return next;
+                    }));
+        }
+        return combined.map(kept -> List.copyOf(kept));
+    }
+
+    private static List<String> ticketIds(List<MatchmakingTicket> tickets) {
+        return tickets.stream()
+                .map(MatchmakingTicket::id)
+                .toList();
     }
 
     @Override

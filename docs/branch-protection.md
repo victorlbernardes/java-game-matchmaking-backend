@@ -12,9 +12,16 @@ Este documento descreve as configurações recomendadas para proteger a branch `
 ### 2. Require status checks to pass before merging
 - [ ] **Require status checks to pass before merging**
 - [ ] **Require branches to be up to date before merging**
-- Checks obrigatórios:
-  - `ci / Validate branch name`
-  - `ci / Build and test`
+- Checks obrigatórios (nome **exato** reportado pelo job — sem prefixo de workflow):
+  - `Validate branch name`
+  - `Build and test`
+
+> **Atenção:** o GitHub casa o check obrigatório por **string exata** com o nome reportado
+> pelo job. Para um job de workflow o nome é `jobs.<id>.name` e, quando não há `name`, o
+> próprio `jobs.<id>`. Portanto `ci / Build and test` (formato de exibição), `ci / build` e
+> `build` (id do job) **nunca** são reportados → o PR fica preso em
+> "Expected — Waiting for status to be reported". Ao renomear um job, atualize os checks
+> obrigatórios na mesma mudança.
 
 ### 3. Regras de push
 - [ ] **Do not allow bypassing the above settings** (desativar bypass para admins)
@@ -47,3 +54,23 @@ Após aplicar, um push direto para `main` deve ser bloquido:
 git push origin main
 # → remote: error: GH006: Protected branch update failed para refs/heads/main.
 ```
+
+### Conferir nomes reportados × nomes exigidos
+
+Se um PR ficar em "Expected — Waiting for status to be reported", compare as duas listas:
+
+```bash
+TOKEN=<personal access token com leitura de admin>
+
+# nomes que os jobs realmente reportam
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://api.github.com/repos/victorlbernardes/java-game-matchmaking-backend/commits/main/check-runs" \
+  | jq -r '.check_runs[].name'
+
+# nomes exigidos pela proteção da main
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://api.github.com/repos/victorlbernardes/java-game-matchmaking-backend/branches/main/protection" \
+  | jq -r '.required_status_checks.contexts[]'
+```
+
+Os dois conjuntos precisam ser idênticos.

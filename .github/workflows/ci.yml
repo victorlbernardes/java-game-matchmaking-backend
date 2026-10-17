@@ -51,6 +51,20 @@ jobs:
     needs: branch-name
     permissions:
       contents: read
+    # The engine tests are Redis integration tests: they assert the atomicity of
+    # pair.lua (SET NX / EVALSHA), the ZSET ordering and the match-pending TTL.
+    # They read REDIS_URI (default redis://localhost:6379), so the job needs a
+    # real Redis — a mock would delete the property under test.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 

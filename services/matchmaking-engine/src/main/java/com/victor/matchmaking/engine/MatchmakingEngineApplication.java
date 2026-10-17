@@ -2,12 +2,16 @@ package com.victor.matchmaking.engine;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
+import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.domain.ticket.TicketState;
 import com.victor.matchmaking.domain.ticket.TicketStateMachine;
+import com.victor.matchmaking.engine.application.FillPolicy;
 import com.victor.matchmaking.engine.application.PairingPolicy;
 import com.victor.matchmaking.engine.application.PendingMatch;
 import com.victor.matchmaking.engine.application.PendingMatchStore;
@@ -29,13 +33,20 @@ import io.vertx.redis.client.RedisOptions;
 import io.vertx.redis.client.Request;
 import io.vertx.redis.client.Response;
 
-/** 1v1 matchmaking worker: pairs queue heads, tracks confirmations, dissolves on decline/timeout. */
+/** Matchmaking worker: pairs queue heads, tracks confirmations, dissolves on decline/timeout. */
 public final class MatchmakingEngineApplication {
 
     private static final System.Logger LOG = System.getLogger("matchmaking.engine");
     private static final long PAIRING_INTERVAL_MS = 500;
     private static final long SWEEP_INTERVAL_MS = 1000;
-    private static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
+    static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
+    /**
+     * The pending-match Redis key must outlive its confirmation deadline,
+     * otherwise it expires before the sweeper can read it and the tickets stay
+     * in CONFIRMING forever. TTL = deadline + this grace (W8 two-phase confirm).
+     */
+    static final long PENDING_KEY_GRACE_SECONDS = 60;
+    static final long PENDING_KEY_TTL_SECONDS = CONFIRMATION_TIMEOUT_SECONDS + PENDING_KEY_GRACE_SECONDS;
     private static final int TICKET_ID_LENGTH = 8;
     private static volatile String PAIR_SCRIPT_SHA = "";
 
@@ -99,8 +110,13 @@ public final class MatchmakingEngineApplication {
 
     private static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier) {
-        redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0").arg("9")).onSuccess(range -> {
-            if (range == null || range.size() < 2) {
+        GameMode gameMode = gameModeOfQueueKey(queueKey);
+        if (gameMode == null) {
+            return;
+        }
+        int playerCount = gameMode.playersPerMatch();
+        redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0").arg(playerCount - 1)).onSuccess(range -> {
+            if (range == null || range.size() < playerCount) {
                 return;
             }
             List<Future<MatchmakingTicket>> loaded = new ArrayList<>();
@@ -109,16 +125,11 @@ public final class MatchmakingEngineApplication {
             }
             Future.all(loaded).onSuccess(cf -> {
                 List<MatchmakingTicket> candidates = loaded.stream().map(Future::result).toList();
-                for (int i = 0; i < candidates.size(); i++) {
-                    for (int j = i + 1; j < candidates.size(); j++) {
-                        MatchmakingTicket a = candidates.get(i);
-                        MatchmakingTicket b = candidates.get(j);
-                        if (a != null && b != null && a.status() == TicketState.SEARCHING
-                                && b.status() == TicketState.SEARCHING && PairingPolicy.canPair(a, b)) {
-                            pair(a, b, queueKey, redis, tickets, pending, notifier);
-                            return;
-                        }
-                    }
+                // The queue head (oldest ticket) is the widening reference: its
+                // queuedAt tells PairingPolicy how long the player has been waiting.
+                List<MatchmakingTicket> roster = buildRoster(candidates, gameMode, candidates.get(0).queuedAt());
+                if (roster != null) {
+                    pair(roster, queueKey, redis, tickets, pending, notifier);
                 }
             }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                     "engine.error stage=loadTickets queue={0}", err, queueKey));
@@ -126,43 +137,107 @@ public final class MatchmakingEngineApplication {
                 "engine.error stage=readQueue queue={0}", err, queueKey));
     }
 
-    private static void pair(MatchmakingTicket a, MatchmakingTicket b, String queueKey,
+    /**
+     * Resolves the roster for one pairing sweep (ADR-0013): partial parties are
+     * completed with the closest solo candidates via the fill policy and parties
+     * are always paired as a unit; the remaining solos pair on their own.
+     *
+     * @return the roster to pair, or null when no valid roster can be formed
+     */
+    static List<MatchmakingTicket> buildRoster(List<MatchmakingTicket> candidates, GameMode gameMode, Instant queuedAt) {
+        List<MatchmakingTicket> solos = new ArrayList<>();
+        Map<String, List<MatchmakingTicket>> partiesById = new LinkedHashMap<>();
+        for (MatchmakingTicket candidate : candidates) {
+            if (candidate.partyId() == null) {
+                solos.add(candidate);
+            } else {
+                partiesById.computeIfAbsent(candidate.partyId(), key -> new ArrayList<>()).add(candidate);
+            }
+        }
+        for (List<MatchmakingTicket> party : partiesById.values()) {
+            List<MatchmakingTicket> combined = FillPolicy.fill(party, solos);
+            if (combined == null) {
+                // The party cannot be completed; it stays queued, never split.
+                continue;
+            }
+            if (PairingPolicy.canPair(combined, queuedAt)) {
+                return combined;
+            }
+        }
+        if (solos.size() == gameMode.playersPerMatch() && PairingPolicy.canPair(solos, queuedAt)) {
+            return solos;
+        }
+        return null;
+    }
+
+    /** Extracts the game mode encoded in a queue key such as "queue:5v5:NA". */
+    private static GameMode gameModeOfQueueKey(String queueKey) {
+        String[] segments = queueKey.split(":", 3);
+        if (segments.length < 3) {
+            return null;
+        }
+        for (GameMode gameMode : GameMode.values()) {
+            if (gameMode.label().equals(segments[1])) {
+                return gameMode;
+            }
+        }
+        return null;
+    }
+
+    /** Pairs exactly the given candidates into one pending match. */
+    private static void pair(List<MatchmakingTicket> candidates, String queueKey,
             io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier) {
         String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
-        PendingMatch pm = new PendingMatch(matchId,
-                List.of(new PendingMatch.PendingPlayer(a.playerId(), a.id()),
-                        new PendingMatch.PendingPlayer(b.playerId(), b.id())),
-                List.of(), Instant.now().plusSeconds(CONFIRMATION_TIMEOUT_SECONDS));
+        List<PendingMatch.PendingPlayer> roster = new ArrayList<>();
+        for (MatchmakingTicket candidate : candidates) {
+            roster.add(new PendingMatch.PendingPlayer(candidate.playerId(), candidate.id()));
+        }
+        PendingMatch pm = new PendingMatch(matchId, roster, List.of(),
+                Instant.now().plusSeconds(CONFIRMATION_TIMEOUT_SECONDS));
 
         // Atomic pairing: ZREM from queue + SET pending match in one Lua script.
         // If another worker won the race, the script returns nil and we skip.
         redis.send(Request.cmd(Command.EVALSHA).arg(PAIR_SCRIPT_SHA)
                 .arg("1").arg(queueKey)
                 .arg(pm.matchId()).arg(pm.toJson().encode())
-                .arg(String.valueOf(CONFIRMATION_TIMEOUT_SECONDS)))
+                .arg(String.valueOf(PENDING_KEY_TTL_SECONDS))
+                .arg(String.valueOf(roster.size())))
                 .onSuccess(result -> {
                     if (result == null) {
                         // Another worker already removed these tickets from the queue
                         return;
                     }
-                    // Paired! Transition to CONFIRMING and notify both players.
-                    tickets.save(null, transition(a, TicketState.CONFIRMING));
-                    tickets.save(null, transition(b, TicketState.CONFIRMING));
-                    Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId, pm.playerIds());
-                    LOG.log(System.Logger.Level.INFO,
-                            "pair.created matchId={0} players={1} gameMode={2} region={3} skillA={4} skillB={5}",
-                            matchId, pm.playerIds(), a.gameMode().label(), a.region().name(),
-                            String.valueOf(a.skill()), String.valueOf(b.skill()));
-                    notifier.notifyPlayer(a.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
-                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                    "engine.error stage=notifyPending playerId=" + a.playerId(), err));
-                    notifier.notifyPlayer(b.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
-                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                    "engine.error stage=notifyPending playerId=" + b.playerId(), err));
+                    // Paired! Transition to CONFIRMING and notify every player.
+                    for (int i = 0; i < candidates.size(); i++) {
+                        MatchmakingTicket candidate = candidates.get(i);
+                        tickets.save(null, transition(candidate, TicketState.CONFIRMING))
+                                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                        "engine.error stage=saveConfirmingTicket ticketId=" + candidate.id(), err));
+                    }
+                    Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId, roster.stream()
+                            .map(PendingMatch.PendingPlayer::playerId).toList());
+                    for (PendingMatch.PendingPlayer player : roster) {
+                        notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
+                                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                        "engine.error stage=notifyPending playerId=" + player.playerId(), err));
+                    }
                 })
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                         "engine.error stage=pairScript matchId=" + matchId, err));
+    }
+
+    /**
+     * Assigns every player a team label. Teams are sized after {@code teamSize};
+     * the current match model always splits into two teams ("A"/"B").
+     */
+    private static List<String> teamAssignments(List<MatchmakingTicket> found, int playerCount) {
+        int teamSize = found.get(0).gameMode().teamSize();
+        List<String> assignments = new ArrayList<>();
+        for (int i = 0; i < playerCount; i++) {
+            assignments.add(i / teamSize == 0 ? "A" : "B");
+        }
+        return assignments;
     }
 
     private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
@@ -239,9 +314,10 @@ public final class MatchmakingEngineApplication {
                                 "engine.error stage=saveConfirmedTicket ticketId=" + t.id(), err));
             }
             List<com.victor.matchmaking.domain.match.MatchPlayer> players = new ArrayList<>();
+            List<String> assignments = teamAssignments(found, pm.players().size());
             for (int i = 0; i < pm.players().size(); i++) {
                 players.add(new com.victor.matchmaking.domain.match.MatchPlayer(pm.matchId(),
-                        pm.players().get(i).playerId(), i == 0 ? "A" : "B", found.get(i).skill()));
+                        pm.players().get(i).playerId(), assignments.get(i), found.get(i).skill()));
             }
             com.victor.matchmaking.domain.match.Match match = new com.victor.matchmaking.domain.match.Match(
                     pm.matchId(), first.gameMode(), first.region(),
@@ -296,7 +372,8 @@ public final class MatchmakingEngineApplication {
     private static MatchmakingTicket transition(MatchmakingTicket ticket, TicketState target) {
         return new MatchmakingTicket(ticket.id(), ticket.playerId(), ticket.gameMode(), ticket.region(),
                 ticket.maxLatencyMs(), ticket.skill(), ticket.queuedAt(),
-                TicketStateMachine.transition(ticket.status(), target), ticket.version() + 1);
+                TicketStateMachine.transition(ticket.status(), target), ticket.version() + 1,
+                ticket.partyId());
     }
 
     private static void sweepExpired(io.vertx.redis.client.Redis redis, TicketRepository tickets,
