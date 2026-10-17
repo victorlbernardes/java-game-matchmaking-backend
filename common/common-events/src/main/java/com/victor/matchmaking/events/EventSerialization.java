@@ -3,6 +3,9 @@ package com.victor.matchmaking.events;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.google.protobuf.Message;
+
+import io.confluent.kafka.serializers.protobuf.KafkaProtobufDeserializer;
 import io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer;
 import io.confluent.kafka.serializers.subject.TopicNameStrategy;
 
@@ -49,6 +52,33 @@ public final class EventSerialization {
         props.put("auto.register.schemas", autoRegisterSchemas);
         // Pinned instead of inherited from a default: the subject is part of the
         // contract every consumer depends on (`<topic>-value`).
+        props.put("value.subject.name.strategy", TopicNameStrategy.class.getName());
+        return props;
+    }
+
+    /**
+     * Kafka properties for the Protobuf value deserializer.
+     *
+     * <p>Protobuf is not self-describing, and that is exactly what the registry buys
+     * here: the deserializer reads the writer's {@code schemaId} from the record
+     * header and resolves the schema through it, so a consumer decodes a record
+     * produced by an older contract without carrying a copy of it.
+     *
+     * @param schemaRegistryUrl registry to resolve the writer schema id against
+     * @param valueType         the message class to deserialize into; Confluent needs
+     *                          it explicitly because a payload alone does not say
+     *                          which message it is
+     */
+    public static Map<String, Object> protobufValueDeserializerProps(String schemaRegistryUrl,
+            Class<? extends Message> valueType) {
+        Map<String, Object> props = new HashMap<>();
+        props.put("value.deserializer", KafkaProtobufDeserializer.class.getName());
+        props.put("schema.registry.url", schemaRegistryUrl);
+        props.put("specific.protobuf.value.type", valueType.getName());
+        // A consumer never registers: the schema must exist because the build
+        // registered it. Fixing a missing schema here would hide the producer's bug
+        // and turn it into a version.
+        props.put("auto.register.schemas", false);
         props.put("value.subject.name.strategy", TopicNameStrategy.class.getName());
         return props;
     }

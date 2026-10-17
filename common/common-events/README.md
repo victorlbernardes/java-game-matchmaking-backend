@@ -54,3 +54,12 @@ registry refuses. See `docs/adr/0015-protobuf-vs-avro-ci-gate.md` — including 
 `FULL` does *not* catch (renumbering, removal and renaming of a field are accepted).
 
 Reading an event back (bytes → registry → JSON): `requests/kafka/verify_match_confirmed.sh`.
+
+## The dead letter topic is not part of this contract
+
+`EventTopics.deadLetterOf(topic)` (`<topic>-dlq`) is where `match-orchestrator` parks a
+record it could not handle (ADR 0019). Its payload is the **original bytes**, untouched,
+and its value is deliberately **not** a schema-managed message: nothing may assume that it
+decodes, because the case it exists for is exactly a payload that does not decode. The
+diagnosis travels in the record headers (`dlq.stage`, `dlq.attempts`, `dlq.error-class`,
+`dlq.original-*`). No subject is registered for it, and none should ever be.

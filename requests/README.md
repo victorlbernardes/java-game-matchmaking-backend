@@ -29,11 +29,13 @@ Scripts next to the collection (same folder, runnable by hand):
 
 ```text
 requests/
-├── e2e/run_e2e.py                     # 10 scenarios, 47 checks over HTTP + Redis + Kafka
+├── e2e/run_e2e.py                     # 11 scenarios, 52 checks over HTTP + Redis + Kafka + Postgres
 ├── e2e/check_confirmation_sweep.py    # focused confirmation-timeout timeline
 ├── kafka/check_kafka.sh               # infrastructure: containers, registry, log round-trip
 ├── kafka/check_contract_gate.sh       # contract: is this change compatible with its base?
-└── kafka/verify_match_confirmed.sh    # event: MATCH_CONFIRMED decodes through the registry
+├── kafka/verify_match_confirmed.sh    # event: MATCH_CONFIRMED decodes through the registry
+├── kafka/verify_idempotent_consumer.sh # consumer: a replay must not apply anything twice (W13)
+└── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
 ```
 
 ## Party flow (W11)
@@ -58,7 +60,13 @@ mvn -B -pl common/common-events exec:java -Dexec.mainClass=com.victor.matchmakin
 mvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication
 mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication
 mvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication
+mvn -pl services/match-orchestrator exec:java -Dexec.mainClass=com.victor.matchmaking.orchestrator.MatchOrchestratorApplication
 ```
+
+The order is not cosmetic: the API fetches the auth service's JWKS at startup, so
+starting it before `auth-service` is *listening* leaves it failing to bind (the
+`ConnectException` in `fetchPublicJwk`) while the auth service finishes booting. The
+orchestrator has no such dependency — it needs Postgres and Kafka, nothing else.
 
 Infrastructure (Redis + Postgres, and Kafka + Schema Registry from W12) comes from
 `docker-compose up -d`. Start the services **after** the build: recompiling
@@ -72,7 +80,7 @@ deliberate — a running pod must never invent a schema version.
 ## Automated tests
 
 ```bash
-mvn -B clean test            # unit + integration + race + stress (72 tests)
+mvn -B clean test            # unit + integration + race + stress (87 tests)
 ```
 
 The engine concurrency tests touch `queue:*` and `match-pending:*` in Redis
@@ -84,15 +92,22 @@ even steal the tickets the test just queued):
 docker exec game-matchmaking-backend-redis-1 redis-cli flushall
 ```
 
-## Automated E2E (W9/W10/W11/W12)
+The orchestrator tests need Postgres as well (`docker compose up -d postgres`): the
+consumer's idempotency is enforced by a unique index and a transaction, so a fake
+database would only assert the fake. They create their own rows (`match-w13-…`, group
+`w13-test`) and delete them afterwards; the CI `build` job runs a Postgres service for
+the same reason.
+
+## Automated E2E (W9/W10/W11/W12/W13)
 
 `requests/e2e/run_e2e.py` drives the running services over HTTP and asserts the
-engine state through Redis and the published event through Kafka (10 scenarios,
-47 checks): 1v1 and 5v5 pairing, party fill, party never split, party not fillable,
-atomic cancel / remove / dissolve, progressive skill widening, the
-confirmation-timeout sweep, and S10 — a confirmed match whose `MATCH_CONFIRMED`
-decodes from the Kafka log with the registered schema (roster, teams and skill
-snapshot included).
+engine state through Redis, the published event through Kafka and the orchestrator's
+projection through Postgres (11 scenarios, 52 checks): 1v1 and 5v5 pairing, party
+fill, party never split, party not fillable, atomic cancel / remove / dissolve,
+progressive skill widening, the confirmation-timeout sweep, S10 — a confirmed match
+whose `MATCH_CONFIRMED` decodes from the Kafka log with the registered schema (roster,
+teams and skill snapshot included) — and S11, where the orchestrator projects that
+match exactly once.
 
 ```bash
 python3 requests/e2e/run_e2e.py            # exits non-zero if any check fails
@@ -210,6 +225,81 @@ case (one build + registrar + both controls); the baseline adds one more build (
 and one more registrar run (6 s); `check_kafka.sh` 25 s. See
 `docs/adr/0015-protobuf-vs-avro-ci-gate.md`.
 
+### The idempotent consumer (W13 task 1)
+
+```bash
+bash requests/kafka/verify_idempotent_consumer.sh
+```
+
+Kafka delivers at least once, so this script reproduces the replay an operator does
+after fixing a projection bug: it stops the orchestrator, rewinds its consumer group to
+the beginning of the topic (`--reset-offsets --to-earliest`), starts it again and
+compares the database before and after. Every record is delivered a second time and
+nothing may be applied twice.
+
+The evidence is the database, not the log — the log says what the consumer intended:
+
+```text
+group position before: offset=8 end=8 lag=0
+...
+match_allocations:  8 -> 8
+processed_events:   8 -> 8
+outcomes logged:    APPLIED=0 DUPLICATE=8
+```
+
+Measured: 8 records re-read, **8 `DUPLICATE` / 0 `APPLIED`**, both tables unchanged and
+the group back at lag 0 in **9 s** after subscribing (rebalance + 8 records, one commit
+per record). The count is the topic's, not a limit: re-running it with 10 records on the
+topic replays 10 and every one of them is recognised as a duplicate. On the live path (`projected_at - confirmed_at` in `match_allocations`) the
+projection lags **42 ms** when the consumer is warm and 1.6 s for the first match after
+it idled; the values in the hours range are backfill — events produced before the
+orchestrator existed, which is a different thing. The check needs the orchestrator
+running and at least one event on the topic (E2E S11 leaves both), stops and restarts
+the consumer itself, and leaves it running. See
+`docs/adr/0038-consumer-idempotency.md`.
+
+### Bounded retry and the dead letter queue (W13 task 2)
+
+```bash
+bash requests/kafka/verify_dlq.sh
+```
+
+An idempotent consumer is only half of the at-least-once problem: a record that *always*
+fails (bytes that never decode, or an effect the database refuses) is never committed,
+so it is re-read forever and **blocks its partition** — every event behind it waits. The
+script drives both failure shapes against the real stack and asserts the same ending for
+each: three attempts, the original record on
+`matchmaking.events.match-confirmed-dlq` with the diagnosis in its headers, and the
+offset committed past it.
+
+1. **a payload that never decodes** — 22 bytes of text are produced onto the topic
+   through the console producer. The dead letter carries `dlq.stage:DECODE`,
+   `dlq.attempts:3`, the original topic/partition/offset, the group, and the payload
+   **verbatim**; no `dlq.event-id`, because nothing ever decoded.
+2. **an effect that cannot be applied** — the script drops the inbox row of the newest
+   projected event (the projection row stays, as it would after a partial restore) and
+   rewinds the group onto it. The event decodes, is no longer a duplicate, and its
+   `INSERT` conflicts on `match_id`: `dlq.stage:APPLY`,
+   `dlq.error-class:java.util.concurrent.CompletionException` with the
+   `duplicate key value violates unique constraint "match_allocations_pkey"` message, and
+   `dlq.event-id` naming the event.
+
+Measured: **38 checks, 0 failures**; after both phases the committed offset had passed
+the record that failed (`lag 0`), the projection was still 10 rows, the inbox unchanged,
+and the dead-lettered payload **still decoded through the Schema Registry into the same
+event** — which is the point of keeping the bytes. The script needs the orchestrator
+running and something already projected (E2E S11 leaves both), creates the dead letter
+topic if it is missing, and restores the inbox row it perturbed. See
+`docs/adr/0019-dlq-retry.md`.
+
+The dead letter topic is a deployment precondition, not something the service invents:
+
+```bash
+docker exec game-matchmaking-backend-kafka-1 kafka-topics --bootstrap-server localhost:29092 \
+  --create --if-not-exists --topic matchmaking.events.match-confirmed-dlq \
+  --partitions 1 --replication-factor 1
+```
+
 ## Typical flow
 
 1. `auth-service` → `POST /v1/auth/login` (captures `token`)
@@ -223,3 +313,9 @@ and one more registrar run (6 s); `check_kafka.sh` 25 s. See
    `requests/kafka/verify_match_confirmed.sh`
 7. Changing a contract (W12 task 3): `bash requests/kafka/check_contract_gate.sh`
    before opening the PR — the same script the `contracts` CI job runs
+8. Consumers (W13): start `match-orchestrator`, confirm a match (E2E S11) and watch the
+   projection row appear; then `requests/kafka/verify_idempotent_consumer.sh` to rewind
+   the group and prove a full replay applies nothing twice
+9. Failure paths (W13): `requests/kafka/verify_dlq.sh` produces a poison record and a
+   conflicting effect, and proves that both end on the dead letter topic with the offset
+   committed instead of stalling the partition
