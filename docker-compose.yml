@@ -22,25 +22,63 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "cub zk-ready localhost 2181"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
 
   kafka:
     image: confluentinc/cp-kafka:7.7.1
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     ports:
+      # EXTERNAL listener only: the hook for clients running on the host
+      # (the Java services via `mvn exec:java`, curl, kafka CLI from the host).
       - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      # Two listeners. One is not enough: the broker answers a client with the
+      # ADVERTISED address of the listener it connected to. Advertising
+      # localhost:9092 makes schema-registry dial itself (the registry stores
+      # schemas in the _schemas topic, so it is itself a Kafka client);
+      # advertising kafka:29092 makes the host unable to resolve the broker.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
+      # Host 8082 -> container 8081 (8081 is the auth-service port on the host).
       - "8082:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # Talks to the broker over the INTERNAL listener.
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      # Global default (see 04 - Engenharia Distribuída): the schema is frozen
+      # with FULL compatibility. The CI gate that fails on INCOMPATIBLE is W12
+      # task 3; this is the server-side half of it.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: full
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 20s

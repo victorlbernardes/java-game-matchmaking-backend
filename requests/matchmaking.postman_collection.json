@@ -1787,6 +1787,104 @@
           ]
         }
       ]
+    },
+    {
+      "name": "infra",
+      "item": [
+        {
+          "name": "schema-registry",
+          "item": [
+            {
+              "name": "GET /config",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.test('global compatibility is FULL', () => pm.expect(pm.response.json().compatibilityLevel).to.eql('FULL'));"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{schemaRegistryUrl}}/config",
+                  "host": [
+                    "{{schemaRegistryUrl}}"
+                  ],
+                  "path": [
+                    "config"
+                  ]
+                }
+              },
+              "description": "Global compatibility level enforced by the Schema Registry (W12).\n\n**Expected:** 200 with `{ \"compatibilityLevel\": \"FULL\" }`.\n\nSet by `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=full` in `docker-compose.yml`. It is the server-side half of the CI gate (W12 task 3): a new version of a subject must be readable by old AND new consumers, otherwise the registry rejects the registration.\n\nRequires: `docker compose up -d zookeeper kafka schema-registry`."
+            },
+            {
+              "name": "GET /subjects",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.test('payload is a list of subjects', () => pm.expect(pm.response.json()).to.be.an('array'));"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{schemaRegistryUrl}}/subjects",
+                  "host": [
+                    "{{schemaRegistryUrl}}"
+                  ],
+                  "path": [
+                    "subjects"
+                  ]
+                }
+              },
+              "description": "Subjects registered in the `_schemas` topic.\n\n**Expected:** 200 with `[]` until W12 task 2 registers the first event contract (`match-confirmed-value`, `player-search-value`).\n\nA non-empty list here is also the proof that the registry reached the broker over the INTERNAL listener."
+            },
+            {
+              "name": "GET /schemas/types",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200', () => pm.response.to.have.status(200));",
+                      "pm.test('PROTOBUF is supported', () => pm.expect(pm.response.json()).to.include('PROTOBUF'));"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{schemaRegistryUrl}}/schemas/types",
+                  "host": [
+                    "{{schemaRegistryUrl}}"
+                  ],
+                  "path": [
+                    "schemas",
+                    "types"
+                  ]
+                }
+              },
+              "description": "Schema formats this registry accepts.\n\n**Expected:** 200 with `[\"JSON\", \"PROTOBUF\", \"AVRO\"]`. The event contracts use Protobuf (see `04 - Engenharia Distribuída`)."
+            }
+          ]
+        }
+      ]
     }
   ]
 }
