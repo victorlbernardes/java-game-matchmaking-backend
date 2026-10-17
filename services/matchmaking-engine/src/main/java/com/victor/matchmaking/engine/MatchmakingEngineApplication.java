@@ -18,8 +18,11 @@ import com.victor.matchmaking.engine.application.OutboxRelay;
 import com.victor.matchmaking.engine.application.PairingPolicy;
 import com.victor.matchmaking.engine.application.PendingMatch;
 import com.victor.matchmaking.engine.application.PendingMatchStore;
+import com.victor.matchmaking.engine.infrastructure.EngineKpis;
 import com.victor.matchmaking.engine.infrastructure.KafkaEventPublisher;
+import com.victor.matchmaking.engine.infrastructure.OutboxMetricsPoller;
 import com.victor.matchmaking.engine.infrastructure.PostgresOutboxQueue;
+import com.victor.matchmaking.engine.infrastructure.QueueMetricsPoller;
 import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
@@ -50,6 +53,15 @@ public final class MatchmakingEngineApplication {
      * a table 10 times a second for nothing.
      */
     private static final long OUTBOX_INTERVAL_MS = 250;
+    /**
+     * How often the derived KPIs (queue depth and head wait in Redis, outbox backlog in
+     * Postgres) are read (W15). The scrape reads the last poll, so this is the bound on how
+     * stale {@code matchmaking_queue_*} and {@code matchmaking_outbox_backlog} can be; every
+     * two seconds is fresh enough for a dashboard and cheap enough for the event loop.
+     */
+    static final long KPI_POLL_INTERVAL_MS = 2000;
+    /** Its own port: the engine has no public HTTP surface and must not grow one for metrics. */
+    private static final int ENGINE_METRICS_PORT = 9091;
     static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
     /**
      * The pending-match Redis key must outlive its confirmation deadline,
@@ -68,7 +80,17 @@ public final class MatchmakingEngineApplication {
         System.setProperty("java.util.logging.SimpleFormatter.format",
                 "%1$tF %1$tT %4$s %5$s%n");
         java.util.Locale.setDefault(java.util.Locale.ENGLISH);
-        Vertx vertx = Vertx.vertx();
+        // The registry before the Vertx instance (see MatchmakingMetrics): the engine's own
+        // meters and Vert.x's (event loop, JVM) end up in one scrape (W15, ADR 0020).
+        com.victor.matchmaking.metrics.MatchmakingMetrics metrics =
+                new com.victor.matchmaking.metrics.MatchmakingMetrics();
+        Vertx vertx = Vertx.vertx(metrics.vertxOptions());
+        EngineKpis kpis = new EngineKpis(metrics.registry());
+        com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(),
+                        com.victor.matchmaking.metrics.MetricsEndpoint.portFromEnv(ENGINE_METRICS_PORT))
+                .onSuccess(s -> LOG.log(System.Logger.Level.INFO, "metrics.started port={0}",
+                        String.valueOf(s.actualPort())))
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=metricsStart", err));
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
         io.vertx.redis.client.Redis redis = io.vertx.redis.client.Redis.createClient(vertx,
                 new RedisOptions().setConnectionString(redisUri));
@@ -93,15 +115,25 @@ public final class MatchmakingEngineApplication {
         }, "engine-outbox-close"));
 
         RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
-                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, outbox));
+                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, outbox, kpis));
 
         // Load the atomic pairing script before starting the pairing loop
         loadPairScript(redis).onSuccess(sha -> {
             PAIR_SCRIPT_SHA = sha;
-            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier));
-            vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier));
+            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier, kpis));
+            vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier, kpis));
             vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
+                    .onSuccess(kpis::relayDrained)
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=outboxDrain", err)));
+
+            // The derived KPIs: the queues live in Redis, the outbox in Postgres, and both are
+            // read asynchronously into gauges (never from the scrape thread).
+            QueueMetricsPoller queueKpis = new QueueMetricsPoller(redis, kpis, java.time.Clock.systemUTC());
+            OutboxMetricsPoller outboxKpis = new OutboxMetricsPoller(outbox, kpis);
+            vertx.setPeriodic(KPI_POLL_INTERVAL_MS, id -> queueKpis.pollOnce()
+                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=queueKpis", err)));
+            vertx.setPeriodic(KPI_POLL_INTERVAL_MS, id -> outboxKpis.pollOnce()
+                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=outboxKpis", err)));
 
             LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2} pairScript={3}",
                     String.valueOf(PAIRING_INTERVAL_MS), String.valueOf(SWEEP_INTERVAL_MS),
@@ -121,19 +153,19 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void scanAndPair(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier) {
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         redis.send(Request.cmd(Command.SCAN).arg("0").arg("MATCH").arg("queue:*")).onSuccess(scan -> {
             Response keysResp = scan.get(1);
             if (keysResp != null) {
                 for (int i = 0; i < keysResp.size(); i++) {
-                    tryPairFromQueue(keysResp.get(i).toString(), redis, tickets, pending, notifier);
+                    tryPairFromQueue(keysResp.get(i).toString(), redis, tickets, pending, notifier, kpis);
                 }
             }
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=scanQueues", err));
     }
 
     private static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier) {
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         GameMode gameMode = gameModeOfQueueKey(queueKey);
         if (gameMode == null) {
             return;
@@ -153,7 +185,7 @@ public final class MatchmakingEngineApplication {
                 // queuedAt tells PairingPolicy how long the player has been waiting.
                 List<MatchmakingTicket> roster = buildRoster(candidates, gameMode, candidates.get(0).queuedAt());
                 if (roster != null) {
-                    pair(roster, queueKey, redis, tickets, pending, notifier);
+                    pair(roster, queueKey, redis, tickets, pending, notifier, kpis);
                 }
             }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                     "engine.error stage=loadTickets queue={0}", err, queueKey));
@@ -211,7 +243,7 @@ public final class MatchmakingEngineApplication {
     /** Pairs exactly the given candidates into one pending match. */
     private static void pair(List<MatchmakingTicket> candidates, String queueKey,
             io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier) {
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
         List<PendingMatch.PendingPlayer> roster = new ArrayList<>();
         for (MatchmakingTicket candidate : candidates) {
@@ -232,6 +264,10 @@ public final class MatchmakingEngineApplication {
                         // Another worker already removed these tickets from the queue
                         return;
                     }
+                    // The roster is off the queue: this is the moment the wait ended, and the
+                    // only place it can be measured per player (W15). Recorded before the
+                    // notifications, so a slow notifier cannot hide a fast pairing.
+                    kpis.matchFormed(candidates, Instant.now());
                     // Paired! Transition to CONFIRMING and notify every player.
                     for (int i = 0; i < candidates.size(); i++) {
                         MatchmakingTicket candidate = candidates.get(i);
@@ -277,7 +313,7 @@ public final class MatchmakingEngineApplication {
 
     private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
             TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, OutboxQueue outbox) {
+            RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
         Payloads.MatchConfirmation command;
         try {
             command = Payloads.MatchConfirmation.fromJson(msg);
@@ -299,7 +335,8 @@ public final class MatchmakingEngineApplication {
                 return;
             }
             if ("DECLINE".equals(action)) {
-                dissolve(pm, "declined by " + playerId, tickets, pending, notifier, redis);
+                dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_DECLINED,
+                        "declined by " + playerId, tickets, pending, notifier, redis, kpis);
                 return;
             }
             if ("CONFIRM".equals(action)) {
@@ -319,7 +356,7 @@ public final class MatchmakingEngineApplication {
                                     matchId, playerId, String.valueOf(confirmed),
                                     String.valueOf(pm.players().size()));
                             if (confirmed >= pm.players().size()) {
-                                confirm(pm, tickets, pending, notifier, outbox);
+                                confirm(pm, tickets, pending, notifier, outbox, kpis);
                             }
                         })
                         .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -330,7 +367,7 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void confirm(PendingMatch pm, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, OutboxQueue outbox) {
+            RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
         // Load both tickets, then transition them and persist the durable match row.
         List<Future<MatchmakingTicket>> loaded = pm.players().stream()
                 .map(p -> tickets.findById(p.ticketId()))
@@ -374,9 +411,14 @@ public final class MatchmakingEngineApplication {
                     Instant.now(),
                     0);
             outbox.writeMatchWithEvent(match, players, record)
-                    .onSuccess(ignored -> LOG.log(System.Logger.Level.INFO,
-                            "match.confirmed matchId={0} players={1} persisted=true eventId={2} outbox=PENDING",
-                            pm.matchId(), pm.playerIds(), record.eventId()))
+                    .onSuccess(ignored -> {
+                        // The match is a fact now: counted here, not when the event reaches the
+                        // broker (that is the outbox KPI's job). Same moment, different question.
+                        kpis.matchConfirmed(first.gameMode(), first.region());
+                        LOG.log(System.Logger.Level.INFO,
+                                "match.confirmed matchId={0} players={1} persisted=true eventId={2} outbox=PENDING",
+                                pm.matchId(), pm.playerIds(), record.eventId());
+                    })
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                             "engine.error stage=persistMatchWithEvent matchId=" + pm.matchId(), err));
             pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -390,9 +432,14 @@ public final class MatchmakingEngineApplication {
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadTicketsForConfirm", err));
     }
 
-    private static void dissolve(PendingMatch pm, String reason, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, io.vertx.redis.client.Redis redis) {
-        LOG.log(System.Logger.Level.INFO, "match.dissolved matchId={0} reason={1}", pm.matchId(), reason);
+    private static void dissolve(PendingMatch pm, String reasonTag, String detail, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, io.vertx.redis.client.Redis redis,
+            EngineKpis kpis) {
+        LOG.log(System.Logger.Level.INFO, "match.dissolved matchId={0} reason={1} detail={2}",
+                pm.matchId(), reasonTag, detail);
+        // The tag is a closed set (timeout, declined): a free-form reason would create one
+        // series per player id. The detail still travels to the players and to the log.
+        kpis.matchDissolved(reasonTag);
         for (PendingMatch.PendingPlayer player : pm.players()) {
             tickets.findById(player.ticketId()).onSuccess(ticket -> {
                 if (ticket != null && ticket.status() == TicketState.CONFIRMING) {
@@ -410,7 +457,7 @@ public final class MatchmakingEngineApplication {
                         "engine.error stage=deleteConfirmedSet matchId=" + pm.matchId(), err));
         for (PendingMatch.PendingPlayer player : pm.players()) {
             notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CANCELLED",
-                    new Payloads.MatchCancelled(pm.matchId(), reason)), Payloads.MatchCancelled::toJson)
+                    new Payloads.MatchCancelled(pm.matchId(), detail)), Payloads.MatchCancelled::toJson)
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                             "engine.error stage=notifyCancelled playerId=" + player.playerId(), err));
         }
@@ -428,7 +475,7 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void sweepExpired(io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier) {
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         redis.send(Request.cmd(Command.SCAN).arg("0").arg("MATCH").arg("match-pending:*")).onSuccess(scan -> {
             Response keysResp = scan.get(1);
             if (keysResp != null) {
@@ -437,7 +484,8 @@ public final class MatchmakingEngineApplication {
                     pending.findById(key.substring("match-pending:".length()))
                             .onSuccess(pm -> {
                                 if (pm != null && Instant.now().isAfter(pm.expiresAt())) {
-                                    dissolve(pm, "timeout", tickets, pending, notifier, redis);
+                                    dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_TIMEOUT,
+                                            "timeout", tickets, pending, notifier, redis, kpis);
                                 }
                             })
                             .onFailure(err -> LOG.log(System.Logger.Level.ERROR,

@@ -16,6 +16,7 @@
         <module>common/common-redis</module>
         <module>common/common-db</module>
         <module>common/common-events</module>
+        <module>common/common-metrics</module>
         <module>services/matchmaking-api</module>
         <module>services/matchmaking-engine</module>
         <module>services/auth-service</module>
@@ -43,6 +44,10 @@
         <kafka.clients.version>7.7.1-ccs</kafka.clients.version>
         <protobuf.maven.plugin.version>0.6.1</protobuf.maven.plugin.version>
         <os.maven.plugin.version>1.7.1</os.maven.plugin.version>
+        <!-- Metrics (W15). vertx-micrometer-metrics 5.2.0 is compiled against
+             Micrometer 1.17.1, so the Prometheus registry must be the same version:
+             a registry from another line fails at runtime with a NoSuchMethodError. -->
+        <micrometer.version>1.17.1</micrometer.version>
     </properties>
 
     <dependencyManagement>

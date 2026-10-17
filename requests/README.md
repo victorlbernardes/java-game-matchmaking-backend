@@ -37,7 +37,10 @@ requests/
 ├── kafka/verify_match_confirmed.sh    # event: MATCH_CONFIRMED decodes through the registry
 ├── kafka/verify_idempotent_consumer.sh # consumer: a replay must not apply anything twice (W13)
 ├── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
-└── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
+├── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
+└── observability/
+    ├── check_metrics.sh               # KPIs: exposition, the numbers moving, Prometheus + Grafana (W15)
+    └── pending_match.py               # helper: the pending match of two given players
 ```
 
 ## Party flow (W11)
@@ -373,6 +376,71 @@ docker exec game-matchmaking-backend-kafka-1 kafka-topics --bootstrap-server loc
   --partitions 1 --replication-factor 1
 ```
 
+## Observability — domain KPIs (W15)
+
+Both services expose a Prometheus scrape on **a port of their own** (`MetricsEndpoint`, ADR
+0020): `matchmaking-api` on **9090**, `matchmaking-engine` on **9091**. The port is never the
+public one; in this local stack the endpoint binds every interface so the Prometheus container
+can reach the host through `host.docker.internal`.
+
+```bash
+docker compose up -d prometheus grafana          # Prometheus :9095, Grafana :3000
+
+# the API owns 9090 by default; the engine is started with its own port:
+METRICS_PORT=9091 mvn -pl services/matchmaking-engine exec:java \
+  -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication </dev/null \
+  > /tmp/matchmaking-engine.log 2>&1 &
+
+curl -s localhost:9090/metrics | grep matchmaking_tickets_enqueued_total
+curl -s localhost:9091/metrics | grep -E 'matchmaking_(queue|outbox|matches)'
+```
+
+The numbers, and the question each one answers:
+
+| Metric (Prometheus) | Kind | Question |
+| --- | --- | --- |
+| `matchmaking_tickets_enqueued_total{mode,region}` | counter (API) | How many players arrived, where |
+| `matchmaking_queue_depth{mode,region}` | gauge from Redis | How many are waiting right now |
+| `matchmaking_queue_oldest_wait_seconds{mode,region}` | gauge from Redis | How long the head has been waiting (the depth alone lies) |
+| `matchmaking_match_wait_seconds_*` | histogram (engine) | Wait from enqueue to match: p50/p95/p99 |
+| `matchmaking_matches_formed_total{mode,region}` | counter | Pairing throughput |
+| `matchmaking_matches_confirmed_total{mode,region}` | counter | Matches that actually happened |
+| `matchmaking_matches_dissolved_total{reason}` | counter | Matches that fell apart (`timeout` / `declined`) |
+| `matchmaking_outbox_backlog{status}` | gauge from Postgres | `PENDING` = backlog, `PARKED` = needs a human |
+| `matchmaking_outbox_oldest_pending_seconds` | gauge from Postgres | A stopped relay, not a busy one |
+| `matchmaking_outbox_publish_lag_seconds` | gauge from Postgres | Fact → broker for the newest event |
+| `matchmaking_outbox_published_total` / `_retried_total` / `_parked_total` | counters | What the relay is doing |
+| `vertx_http_server_requests_total{code,method}`, `vertx_http_server_response_time_seconds`, `vertx_pool_*`, `vertx_redis_*`, `vertx_sql_*`, `jvm_*` | Vert.x / JVM | Transport and runtime health (event loop, pool, memory, HTTP codes) |
+
+Two rules the dashboards depend on: **every tag is a closed set** (`mode`, `region`, `status`,
+`reason` — never a player id or a free-form string), and the **state-derived gauges are refreshed
+every 2 s** by a poller, because a Micrometer gauge is read synchronously at scrape time and Redis
+and Postgres are not (the staleness bound is in ADR 0020).
+
+The scenario drives one real match with two players and asserts the numbers moved:
+
+```bash
+bash requests/observability/check_metrics.sh
+```
+
+It reads the exposition directly, then the same series through Prometheus (`up == 1`, a query),
+then Grafana's API, and cross-checks the outbox backlog against `SELECT count(*)` in Postgres —
+so it fails if a service stops exposing, if Prometheus stops scraping, if the dashboard is
+dropped from the provisioning, or if Grafana can no longer query the datasource. Grafana and
+Prometheus are configured as code: `ops/prometheus/` and `ops/grafana/` (datasource, provider,
+dashboard), so a fresh machine gets the panels without clicking.
+
+Measured: **35 checks, 0 failures, ~25 s** (ADR 0020 has the numbers the run produced). If the
+container images cannot be pulled (this machine could not reach the registry), the same
+configuration runs from the binaries on the host and the scenario is unaffected — it checks
+reachability, not what serves it:
+
+```bash
+prometheus --config.file=ops/prometheus/prometheus.host.yml --web.listen-address=:9095 \
+           --storage.tsdb.path=/tmp/prometheus-w15        # targets localhost:9090/9091
+grafana server                                        # provisioning: ops/grafana/
+```
+
 ## Typical flow
 
 1. `auth-service` → `POST /v1/auth/login` (captures `token`)
@@ -396,3 +464,6 @@ docker exec game-matchmaking-backend-kafka-1 kafka-topics --bootstrap-server loc
 9. Failure paths (W13): `requests/kafka/verify_dlq.sh` produces a poison record and a
    conflicting effect, and proves that both end on the dead letter topic with the offset
    committed instead of stalling the partition
+10. KPIs (W15): `docker compose up -d prometheus grafana`, start both services with the
+    metrics ports, `bash requests/observability/check_metrics.sh` (Prometheus:
+    http://localhost:9095, Grafana: http://localhost:3000 → folder *Matchmaking*)

@@ -1,0 +1,25 @@
+# Prometheus (W15, ADR 0021).
+#
+# Two jobs, one per service: the matchmaking-api answers players and exposes the transport
+# and arrival KPIs, the matchmaking-engine pairs and exposes the queue and outbox KPIs. They
+# run on the host (mvn exec:java), each on its own metrics port, and the scrape reaches them
+# through host.docker.internal - that is why the metrics endpoint binds every interface in
+# the local stack and why the port is not the public one (see MetricsEndpoint).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: matchmaking-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+        labels:
+          service: matchmaking-api
+
+  - job_name: matchmaking-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: matchmaking-engine

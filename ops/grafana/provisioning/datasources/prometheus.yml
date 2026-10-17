@@ -1,0 +1,11 @@
+apiVersion: 1
+
+# The datasource points at the Prometheus of this compose file, by service name.
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -31,8 +31,14 @@ public final class MatchmakingApiApplication {
         System.setProperty("java.util.logging.SimpleFormatter.format",
                 "%1$tF %1$tT %4$s %5$s%n");
         java.util.Locale.setDefault(java.util.Locale.ENGLISH);
-        Vertx vertx = Vertx.vertx();
+        // The registry exists before the Vertx instance: Vert.x binds its own meters (HTTP
+        // server, event loop, JVM) to it, and the domain KPIs are added to the same one.
+        com.victor.matchmaking.metrics.MatchmakingMetrics metrics =
+                new com.victor.matchmaking.metrics.MatchmakingMetrics();
+        Vertx vertx = Vertx.vertx(metrics.vertxOptions());
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", String.valueOf(DEFAULT_PORT)));
+        int metricsPort = com.victor.matchmaking.metrics.MetricsEndpoint.portFromEnv(
+                com.victor.matchmaking.metrics.MetricsEndpoint.DEFAULT_PORT);
         String jwksUrl = System.getenv().getOrDefault("AUTH_JWKS_URL", "http://localhost:8081/.well-known/jwks.json");
 
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
@@ -56,7 +62,14 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.domain.player.SkillProvider skillProvider =
                 new com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider();
         Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository,
-                skillProvider, partyStore);
+                skillProvider, partyStore, metrics.registry());
+
+        com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(), metricsPort)
+                .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
+                        "metrics.started port={0} path={1}", String.valueOf(s.actualPort()),
+                        com.victor.matchmaking.metrics.MetricsEndpoint.PATH))
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                        "metrics.start.failed port=" + metricsPort, err));
 
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router)

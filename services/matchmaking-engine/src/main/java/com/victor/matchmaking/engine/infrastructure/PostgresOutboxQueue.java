@@ -6,7 +6,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import com.victor.matchmaking.db.DatabaseConfig;
@@ -153,6 +155,56 @@ public final class PostgresOutboxQueue implements OutboxQueue, AutoCloseable {
     @Override
     public void close() {
         pool.close();
+    }
+
+    /**
+     * Rows per status, for the KPIs (ADR 0020). Read-only and untagged: whoever reads it wants
+     * the size of the backlog and of the parked lot, not the rows themselves.
+     */
+    public Future<Map<String, Long>> countByStatus() {
+        return pool.query("SELECT status, count(*) AS total FROM outbox_events GROUP BY status")
+                .execute()
+                .map(rows -> {
+                    Map<String, Long> counts = new LinkedHashMap<>();
+                    for (Row row : rows) {
+                        counts.put(row.getString("status"), row.getLong("total"));
+                    }
+                    return counts;
+                });
+    }
+
+    /**
+     * The age of the oldest row still waiting. This is the relay's real lag - how long an
+     * event has been sitting since the fact happened - not the polling interval.
+     *
+     * @return null when there is nothing pending
+     */
+    public Future<Duration> oldestPendingAge() {
+        return secondsQuery("SELECT extract(epoch FROM (now() - min(created_at)))::double precision AS seconds"
+                + " FROM outbox_events WHERE status = 'PENDING'");
+    }
+
+    /**
+     * Fact to broker, for the newest published row: how much delay the outbox added between
+     * committing the match and having the event acknowledged.
+     *
+     * @return null when nothing was published yet
+     */
+    public Future<Duration> newestPublishLag() {
+        return secondsQuery("SELECT extract(epoch FROM (published_at - occurred_at))::double precision AS seconds"
+                + " FROM outbox_events WHERE status = 'PUBLISHED'"
+                + " ORDER BY published_at DESC LIMIT 1");
+    }
+
+    private Future<Duration> secondsQuery(String sql) {
+        return pool.query(sql).execute().map(rows -> {
+            Row row = rows.iterator().hasNext() ? rows.iterator().next() : null;
+            if (row == null) {
+                return null;
+            }
+            Double seconds = row.getDouble("seconds");
+            return seconds == null ? null : Duration.ofMillis(Math.round(seconds * 1000));
+        });
     }
 
     private Future<Void> insertEvent(SqlConnection connection, OutboxRecord event) {

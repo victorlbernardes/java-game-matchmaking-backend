@@ -19,7 +19,10 @@ import com.victor.matchmaking.api.infrastructure.InMemoryPartyStore;
 import com.victor.matchmaking.api.infrastructure.InMemoryTicketRepository;
 import com.victor.matchmaking.redis.TicketCodec;
 import com.victor.matchmaking.redis.RedisPublisher;
+import com.victor.matchmaking.metrics.MetricNames;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.auth.authentication.TokenCredentials;
@@ -62,11 +65,24 @@ public final class HttpRoutes {
     /** Full injection with the real skill provider and party store (main wiring). */
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore) {
+        return createRouter(vertx, jwtAuth, repository, wsHub, matchRepository, skillProvider, partyStore,
+                new SimpleMeterRegistry());
+    }
+
+    /**
+     * Main wiring plus the registry the domain KPIs are counted on. The routes count what
+     * crosses them (a ticket enqueued is an arrival, and only the boundary sees every
+     * arrival, including the ones the queue never pairs); deeper numbers come from the
+     * state itself in the engine.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry) {
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
-                new PartyUseCases(partyStore, repository, skillProvider));
+                new PartyUseCases(partyStore, repository, skillProvider), registry);
     }
 
     /**
@@ -82,12 +98,12 @@ public final class HttpRoutes {
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
-                new PartyUseCases(partyStore, repository, skillProvider));
+                new PartyUseCases(partyStore, repository, skillProvider), new SimpleMeterRegistry());
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
             GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub,
-            MatchRepository matchRepository, PartyUseCases partyUseCases) {
+            MatchRepository matchRepository, PartyUseCases partyUseCases, MeterRegistry registry) {
 
         Router router = Router.router(vertx);
         router.route().handler(ctx -> {
@@ -141,6 +157,7 @@ public final class HttpRoutes {
                                         respond(ctx, 200, TicketCodec.toJson(result.ticket()));
                                         return;
                                     }
+                                    countEnqueuedTicket(registry, result.ticket());
                                     respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
                                 })
                                 .onFailure(err -> fail(ctx, 500, err.getMessage()));
@@ -228,6 +245,18 @@ public final class HttpRoutes {
                 }));
 
         return router;
+    }
+
+    /**
+     * Counts an arrival: a ticket that entered a queue. Tagged by mode and region so the KPI
+     * answers "who is waiting where", and only on a real creation - an idempotent replay
+     * returns 200 and must not inflate the arrival count.
+     */
+    private static void countEnqueuedTicket(MeterRegistry registry,
+            com.victor.matchmaking.domain.ticket.MatchmakingTicket ticket) {
+        registry.counter(MetricNames.TICKETS_ENQUEUED,
+                MetricNames.TAG_MODE, ticket.gameMode().label(),
+                MetricNames.TAG_REGION, ticket.region().name()).increment();
     }
 
     private static JsonObject partyViewToJson(GetPartyUseCase.PartyView view) {

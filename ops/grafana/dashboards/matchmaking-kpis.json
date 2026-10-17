@@ -1,0 +1,272 @@
+{
+  "uid": "matchmaking-kpis",
+  "title": "Matchmaking KPIs",
+  "tags": ["matchmaking", "w15"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Players waiting (queue depth)",
+      "description": "Derived from Redis every 2 s (ADR 0020). The queue is the source of truth, so this number cannot disagree with it.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "matchmaking_queue_depth",
+          "legendFormat": "{{mode}} {{region}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Oldest wait in queue (s)",
+      "description": "How long the player at the head of the queue has been waiting. A deep queue that moves is healthy; a shallow one with an old head is not.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "matchmaking_queue_oldest_wait_seconds",
+          "legendFormat": "{{mode}} {{region}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Arrivals (tickets/min)",
+      "description": "Counted at the API's enqueue route, only on a real creation: an idempotent replay does not inflate arrivals.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (mode, region) (rate(matchmaking_tickets_enqueued_total[5m])) * 60",
+          "legendFormat": "{{mode}} {{region}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Matches formed vs confirmed (per min)",
+      "description": "The gap between the two lines is matches that fell apart before confirmation. Per mode/region the ratio is the quality of the pairing policy.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (mode, region) (rate(matchmaking_matches_formed_total[5m])) * 60",
+          "legendFormat": "formed {{mode}} {{region}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (mode, region) (rate(matchmaking_matches_confirmed_total[5m])) * 60",
+          "legendFormat": "confirmed {{mode}} {{region}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Wait from queue to match: p50 / p95 / p99 (s)",
+      "description": "The product metric. A percentile histogram, because the average hides the tail that makes players leave.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(matchmaking_match_wait_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(matchmaking_match_wait_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(matchmaking_match_wait_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Matches dissolved by reason (per min)",
+      "description": "timeout = the confirmation window closed; declined = a player said no. Free-form detail stays in the log, never in a label.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason) (rate(matchmaking_matches_dissolved_total[5m])) * 60",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Outbox backlog by status (rows)",
+      "description": "Derived from Postgres. PENDING is the backlog; PARKED needs a human (ADR 0018).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "matchmaking_outbox_backlog",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Outbox lag: oldest pending and newest publish (s)",
+      "description": "A backlog that is not growing but has an old head is a stopped relay, not a busy one. The publish lag is fact -> broker for the newest row.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "matchmaking_outbox_oldest_pending_seconds",
+          "legendFormat": "oldest pending"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "matchmaking_outbox_publish_lag_seconds",
+          "legendFormat": "newest publish lag"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Relay operations (per min)",
+      "description": "What the outbox relay did: published, retried after a failure, parked after giving up.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(matchmaking_outbox_published_total[5m]) * 60",
+          "legendFormat": "published"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(matchmaking_outbox_retried_total[5m]) * 60",
+          "legendFormat": "retried"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(matchmaking_outbox_parked_total[5m]) * 60",
+          "legendFormat": "parked"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "HTTP requests by code (per min)",
+      "description": "The transport, as Vert.x reports it: 5xx here means the gateway is failing, not the players are slow.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (code) (rate(vertx_http_server_requests_total[5m])) * 60",
+          "legendFormat": "{{code}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "HTTP mean and max response time (s)",
+      "description": "Vert.x exposes the response time as a summary (count/sum/max), so the mean is sum/count and the max is reported as-is.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(vertx_http_server_response_time_seconds_sum[5m])) / sum(rate(vertx_http_server_response_time_seconds_count[5m]))",
+          "legendFormat": "mean"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(vertx_http_server_response_time_seconds_max)",
+          "legendFormat": "max"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Runtime: pools and event loop",
+      "description": "The engine and the API share one registry, so the pool and Redis/SQL numbers of the process are one scrape away.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vertx_pool_in_use",
+          "legendFormat": "pool in use ({{service}}, {{pool_type}})"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vertx_pool_queue_pending",
+          "legendFormat": "pool queue pending ({{service}})"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "vertx_redis_processing_pending",
+          "legendFormat": "redis processing pending ({{service}})"
+        }
+      ]
+    }
+  ]
+}

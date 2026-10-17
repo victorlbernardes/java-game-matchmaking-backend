@@ -82,3 +82,34 @@ services:
       timeout: 10s
       retries: 12
       start_period: 20s
+
+  # Observability (W15, ADR 0021). Prometheus scrapes the metrics port of each service on the
+  # host (9090 = matchmaking-api, 9091 = matchmaking-engine, both on a port of their own, never
+  # the public one). Grafana reads from Prometheus and is provisioned from ops/grafana, so a
+  # fresh machine gets the dashboard without clicking.
+  prometheus:
+    image: prom/prometheus:v3.13.4
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      # Host 9095 -> container 9090 (9090 is the matchmaking-api metrics port on the host).
+      - "9095:9090"
+    extra_hosts:
+      # On Linux, host.docker.internal is not there by default; on Docker Desktop it is.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:13.0-slim
+    depends_on:
+      - prometheus
+    environment:
+      # Anonymous access for the local stack only: no login wall in front of a dev dashboard.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
