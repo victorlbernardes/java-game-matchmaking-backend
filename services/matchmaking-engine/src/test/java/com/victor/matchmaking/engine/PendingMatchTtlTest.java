@@ -53,7 +53,10 @@ class PendingMatchTtlTest {
                             .arg("1").arg(QUEUE_KEY)
                             .arg(MATCH_ID).arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}")
                             .arg(String.valueOf(MatchmakingEngineApplication.PENDING_KEY_TTL_SECONDS))
-                            .arg("2"))
+                            .arg("2")
+                            // The caller names the roster (W16): the script no longer takes the
+                            // head of the queue itself.
+                            .arg("ticket-ttl-a").arg("ticket-ttl-b"))
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
             assertNotNull(result, "the pair script must win the race");
 

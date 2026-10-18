@@ -44,22 +44,17 @@ public final class QueueMetricsPoller {
         this.clock = clock;
     }
 
-    /** One pass: scan the queue keys, read each one, publish all of them. */
+    /** One pass: read every configured queue and publish all of them. */
     public Future<Void> pollOnce() {
         Map<String, Long> depth = new HashMap<>();
         Map<String, Long> headQueuedAtMillis = new HashMap<>();
-        return redis.send(Request.cmd(Command.SCAN).arg("0").arg("MATCH").arg("queue:*"))
-                .compose(scan -> {
-                    Response keys = scan.get(1);
-                    if (keys == null) {
-                        return Future.succeededFuture();
-                    }
-                    List<Future<Void>> reads = new ArrayList<>();
-                    for (int index = 0; index < keys.size(); index++) {
-                        reads.add(readQueue(keys.get(index).toString(), depth, headQueuedAtMillis));
-                    }
-                    return Future.all(reads).mapEmpty();
-                })
+        List<Future<Void>> reads = new ArrayList<>();
+        // The keys are built, not discovered: a SCAN page used to decide which queues existed,
+        // and a queue that fell on a later page was published as an empty one (W16).
+        for (String queueKey : RedisKeys.allQueueKeys()) {
+            reads.add(readQueue(queueKey, depth, headQueuedAtMillis));
+        }
+        return Future.all(reads)
                 .map(ignored -> {
                     publish(depth, headQueuedAtMillis);
                     return (Void) null;

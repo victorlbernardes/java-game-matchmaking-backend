@@ -11,7 +11,6 @@ import com.victor.matchmaking.api.presentation.HttpRoutes;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
 import io.vertx.redis.client.Redis;
-import io.vertx.redis.client.RedisOptions;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.auth.jwt.JWTAuth;
@@ -42,7 +41,7 @@ public final class MatchmakingApiApplication {
         String jwksUrl = System.getenv().getOrDefault("AUTH_JWKS_URL", "http://localhost:8081/.well-known/jwks.json");
 
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
-        Redis redis = Redis.createClient(vertx, new RedisOptions().setConnectionString(redisUri));
+        Redis redis = Redis.createClient(vertx, com.victor.matchmaking.redis.RedisClients.options(redisUri));
         com.victor.matchmaking.redis.TicketRepository repository =
                 new RedisTicketRepository(redis);
         com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);

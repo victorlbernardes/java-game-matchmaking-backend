@@ -9,6 +9,11 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# The SLOs and their burn-rate alerts (W16, ADR 0021). Prometheus refuses to start on a broken
+# rule file, which is the point: an objective that does not compile is worse than none.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
   - job_name: matchmaking-api
     metrics_path: /metrics

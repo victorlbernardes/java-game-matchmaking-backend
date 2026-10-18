@@ -1,0 +1,199 @@
+# The matchmaking SLOs (W16, ADR 0021).
+#
+# Four objectives, chosen because each one is a question a player or an operator asks, and each
+# one is answered by a number this stack already produces (ADR 0020):
+#
+#   SL-1 latency   99% of matched tickets wait <= 10 s   (histogram buckets, engine)
+#   SL-2 confirm   99% of formed matches are confirmed   (two counters, engine)
+#   SL-3 delivery  the outbox never ages past 5 s        (gauges, engine)
+#   SL-4 capacity  a waiting player never waits > 30 s   (gauge, engine)
+#
+# SL-1 and SL-2 are ratios, so they have an error budget (1%) and burn-rate alerts. SL-3 and SL-4
+# are thresholds over gauges - there is no proportion to spend, only a line to hold - so they
+# alert after the line has been crossed for a while, and the ADR says why they are not ratios.
+#
+# The targets are calibrated against the W16 measurements, not invented: a 400-player burst
+# drained with p99 1.8 s and a saturated 4000-player burst (arrival above capacity) with p99
+# 15.6 s - so SL-1 holds up to the capacity the single node pairs (≈180 players/s peak) and
+# deliberately does not promise latency to an unbounded arrival rate; the queue's head (SL-4) is
+# the line that reports that case. SL-2 held at 100% once the pairing and confirmation defects
+# found that day were fixed (2000 matches formed, 2000 confirmed, 0 dissolved). SL-4 is the one
+# that would have caught them: the W15 ghost member and the W16 blind scan both showed up as a
+# queue whose head waited minutes while nothing paired.
+#
+# SL-1's boundary is only measurable because the histogram carries a bucket edge exactly at 10 s
+# (EngineKpis.LATENCY_SLO) AND because the selector matches how the client renders it: Micrometer's
+# default buckets jump from 8.59 s to 10.02 s, and it writes the edge as `le="10.0"`, so a plain
+# `le="10"` matches no series at all - the ratio answers nothing and the objective silently
+# measures no data (both measured in W16). The regex accepts either rendering, because a silent
+# no-match is worse than a slightly odd matcher.
+
+groups:
+  # ── the objectives, as ratios ────────────────────────────────────────────────────────
+  - name: matchmaking-slo-recording
+    interval: 15s
+    rules:
+      - record: matchmaking:slo_latency_within_10s:ratio_5m
+        expr: |
+          sum(rate(matchmaking_match_wait_seconds_bucket{le=~"10(\\.0)?"}[5m]))
+            / sum(rate(matchmaking_match_wait_seconds_count[5m]))
+      - record: matchmaking:slo_latency_within_10s:ratio_30m
+        expr: |
+          sum(rate(matchmaking_match_wait_seconds_bucket{le=~"10(\\.0)?"}[30m]))
+            / sum(rate(matchmaking_match_wait_seconds_count[30m]))
+      - record: matchmaking:slo_latency_within_10s:ratio_1h
+        expr: |
+          sum(rate(matchmaking_match_wait_seconds_bucket{le=~"10(\\.0)?"}[1h]))
+            / sum(rate(matchmaking_match_wait_seconds_count[1h]))
+      - record: matchmaking:slo_latency_within_10s:ratio_6h
+        expr: |
+          sum(rate(matchmaking_match_wait_seconds_bucket{le=~"10(\\.0)?"}[6h]))
+            / sum(rate(matchmaking_match_wait_seconds_count[6h]))
+
+      - record: matchmaking:slo_confirm:ratio_5m
+        expr: |
+          sum(rate(matchmaking_matches_confirmed_total[5m]))
+            / sum(rate(matchmaking_matches_formed_total[5m]))
+      - record: matchmaking:slo_confirm:ratio_30m
+        expr: |
+          sum(rate(matchmaking_matches_confirmed_total[30m]))
+            / sum(rate(matchmaking_matches_formed_total[30m]))
+      - record: matchmaking:slo_confirm:ratio_1h
+        expr: |
+          sum(rate(matchmaking_matches_confirmed_total[1h]))
+            / sum(rate(matchmaking_matches_formed_total[1h]))
+      - record: matchmaking:slo_confirm:ratio_6h
+        expr: |
+          sum(rate(matchmaking_matches_confirmed_total[6h]))
+            / sum(rate(matchmaking_matches_formed_total[6h]))
+
+      # The queue's own health: how many players are waiting, and for how long the oldest one
+      # has been. Both are derived from Redis (ADR 0020), so they cannot disagree with the
+      # queue the engine pairs from.
+      - record: matchmaking:queue:waiting_players
+        expr: sum(matchmaking_queue_depth)
+      - record: matchmaking:queue:oldest_wait_seconds
+        expr: max(matchmaking_queue_oldest_wait_seconds)
+
+  # ── the alerts ───────────────────────────────────────────────────────────────────────
+  - name: matchmaking-slo-alerts
+    interval: 15s
+    rules:
+      # Fast burn: 2% of the 30-day budget in one hour (14.4x). Both windows must be burning,
+      # which is what makes it a page instead of a spike.
+      - alert: MatchmakingLatencyFastBurn
+        expr: |
+          (1 - matchmaking:slo_latency_within_10s:ratio_1h) > (14.4 * 0.01)
+            and
+          (1 - matchmaking:slo_latency_within_10s:ratio_5m) > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: sl-1-latency
+        annotations:
+          summary: "Match wait: the 1% budget is burning at more than 14.4x"
+          description: >-
+            SL-1 says 99% of matched tickets wait at most 10 s. Both the 1h and the 5m window are
+            past 14.4x the budget. Look at matchmaking_queue_oldest_wait_seconds and
+            matchmaking_queue_depth: a queue that is deep and not moving is a pairing problem
+            (ghosts, a scan that cannot see the queue), a queue that is empty is load that never
+            arrived.
+
+      # Slow burn: 10% of the budget in six hours (6x) - a ticket, not a page.
+      - alert: MatchmakingLatencySlowBurn
+        expr: |
+          (1 - matchmaking:slo_latency_within_10s:ratio_6h) > (6 * 0.01)
+            and
+          (1 - matchmaking:slo_latency_within_10s:ratio_30m) > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: sl-1-latency
+        annotations:
+          summary: "Match wait is spending the error budget faster than 6x"
+          description: "Sustained: a sixth of the 30-day budget gone in six hours. WS16 measured this burning a whole day's budget in minutes when the confirmation path was broken."
+
+      - alert: MatchmakingConfirmFastBurn
+        expr: |
+          (1 - matchmaking:slo_confirm:ratio_1h) > (14.4 * 0.01)
+            and
+          (1 - matchmaking:slo_confirm:ratio_5m) > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: sl-2-confirm
+        annotations:
+          summary: "Matches are formed and not confirmed"
+          description: >-
+            SL-2 says 99% of formed matches confirm. Growth in
+            matchmaking_matches_dissolved_total{reason="timeout"} is the usual cause: players
+            never answered, or their answer was refused (W16: a repeated confirmation wrote
+            duplicate events, and a stale pairing roster left players in two matches at once).
+
+      - alert: MatchmakingConfirmSlowBurn
+        expr: |
+          (1 - matchmaking:slo_confirm:ratio_6h) > (6 * 0.01)
+            and
+          (1 - matchmaking:slo_confirm:ratio_30m) > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: sl-2-confirm
+        annotations:
+          summary: "The confirmed/form ratio is spending the error budget at 6x"
+
+      # SL-4: the queue's head. This is the "is the matchmaker alive" line - a queue with
+      # waiting players whose oldest has waited over 30 s is not a latency problem, it is a
+      # matchmaker that is not matching (and the players cannot tell the difference).
+      - alert: MatchmakingHeadWaitTooLong
+        expr: |
+          (matchmaking_queue_oldest_wait_seconds > 30)
+            and on (mode, region)
+          (matchmaking_queue_depth > 0)
+        for: 1m
+        labels:
+          severity: page
+          slo: sl-4-capacity
+        annotations:
+          summary: "The oldest waiting player ({{ $labels.mode }}/{{ $labels.region }}) has waited over 30 s"
+          description: >-
+            Players are queueing and nobody is being paired from this queue. Check the engine's
+            log for the pairing ticks (engine.reapedStaleMembers, engine.error) and whether the
+            queue the players are in is the queue the engine reads.
+
+      # SL-3: the outbox. The relay publishes on a 250 ms timer (ADR 0018), so an age of
+      # seconds means the broker or the relay is in trouble.
+      - alert: MatchmakingOutboxBacklogOld
+        expr: matchmaking_outbox_oldest_pending_seconds > 5
+        for: 2m
+        labels:
+          severity: page
+          slo: sl-3-delivery
+        annotations:
+          summary: "The oldest event in the outbox is {{ $value }} s old"
+          description: >-
+            SL-3 says an event reaches the broker within 5 s. Check the relay's log
+            (outbox.drain, outbox.publishFailed) and the broker: Kafka and the schema registry
+            are part of this path.
+
+      - alert: MatchmakingOutboxParkedRows
+        expr: matchmaking_outbox_backlog{status="PARKED"} > 0
+        for: 5m
+        labels:
+          severity: ticket
+          slo: sl-3-delivery
+        annotations:
+          summary: "{{ $value }} outbox rows were given up on and need a human"
+          description: >-
+            A parked row carries its last_error: SELECT event_id, last_error FROM outbox_events
+            WHERE status = 'PARKED'. Each one is an event a consumer never saw.
+
+      # Supporting: a service that is not being scraped cannot answer, and its counters stop.
+      - alert: MatchmakingServiceDown
+        expr: up{job=~"matchmaking-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} has not been scraped for 2 minutes"

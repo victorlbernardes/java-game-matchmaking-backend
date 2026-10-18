@@ -27,6 +27,7 @@ import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
 import com.victor.matchmaking.redis.RedisKeys;
+import com.victor.matchmaking.redis.RedisScanner;
 import com.victor.matchmaking.redis.RedisPlayerNotifier;
 import com.victor.matchmaking.redis.RedisPublisher;
 import com.victor.matchmaking.redis.RedisSubscriber;
@@ -37,7 +38,6 @@ import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
 import io.vertx.redis.client.Command;
-import io.vertx.redis.client.RedisOptions;
 import io.vertx.redis.client.Request;
 import io.vertx.redis.client.Response;
 
@@ -60,6 +60,21 @@ public final class MatchmakingEngineApplication {
      * two seconds is fresh enough for a dashboard and cheap enough for the event loop.
      */
     static final long KPI_POLL_INTERVAL_MS = 2000;
+    /**
+     * How many queue members one reaping pass inspects once an expired ticket is found (W16,
+     * ADR 0025). Bounded on purpose: a queue full of ghosts is cleared over a few ticks of the
+     * 500 ms loop instead of reading a whole queue in one tick.
+     */
+    static final long REAP_BATCH = 64;
+    /**
+     * How many matches one queue may pair in a single 500 ms tick (W16, ADR 0021). Pairing a
+     * single match per tick put the ceiling at 2 matches/s per mode/region no matter the
+     * hardware — measured under load, a queue of a thousand players drained at 4 players/s
+     * while the engine sat idle. The budget lets a queue drain at Redis speed while keeping a
+     * burst from monopolizing the event loop that also runs the sweep, the outbox relay and
+     * the KPI pollers.
+     */
+    static final int PAIR_BATCH_PER_TICK = 200;
     /** Its own port: the engine has no public HTTP surface and must not grow one for metrics. */
     private static final int ENGINE_METRICS_PORT = 9091;
     static final long CONFIRMATION_TIMEOUT_SECONDS = 30;
@@ -70,8 +85,20 @@ public final class MatchmakingEngineApplication {
      */
     static final long PENDING_KEY_GRACE_SECONDS = 60;
     static final long PENDING_KEY_TTL_SECONDS = CONFIRMATION_TIMEOUT_SECONDS + PENDING_KEY_GRACE_SECONDS;
+    /**
+     * How long a match's confirmation keys are kept: the set of players who confirmed and the
+     * claim saying the match is spoken for. The set is deleted by the confirmation, the claim
+     * expires, and the TTL is the guarantee for the match whose players never all confirm
+     * (W16: the set had no TTL at all, so every confirmed match left one behind - 198 of them
+     * after a single load run).
+     */
+    static final long MATCH_CONFIRMED_TTL_SECONDS = 300;
     private static final int TICKET_ID_LENGTH = 8;
-    private static volatile String PAIR_SCRIPT_SHA = "";
+    /**
+     * Package-private with the pairing entry points below: the stale-member test drives one
+     * pairing tick directly, which needs the script the app loads at startup.
+     */
+    static volatile String PAIR_SCRIPT_SHA = "";
 
     private MatchmakingEngineApplication() {
     }
@@ -93,7 +120,7 @@ public final class MatchmakingEngineApplication {
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=metricsStart", err));
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
         io.vertx.redis.client.Redis redis = io.vertx.redis.client.Redis.createClient(vertx,
-                new RedisOptions().setConnectionString(redisUri));
+                com.victor.matchmaking.redis.RedisClients.options(redisUri));
         TicketRepository tickets = new RedisTicketRepository(redis);
         PendingMatchStore pending = new RedisPendingMatchStore(redis);
         RedisPublisher publisher = new RedisPublisher(redis);
@@ -120,7 +147,7 @@ public final class MatchmakingEngineApplication {
         // Load the atomic pairing script before starting the pairing loop
         loadPairScript(redis).onSuccess(sha -> {
             PAIR_SCRIPT_SHA = sha;
-            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> scanAndPair(vertx, redis, tickets, pending, notifier, kpis));
+            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> pairAcrossQueues(vertx, redis, tickets, pending, notifier, kpis));
             vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier, kpis));
             vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
                     .onSuccess(kpis::relayDrained)
@@ -141,7 +168,7 @@ public final class MatchmakingEngineApplication {
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadPairScript", err));
     }
 
-    private static Future<String> loadPairScript(io.vertx.redis.client.Redis redis) {
+    static Future<String> loadPairScript(io.vertx.redis.client.Redis redis) {
         String script;
         try {
             script = new String(MatchmakingEngineApplication.class.getResourceAsStream("/pair.lua").readAllBytes());
@@ -152,45 +179,152 @@ public final class MatchmakingEngineApplication {
                 .map(resp -> resp != null ? resp.toString() : null);
     }
 
-    private static void scanAndPair(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
-        redis.send(Request.cmd(Command.SCAN).arg("0").arg("MATCH").arg("queue:*")).onSuccess(scan -> {
-            Response keysResp = scan.get(1);
-            if (keysResp != null) {
-                for (int i = 0; i < keysResp.size(); i++) {
-                    tryPairFromQueue(keysResp.get(i).toString(), redis, tickets, pending, notifier, kpis);
-                }
-            }
-        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=scanQueues", err));
+    /**
+     * Every queue the engine can pair from, from the closed set of game modes and regions
+     * ({@link RedisKeys#allQueueKeys()}).
+     *
+     * <p>Why this replaced {@code SCAN}: the pairing used to ask Redis for one {@code SCAN} page
+     * and ignore the cursor, so with a few hundred keys the answer was an empty page and the
+     * engine matched nothing at all while players waited (measured in W16: 404 keys, no key
+     * returned, the queue on page 6 of 39). Building the names is exact, and an empty queue
+     * costs one trivial {@code ZRANGE}.
+     */
+    static List<String> queueKeys() {
+        return RedisKeys.allQueueKeys();
     }
 
-    private static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+    private static void pairAcrossQueues(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
+        for (String queueKey : queueKeys()) {
+            tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis);
+        }
+    }
+
+    static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
+        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true);
+    }
+
+    /**
+     * Pairs from one queue until the queue stops giving (no roster fits the head, or another
+     * worker took it) or this tick's budget is spent.
+     *
+     * @param budget       matches still allowed in this tick; keeps a burst from monopolizing
+     *                     the event loop while letting a queue drain at Redis speed
+     * @param mayLookAgain false on the pass that follows a reap, so a queue made only of
+     *                     ghosts cannot make this tick loop
+     */
+    private static void pairBatch(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, int budget,
+            boolean mayLookAgain) {
+        if (budget <= 0) {
+            return;
+        }
         GameMode gameMode = gameModeOfQueueKey(queueKey);
         if (gameMode == null) {
             return;
         }
         int playerCount = gameMode.playersPerMatch();
-        redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0").arg(playerCount - 1)).onSuccess(range -> {
-            if (range == null || range.size() < playerCount) {
+        readHead(queueKey, playerCount, redis, tickets).onSuccess(head -> {
+            if (!head.deadMembers().isEmpty()) {
+                // A ticket expires on its TTL, but a ZSET member cannot: it stays in the
+                // queue as a ghost, and read as the head it blocks every compatible player
+                // behind it - the whole mode/region stops pairing (measured in W15). Reap
+                // the head batch and look once more in the same tick, so the players behind
+                // the ghost get their turn now instead of waiting for a tick of their own.
+                reapStaleMembers(queueKey, redis, tickets).onComplete(reaped -> {
+                    if (mayLookAgain) {
+                        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget, false);
+                    }
+                });
                 return;
             }
-            List<Future<MatchmakingTicket>> loaded = new ArrayList<>();
-            for (int i = 0; i < range.size(); i++) {
-                loaded.add(tickets.findById(range.get(i).toString()));
+            if (head.candidates().size() < playerCount) {
+                return;
             }
-            Future.all(loaded).onSuccess(cf -> {
-                List<MatchmakingTicket> candidates = loaded.stream().map(Future::result).toList();
-                // The queue head (oldest ticket) is the widening reference: its
-                // queuedAt tells PairingPolicy how long the player has been waiting.
-                List<MatchmakingTicket> roster = buildRoster(candidates, gameMode, candidates.get(0).queuedAt());
-                if (roster != null) {
-                    pair(roster, queueKey, redis, tickets, pending, notifier, kpis);
+            // The queue head (oldest ticket) is the widening reference: its
+            // queuedAt tells PairingPolicy how long the player has been waiting.
+            List<MatchmakingTicket> roster = buildRoster(head.candidates(), gameMode,
+                    head.candidates().get(0).queuedAt());
+            if (roster == null) {
+                return;
+            }
+            // Chain the next attempt on this one's completion, so the queue is read after the
+            // tickets are really off it; a nil from the script means somebody else paired them,
+            // and then this tick is done with the queue.
+            pair(roster, queueKey, redis, tickets, pending, notifier, kpis).onComplete(paired -> {
+                if (paired.succeeded() && Boolean.TRUE.equals(paired.result())) {
+                    pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget - 1, mayLookAgain);
                 }
-            }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                    "engine.error stage=loadTickets queue={0}", err, queueKey));
+            });
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                 "engine.error stage=readQueue queue={0}", err, queueKey));
+    }
+
+    /**
+     * The head of a queue: the tickets that are still alive, in queue order, and the members
+     * whose ticket is gone.
+     */
+    private record QueueHead(List<MatchmakingTicket> candidates, List<String> deadMembers) {
+    }
+
+    /** Reads up to {@code playerCount} members of a queue and resolves their tickets. */
+    private static Future<QueueHead> readHead(String queueKey, int playerCount,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets) {
+        return redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0").arg(String.valueOf(playerCount - 1)))
+                .compose(range -> resolve(queueKey, range, tickets));
+    }
+
+    /**
+     * Inspects the head batch of a queue and takes out the members whose ticket no longer
+     * exists. Bounded on purpose: the head batch, not the whole queue, and only when a ghost
+     * was seen - a queue of thousands of ghosts clears in a few ticks of the 500 ms loop.
+     */
+    private static Future<Void> reapStaleMembers(String queueKey, io.vertx.redis.client.Redis redis,
+            TicketRepository tickets) {
+        return redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0")
+                        .arg(String.valueOf(REAP_BATCH - 1)))
+                .compose(range -> resolve(queueKey, range, tickets))
+                .compose(head -> {
+                    if (head.deadMembers().isEmpty()) {
+                        return Future.succeededFuture();
+                    }
+                    Request zrem = Request.cmd(Command.ZREM).arg(queueKey);
+                    for (String member : head.deadMembers()) {
+                        zrem.arg(member);
+                    }
+                    return redis.send(zrem).onSuccess(removed -> LOG.log(System.Logger.Level.INFO,
+                                    "engine.reapedStaleMembers queue={0} inspected={1} removed={2}",
+                                    queueKey, String.valueOf(head.candidates().size() + head.deadMembers().size()),
+                                    String.valueOf(removed)))
+                            .mapEmpty();
+                });
+    }
+
+    /** Splits the members of a {@code ZRANGE} reply into live tickets and dead members. */
+    private static Future<QueueHead> resolve(String queueKey, Response range, TicketRepository tickets) {
+        if (range == null || range.size() == 0) {
+            return Future.succeededFuture(new QueueHead(List.of(), List.of()));
+        }
+        List<String> members = new ArrayList<>();
+        List<Future<MatchmakingTicket>> loaded = new ArrayList<>();
+        for (int i = 0; i < range.size(); i++) {
+            members.add(range.get(i).toString());
+            loaded.add(tickets.findById(members.get(i)));
+        }
+        return Future.all(loaded).map(done -> {
+            List<MatchmakingTicket> candidates = new ArrayList<>();
+            List<String> deadMembers = new ArrayList<>();
+            for (int i = 0; i < members.size(); i++) {
+                MatchmakingTicket ticket = loaded.get(i).result();
+                if (ticket == null) {
+                    deadMembers.add(members.get(i));
+                } else {
+                    candidates.add(ticket);
+                }
+            }
+            return new QueueHead(candidates, deadMembers);
+        });
     }
 
     /**
@@ -240,8 +374,13 @@ public final class MatchmakingEngineApplication {
         return null;
     }
 
-    /** Pairs exactly the given candidates into one pending match. */
-    private static void pair(List<MatchmakingTicket> candidates, String queueKey,
+    /**
+     * Pairs exactly the given candidates into one pending match.
+     *
+     * @return true when this worker won the atomic race and the match exists, false when the
+     *         Lua script returned nil because another worker had already taken those tickets
+     */
+    static Future<Boolean> pair(List<MatchmakingTicket> candidates, String queueKey,
             io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
@@ -252,39 +391,55 @@ public final class MatchmakingEngineApplication {
         PendingMatch pm = new PendingMatch(matchId, roster, List.of(),
                 Instant.now().plusSeconds(CONFIRMATION_TIMEOUT_SECONDS));
 
-        // Atomic pairing: ZREM from queue + SET pending match in one Lua script.
-        // If another worker won the race, the script returns nil and we skip.
-        redis.send(Request.cmd(Command.EVALSHA).arg(PAIR_SCRIPT_SHA)
+        // Atomic pairing: the roster goes off the queue and the pending match is set in one Lua
+        // script. The members are named, not read from the queue inside the script: a caller
+        // whose read overlapped another tick's pairing must take nothing, or it removes the
+        // wrong members and stores a roster nobody paired (W16). A nil answer means another
+        // worker won the race and we skip.
+        Request pairRequest = Request.cmd(Command.EVALSHA).arg(PAIR_SCRIPT_SHA)
                 .arg("1").arg(queueKey)
                 .arg(pm.matchId()).arg(pm.toJson().encode())
                 .arg(String.valueOf(PENDING_KEY_TTL_SECONDS))
-                .arg(String.valueOf(roster.size())))
-                .onSuccess(result -> {
+                .arg(String.valueOf(roster.size()));
+        for (MatchmakingTicket candidate : candidates) {
+            pairRequest.arg(candidate.id());
+        }
+        return redis.send(pairRequest)
+                .compose(result -> {
                     if (result == null) {
                         // Another worker already removed these tickets from the queue
-                        return;
+                        return Future.succeededFuture(Boolean.FALSE);
                     }
                     // The roster is off the queue: this is the moment the wait ended, and the
                     // only place it can be measured per player (W15). Recorded before the
                     // notifications, so a slow notifier cannot hide a fast pairing.
                     kpis.matchFormed(candidates, Instant.now());
-                    // Paired! Transition to CONFIRMING and notify every player.
-                    for (int i = 0; i < candidates.size(); i++) {
-                        MatchmakingTicket candidate = candidates.get(i);
-                        tickets.save(null, transition(candidate, TicketState.CONFIRMING))
+                    // Paired! The tickets must be CONFIRMING before anyone is told: the
+                    // notification is what opens the players' confirmation window, and a client
+                    // that answers within milliseconds used to beat these (unawaited) writes -
+                    // its confirmation was refused as "tickets not in CONFIRMING" and the match
+                    // then died on its timeout (measured in W16: a whole load run dissolving 141
+                    // matches, every one of them a client that was too fast for the engine).
+                    List<Future<Void>> confirming = new ArrayList<>();
+                    for (MatchmakingTicket candidate : candidates) {
+                        confirming.add(tickets.save(null, transition(candidate, TicketState.CONFIRMING))
                                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                        "engine.error stage=saveConfirmingTicket ticketId=" + candidate.id(), err));
+                                        "engine.error stage=saveConfirmingTicket ticketId=" + candidate.id(), err)));
                     }
-                    Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId, roster.stream()
-                            .map(PendingMatch.PendingPlayer::playerId).toList());
-                    for (PendingMatch.PendingPlayer player : roster) {
-                        notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
-                                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                        "engine.error stage=notifyPending playerId=" + player.playerId(), err));
-                    }
+                    return Future.all(confirming).map(ignored -> {
+                        Payloads.MatchPending pendingPayload = new Payloads.MatchPending(matchId,
+                                roster.stream().map(PendingMatch.PendingPlayer::playerId).toList());
+                        for (PendingMatch.PendingPlayer player : roster) {
+                            notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_PENDING_CONFIRMATION", pendingPayload), Payloads.MatchPending::toJson)
+                                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                            "engine.error stage=notifyPending playerId=" + player.playerId(), err));
+                        }
+                        return Boolean.TRUE;
+                    });
                 })
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                        "engine.error stage=pairScript matchId=" + matchId, err));
+                        "engine.error stage=pairScript matchId=" + matchId, err))
+                .otherwise(false);
     }
 
     /**
@@ -311,7 +466,7 @@ public final class MatchmakingEngineApplication {
         return "engine-" + ProcessHandle.current().pid();
     }
 
-    private static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
+    static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
             TicketRepository tickets, PendingMatchStore pending,
             RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
         Payloads.MatchConfirmation command;
@@ -347,15 +502,46 @@ public final class MatchmakingEngineApplication {
                     return;
                 }
                 String confirmedKey = "match-confirmed:" + matchId;
+                String claimKey = "match-confirmed-claim:" + matchId;
                 redisCommands(redis, Request.cmd(Command.SADD).arg(confirmedKey).arg(playerId))
+                        .flatMap(v -> redisCommands(redis, Request.cmd(Command.EXPIRE)
+                                .arg(confirmedKey).arg(String.valueOf(MATCH_CONFIRMED_TTL_SECONDS))))
                         .flatMap(v -> redisCommands(redis, Request.cmd(Command.SCARD).arg(confirmedKey)))
-                        .onSuccess(count -> {
+                        .flatMap(count -> {
                             long confirmed = count.toLong() != null ? count.toLong() : 0L;
                             LOG.log(System.Logger.Level.INFO,
                                     "confirm.received matchId={0} playerId={1} count={2} required={3}",
                                     matchId, playerId, String.valueOf(confirmed),
                                     String.valueOf(pm.players().size()));
-                            if (confirmed >= pm.players().size()) {
+                            if (confirmed < pm.players().size()) {
+                                return Future.succeededFuture(Boolean.FALSE);
+                            }
+                            // SET NX is the whole decision: the first caller to create the claim
+                            // confirms, and every later one is refused - a retry, a duplicate
+                            // delivery, a message that arrives while the match is still being
+                            // deleted. Counting alone does not do it: a retry after the count was
+                            // already complete rebuilds a complete set and would confirm the same
+                            // match again (measured in W16: one match, four events).
+                            return redisCommands(redis, Request.cmd(Command.SET).arg(claimKey).arg("1")
+                                            .arg("NX").arg("EX")
+                                            .arg(String.valueOf(MATCH_CONFIRMED_TTL_SECONDS)))
+                                    .map(set -> {
+                                        boolean won = set != null;
+                                        if (!won) {
+                                            LOG.log(System.Logger.Level.INFO,
+                                                    "confirm.duplicate matchId={0} playerId={1} ignored=true",
+                                                    matchId, playerId);
+                                        }
+                                        return won;
+                                    });
+                        })
+                        .onSuccess(isConfirmer -> {
+                            if (Boolean.TRUE.equals(isConfirmer)) {
+                                // The count has done its job; the claim key is what says the match
+                                // is spoken for, and it expires on its own.
+                                redisCommands(redis, Request.cmd(Command.DEL).arg(confirmedKey))
+                                        .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                                "engine.error stage=deleteConfirmedSet matchId=" + matchId, err));
                                 confirm(pm, tickets, pending, notifier, outbox, kpis);
                             }
                         })
@@ -452,7 +638,8 @@ public final class MatchmakingEngineApplication {
         }
         pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                 "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
-        redis.send(Request.cmd(Command.DEL).arg("match-confirmed:" + pm.matchId()))
+        redis.send(Request.cmd(Command.DEL).arg("match-confirmed:" + pm.matchId())
+                        .arg("match-confirmed-claim:" + pm.matchId()))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                         "engine.error stage=deleteConfirmedSet matchId=" + pm.matchId(), err));
         for (PendingMatch.PendingPlayer player : pm.players()) {
@@ -474,24 +661,28 @@ public final class MatchmakingEngineApplication {
                 ticket.partyId());
     }
 
+    /**
+     * Dissolves the pending matches whose confirmation window has passed. The pending matches are
+     * the one set of keys the engine cannot name in advance, so they are found with a real
+     * {@code SCAN} - every page of it ({@link RedisScanner}); the single-page version used to
+     * miss them the same way it missed the queues (W16).
+     */
     private static void sweepExpired(io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
-        redis.send(Request.cmd(Command.SCAN).arg("0").arg("MATCH").arg("match-pending:*")).onSuccess(scan -> {
-            Response keysResp = scan.get(1);
-            if (keysResp != null) {
-                for (int i = 0; i < keysResp.size(); i++) {
-                    String key = keysResp.get(i).toString();
-                    pending.findById(key.substring("match-pending:".length()))
-                            .onSuccess(pm -> {
-                                if (pm != null && Instant.now().isAfter(pm.expiresAt())) {
-                                    dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_TIMEOUT,
-                                            "timeout", tickets, pending, notifier, redis, kpis);
-                                }
-                            })
-                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                    "engine.error stage=loadExpiredPending key=" + key, err));
-                }
-            }
-        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=sweepExpired", err));
+        RedisScanner.scanAll(redis, "match-pending:*")
+                .onSuccess(keys -> {
+                    for (String key : keys) {
+                        pending.findById(key.substring("match-pending:".length()))
+                                .onSuccess(pm -> {
+                                    if (pm != null && Instant.now().isAfter(pm.expiresAt())) {
+                                        dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_TIMEOUT,
+                                                "timeout", tickets, pending, notifier, redis, kpis);
+                                    }
+                                })
+                                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                        "engine.error stage=loadExpiredPending key=" + key, err));
+                    }
+                })
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=sweepExpired", err));
     }
 }

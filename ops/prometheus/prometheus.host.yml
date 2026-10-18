@@ -1,5 +1,5 @@
-# Prometheus (W15, ADR 0020), same jobs as prometheus.yml but for a Prometheus running
-# directly on the host instead of in the container.
+# Prometheus (W15, ADR 0020; SLO rules W16, ADR 0021), same jobs as prometheus.yml but for a
+# Prometheus running directly on the host instead of in the container.
 #
 # Why it exists: `prometheus.yml` targets `host.docker.internal`, which only resolves from
 # inside a container (Docker Desktop provides it; on Linux the compose file maps it through
@@ -12,6 +12,14 @@
 global:
   scrape_interval: 5s
   evaluation_interval: 5s
+
+# The SLO rules (W16, ADR 0021). Prometheus resolves a relative rule_files entry against the
+# directory of the config file - not the working directory - so from the repository the path
+# is the sibling `rules` directory. Measured the hard way: `ops/prometheus/rules/*.yml` here
+# resolved to `ops/prometheus/ops/prometheus/rules/*.yml`, loaded zero groups and looked
+# healthy (no rule file to refuse), which is why the scenario asserts the groups exist.
+rule_files:
+  - rules/*.yml
 
 scrape_configs:
   - job_name: matchmaking-api

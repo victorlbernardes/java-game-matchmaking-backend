@@ -55,15 +55,19 @@ class PairingStressTest {
                         .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             }
 
-            // 10 workers race to pair — each calls the script once with a unique matchId
+            // 10 workers race to pair. Each names its own pair (W16: the caller passes the roster,
+            // the script no longer takes the head of the queue), so all ten win and the race is
+            // about the script being atomic under concurrent EVALSHA.
             List<Future<io.vertx.redis.client.Response>> workers = new ArrayList<>();
             for (int i = 0; i < WORKER_COUNT; i++) {
                 String matchId = "match-stress-" + i;
+                String first = String.format("ticket-stress-%03d", i * 2);
+                String second = String.format("ticket-stress-%03d", i * 2 + 1);
                 workers.add(redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                         .arg("1").arg(queueKey)
                         .arg(matchId)
                         .arg("{\"players\":[],\"expiresAt\":\"2030-01-01T00:00:00Z\"}")
-                        .arg("30").arg("2")));
+                        .arg("30").arg("2").arg(first).arg(second)));
             }
 
             // Wait for all 10 workers to complete

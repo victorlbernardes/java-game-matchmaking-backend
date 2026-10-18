@@ -91,6 +91,9 @@ services:
     image: prom/prometheus:v3.13.4
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The SLO rules travel with the config (W16, ADR 0021): a Prometheus that cannot evaluate
+      # its objectives is a dashboard, not a monitor.
+      - ./ops/prometheus/rules:/etc/prometheus/rules:ro
     ports:
       # Host 9095 -> container 9090 (9090 is the matchmaking-api metrics port on the host).
       - "9095:9090"

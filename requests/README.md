@@ -31,6 +31,9 @@ Scripts next to the collection (same folder, runnable by hand):
 requests/
 ├── e2e/run_e2e.py                     # 11 scenarios, 52 checks over HTTP + Redis + Kafka + Postgres
 ├── e2e/check_confirmation_sweep.py    # focused confirmation-timeout timeline
+├── engine/verify_queue_reaper.sh      # queue: a ghost member must not stall the mode/region (W16)
+├── load/run_load.py                   # load: the ceiling and the behaviour at it (W16)
+├── load/results-*.json                # one file per measured run (before/after, 400/2000/4000 players)
 ├── kafka/check_kafka.sh               # infrastructure: containers, registry, log round-trip
 ├── kafka/check_contract_gate.sh       # contract: is this change compatible with its base?
 ├── kafka/check_proto_evolution.sh     # contract: the rules the registry does not check (W13)
@@ -40,7 +43,9 @@ requests/
 ├── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
 └── observability/
     ├── check_metrics.sh               # KPIs: exposition, the numbers moving, Prometheus + Grafana (W15)
-    └── pending_match.py               # helper: the pending match of two given players
+    ├── pending_match.py               # helper: the pending match of two given players
+    ├── check_slos.sh                  # SLOs: rules loaded, ratios agree with a hand count, alerts alive (W16)
+    └── slo_ratios.py                  # helper: the counters of a scrape, and the ratios of a window
 ```
 
 ## Party flow (W11)
@@ -85,7 +90,7 @@ deliberate — a running pod must never invent a schema version.
 ## Automated tests
 
 ```bash
-mvn -B clean test            # unit + integration + race + stress (87 tests)
+mvn -B clean test            # unit + integration + race + stress (135 tests, 12 modules)
 ```
 
 The engine concurrency tests touch `queue:*` and `match-pending:*` in Redis
@@ -440,6 +445,70 @@ prometheus --config.file=ops/prometheus/prometheus.host.yml --web.listen-address
            --storage.tsdb.path=/tmp/prometheus-w15        # targets localhost:9090/9091
 grafana server                                        # provisioning: ops/grafana/
 ```
+
+## The load test — where the ceiling is (W16)
+
+```bash
+python3 requests/load/run_load.py --players 400 --concurrency 64 --label after
+```
+
+It drives real players through the whole stack (auth → API → engine → Redis/Postgres/Kafka),
+stands in for the players' clients and reports what the sprint is about: enqueue throughput and
+client-side percentiles, the pairing rate (players out of the queue per second — **the ceiling**,
+as a peak and as a window average), the wait the players actually felt (p50/p95/p99), the
+confirmation rate, the resource cost (engine CPU, heap, Redis ops/s, Postgres tx/s), and the
+invariant a ratio cannot see: **one match, one event** (the `matches` rows are counted against the
+distinct `partition_key` in `outbox_events`, and a duplicate exits non-zero).
+
+The client half is a plain socket speaking RESP — a subscriber on `player_notifications` and a
+publisher on `match_confirmations` — not `docker exec redis-cli`: measured with the exec hop, 24
+of 1024 matches were announced and never arrived (the attach stream in front of the client was the
+lossy part), and each dissolved at its 30 s deadline. A harness that drops 2% of its own input
+cannot measure a 99% objective.
+
+Measured on the dev machine (1v1/NA, every player pairable, one confirmation per player; the
+before row is `PAIR_BATCH_PER_TICK=1`, behaviourally the pre-W16 loop):
+
+| Run | Players | Enqueue | Pairing (peak / window) | Formed → confirmed | Dissolved | Wait p50 / p95 / p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| before | 400 | 12/400 (388 refused: Redis pool) | — / 4.2 players/s | 200 → 302 | 2 | 30 / 30 / 30 s |
+| after | 400 | 265/s | 89 / 62 players/s | 200 → 200 | 0 | 1.23 / 1.74 / 1.78 s |
+| after | 2000 | 282/s | 168 / 125 players/s | 1000 → 1000 | 0 | 6.16 / 9.22 / 9.86 s |
+| after | 4000 (arrival above capacity) | 269/s | 184 / 138 players/s | 2000 → 2000 | 0 | 9.41 / 14.97 / 15.59 s |
+
+Every run writes `requests/load/results-<label>.json`; the committed files are the evidence. The
+4000-player row is honest about the envelope: arrivals above the node's pairing rate grow the
+queue, waits grow with it, and **SL-4** (not SL-1) is the objective that reports it.
+
+## The SLOs — what "good enough" means (W16)
+
+Four objectives live as code in `ops/prometheus/rules/matchmaking-slos.yml` (10 recording rules +
+8 alerts), loaded by both Prometheus configs and mounted into the compose file:
+
+| Id | Objective | Shape |
+| --- | --- | --- |
+| SL-1 | 99% of matched tickets wait ≤ 10 s | ratio, 1% error budget |
+| SL-2 | 99% of formed matches are confirmed | ratio, 1% error budget |
+| SL-3 | the outbox never ages past 5 s, and parks nothing | threshold |
+| SL-4 | a waiting player never waits > 30 s while his queue has work | threshold |
+
+```bash
+bash requests/observability/check_slos.sh      # 34 checks, ~2 min
+```
+
+The scenario asserts the rules are loaded **and are this repository's file**, computes the SL-1 and
+SL-2 ratios of its own traffic by hand from two scrapes and compares them with the recorded series,
+checks the queue rules against the queue itself (a lone waiting player raises both, cancelling
+brings them back), and proves the alert expressions are **alive**: an expression that never answers
+anything never fires either, so each one is evaluated at a threshold that *must* trip it (and must
+return a series) and at its real threshold (and must stay empty).
+
+Two traps are worth knowing before writing another ratio rule: the objective's boundary must be a
+**bucket edge** (`EngineKpis.LATENCY_SLO` — Micrometer's defaults jump from 8.59 s to 10.02 s, so a
+`le="10"` rule once summed over a boundary that did not exist), and PromQL matches labels by exact
+string while the client renders the edge `le="10.0"` (hence `le=~"10(\.0)?"`). A rule file that
+loads nothing also looks healthy — a relative `rule_files` entry resolves against the config file's
+directory — which is why the scenario asserts the groups exist and checks their path.
 
 ## Typical flow
 

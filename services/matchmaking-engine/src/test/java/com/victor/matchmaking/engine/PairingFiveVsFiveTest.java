@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
@@ -40,8 +42,10 @@ class PairingFiveVsFiveTest {
                     .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
 
             // Queue ten tickets of the 5v5 mode.
+            List<String> ticketIds = new ArrayList<>();
             for (int i = 0; i < PLAYER_COUNT; i++) {
                 String ticketId = String.format("ticket-five-vs-five-%02d", i);
+                ticketIds.add(ticketId);
                 redis.send(Request.cmd(Command.SET).arg("ticket:" + ticketId)
                                 .arg("{\"matchId\":\"" + ticketId + "\"}").arg("EX").arg("900"))
                         .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -50,11 +54,15 @@ class PairingFiveVsFiveTest {
                         .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             }
 
-            // Pairing consumes exactly the player count.
+            // Pairing consumes exactly the player count, and the caller names the roster (W16).
             String pendingJson = pendingJsonFor(PLAYER_COUNT);
-            Object result = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
-                            .arg("1").arg(QUEUE_KEY)
-                            .arg("match-five-vs-five-1").arg(pendingJson).arg("30").arg(String.valueOf(PLAYER_COUNT)))
+            Request pairing = Request.cmd(Command.EVALSHA).arg(sha)
+                    .arg("1").arg(QUEUE_KEY)
+                    .arg("match-five-vs-five-1").arg(pendingJson).arg("30").arg(String.valueOf(PLAYER_COUNT));
+            for (String ticketId : ticketIds) {
+                pairing.arg(ticketId);
+            }
+            Object result = redis.send(pairing)
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
             assertNotNull(result, "pairing the ten tickets must succeed");
             assertEquals("match-five-vs-five-1", result.toString());

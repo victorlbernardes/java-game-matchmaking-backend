@@ -37,6 +37,15 @@ import io.micrometer.core.instrument.Timer;
  */
 public final class EngineKpis {
 
+    /**
+     * The SL-1 boundary (ADR 0021): the wait histogram must have a bucket edge exactly here, or
+     * the ratio behind {@code matchmaking:slo_latency_within_10s:ratio_*} sums over a boundary
+     * that does not exist and answers nothing - an objective that silently measures no data.
+     * Measured (W16): Micrometer's default percentile buckets jump from 8.59 s to 10.02 s, so
+     * {@code le="10"} matched no series at all.
+     */
+    private static final Duration LATENCY_SLO = Duration.ofSeconds(10);
+
     private final MeterRegistry registry;
     private final Map<String, AtomicLong> queueDepth = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> queueOldestWaitSeconds = new ConcurrentHashMap<>();
@@ -60,6 +69,9 @@ public final class EngineKpis {
         Timer wait = Timer.builder(MetricNames.MATCH_WAIT).tags(tags)
                 .description("Time from entering the queue to the match being formed")
                 .publishPercentileHistogram()
+                // The objective's own edge, on top of the default buckets: an SLO whose boundary
+                // is not a bucket edge is not measurable (ADR 0021).
+                .serviceLevelObjectives(LATENCY_SLO)
                 .register(registry);
         for (MatchmakingTicket ticket : roster) {
             wait.record(Duration.between(ticket.queuedAt(), now));

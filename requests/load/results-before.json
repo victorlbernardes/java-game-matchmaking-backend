@@ -1,0 +1,107 @@
+{
+  "label": "before",
+  "players": 400,
+  "concurrency": 64,
+  "mode": "1v1",
+  "region": "NA",
+  "skill": 61,
+  "logins": {
+    "count": 400,
+    "seconds": 2.57,
+    "per_second": 155.7
+  },
+  "enqueue": {
+    "count": 12,
+    "seconds": 2.1,
+    "per_second": 5.7,
+    "p50_ms": 2023.8,
+    "p95_ms": 2081.9,
+    "p99_ms": 2081.9,
+    "max_ms": 2081.9
+  },
+  "drain": {
+    "peak_depth": 6,
+    "seconds": 4.91,
+    "players_per_second": 1.2,
+    "matches_per_second": 0.61
+  },
+  "wait": {
+    "p50_s": 5.440291908,
+    "p95_s": 30.0,
+    "p99_s": 30.0,
+    "queued_players_per_second_effective": 1.2
+  },
+  "matches": {
+    "enqueued_metric": 0.0,
+    "formed": 6.0,
+    "confirmed": 9.0,
+    "dissolved_timeout": 0.0,
+    "confirm_rate": 1.5
+  },
+  "resources": {
+    "engine_cpu_peak": 0.13495360153078206,
+    "system_cpu_peak": 0.9585087191822008,
+    "heap_used_peak_mb": 68.8,
+    "redis_ops_peak": 90,
+    "redis_memory_mb": 1.75,
+    "postgres_tx_in_run": 743,
+    "postgres_tx_per_second": 10.4
+  },
+  "outbox": {
+    "publish_lag_s": 0.0,
+    "oldest_pending_s": 0.0
+  },
+  "errors": [
+    "enqueue load-2130: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-416: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-3566: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-4767: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-2811: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-3960: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-1845: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-4138: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-1164: 500 {'error': 'Connection pool reached max wait queue size of 24'}",
+    "enqueue load-1596: 500 {'error': 'Connection pool reached max wait queue size of 24'}"
+  ],
+  "samples": [
+    {
+      "t": 0.31,
+      "depth": 6,
+      "oldest_wait_s": 2.4,
+      "engine_cpu": 0.012205448933826584,
+      "system_cpu": 0.8251417769376181,
+      "heap_mb": 41.80340576171875,
+      "redis_ops": 90,
+      "formed": 33.0,
+      "confirmed": 0.0,
+      "dissolved_timeout": 7.0,
+      "outbox_pending": 0.0
+    },
+    {
+      "t": 2.4,
+      "depth": 4,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.13495360153078206,
+      "system_cpu": 0.9585087191822008,
+      "heap_mb": 62.80340576171875,
+      "redis_ops": 65,
+      "formed": 34.0,
+      "confirmed": 2.0,
+      "dissolved_timeout": 7.0,
+      "outbox_pending": 0.0
+    },
+    {
+      "t": 4.48,
+      "depth": 0,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.028060141312632722,
+      "system_cpu": 0.9086538461538461,
+      "heap_mb": 68.80340576171875,
+      "redis_ops": 25,
+      "formed": 36.0,
+      "confirmed": 9.0,
+      "dissolved_timeout": 7.0,
+      "outbox_pending": 0.0
+    }
+  ]
+}
