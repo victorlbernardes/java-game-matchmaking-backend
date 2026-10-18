@@ -93,12 +93,14 @@ def count_sql(sql):
     return int(raw) if raw.isdigit() else 0
 
 
-def call(method, url, token=None, body=None, timeout=15):
+def call(method, url, token=None, body=None, timeout=15, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", "Bearer " + token)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
@@ -337,6 +339,15 @@ class Run:
         self.tokens = {}
         self.tickets = {}
         self.enqueue_ms = []
+        # W17: the arrivals the API refused on purpose. They are not errors - a bounded queue is
+        # the system working - but they must be counted, or a run with a cap would look like a run
+        # that lost two thirds of its players.
+        self.shed = []
+        self.shed_ms = []
+        self.rate_limited = 0
+        # What was still in the queue when the drain ended; 1 in a 1v1 run means one player found
+        # nobody, which is not a queue that failed to drain.
+        self.leftover = None
         self.login_ms = []
         self.samples = []
         self.peak_players_per_second = 0.0
@@ -375,6 +386,15 @@ class Run:
                             {"gameMode": self.args.mode, "region": self.args.region,
                              "maxLatencyMs": 80})
         elapsed = (time.perf_counter() - started) * 1000
+        if status == 503:
+            # Shed by the admission cap (W17): the answer is meant to be fast, and the latency of
+            # the refusal is the number that says whether the player is better or worse off.
+            self.shed.append(body)
+            self.shed_ms.append(elapsed)
+            return
+        if status == 429:
+            self.rate_limited += 1
+            return
         if status != 201:
             self.errors.append(f"enqueue {pid}: {status} {body}")
             return
@@ -419,7 +439,14 @@ class Run:
             self.confirm_thread.join(timeout=5)
 
     # -- phase 3: watch the queue drain, sampling what it costs
-    def watch_drain(self, deadline_s):
+    def watch_drain(self, deadline_s, floor=0):
+        """Samples the queue until it is drained (see `floor`), reporting the peak and the cost.
+
+        `floor` is the depth that counts as drained. In a 1v1 queue an odd number of accepted
+        arrivals leaves exactly one player with nobody to pair with, and waiting for a zero that
+        cannot happen would turn a 30 s drain into a 400 s watchdog timeout - and turn the honest
+        drain rate into a meaningless average over the wait.
+        """
         started = time.perf_counter()
         peak_depth = 0
         drain_s = None
@@ -452,7 +479,8 @@ class Run:
                 "dissolved_timeout": total(engine, "matchmaking_matches_dissolved_total", reason="timeout"),
                 "outbox_pending": total(engine, "matchmaking_outbox_backlog", status="PENDING"),
             })
-            if depth == 0 and total(engine, "matchmaking_matches_formed_total") > 0:
+            self.leftover = depth
+            if depth <= floor and total(engine, "matchmaking_matches_formed_total") > 0:
                 drain_s = time.perf_counter() - started
                 break
             time.sleep(1)
@@ -504,6 +532,9 @@ def main():
     parser.add_argument("--mode", default="1v1")
     parser.add_argument("--region", default="NA")
     parser.add_argument("--drain-timeout", type=float, default=400)
+    parser.add_argument("--drain-floor", type=int, default=1,
+                        help="queue depth that counts as drained; 1v1: an odd arrival count leaves "
+                             "one player who can never pair, so 1 is an empty queue in effect")
     parser.add_argument("--settle-timeout", type=float, default=60)
     parser.add_argument("--confirm-retries", type=int, default=1,
                         help="confirmations per player (a retrying client sends more than one)")
@@ -541,7 +572,7 @@ def main():
           f"{percentile(run.enqueue_ms, 0.5):.0f}ms p95 {percentile(run.enqueue_ms, 0.95):.0f}ms "
           f"p99 {percentile(run.enqueue_ms, 0.99):.0f}ms")
 
-    peak_depth, drain_s = run.watch_drain(args.drain_timeout)
+    peak_depth, drain_s = run.watch_drain(args.drain_timeout, floor=args.drain_floor)
     window_players_per_s = observed_rate(run.samples, "depth")
     window_matches_per_s = observed_rate(run.samples, "formed", decreasing=False)
     if drain_s is None:
@@ -598,7 +629,14 @@ def main():
                     "p95_ms": round(percentile(run.enqueue_ms, 0.95), 1),
                     "p99_ms": round(percentile(run.enqueue_ms, 0.99), 1),
                     "max_ms": round(max(run.enqueue_ms), 1) if run.enqueue_ms else None},
-        "drain": {"peak_depth": peak_depth, "seconds": round(drain_s, 2),
+        "shed": {"count": len(run.shed), "rate_limited": run.rate_limited,
+                 "capacity": (run.shed[0] or {}).get("capacity") if run.shed else None,
+                 "p50_ms": round(percentile(run.shed_ms, 0.5), 1) if run.shed_ms else None,
+                 "p95_ms": round(percentile(run.shed_ms, 0.95), 1) if run.shed_ms else None,
+                 "p99_ms": round(percentile(run.shed_ms, 0.99), 1) if run.shed_ms else None,
+                 "max_ms": round(max(run.shed_ms), 1) if run.shed_ms else None},
+        "drain": {"peak_depth": peak_depth, "leftover": run.leftover,
+                  "seconds": round(drain_s, 2),
                   "completed": drain_s is not None,
                   "players_per_second": round(peak_depth / drain_s, 1) if drain_s else None,
                   "matches_per_second": round(peak_depth / 2 / drain_s, 2) if drain_s else None,
@@ -648,6 +686,9 @@ def main():
           f" matches/s), peak depth {peak_depth}, "
           f"{'drained in ' + str(result['drain']['seconds']) + 's' if result['drain']['completed'] else 'partial window'}")
     print(f"   wait felt      p50 {wait_p50}s  p95 {wait_p95}s  p99 {wait_p99}s")
+    print(f"   shed           {result['shed']['count']} refused (capacity "
+          f"{result['shed']['capacity']}, p50 {result['shed']['p50_ms']}ms "
+          f"p99 {result['shed']['p99_ms']}ms), rate-limited {result['shed']['rate_limited']}")
     print(f"   matches        formed {formed:.0f}  confirmed {confirmed:.0f}  "
           f"dissolved(timeout) {dissolved_timeout:.0f}  confirm rate {result['matches']['confirm_rate']}")
     print(f"   client         {len(run.confirmed_matches)} matches seen, "

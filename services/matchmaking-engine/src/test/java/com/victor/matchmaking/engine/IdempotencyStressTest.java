@@ -66,18 +66,21 @@ class IdempotencyStressTest {
                         .arg(ticket.id())
                         .arg("queue:1v1:NA")
                         .arg(String.valueOf(ticket.queuedAt().toEpochMilli()))
-                        .arg("900").arg("900")));
+                        .arg("900").arg("900").arg("0")));
             }
 
             // Wait for all 10 requests to complete
             Future.all(requests).toCompletionStage().toCompletableFuture().get(20, TimeUnit.SECONDS);
 
-            // All requests must return the SAME ticketId (the one that won the race)
-            String firstResult = requests.get(0).result().toString();
+            // All requests must return the SAME ticketId (the one that won the race). The script
+            // answers {status, payload}: one arrival, the rest replays.
+            String firstResult = requests.get(0).result().get(1).toString();
             assertNotNull(firstResult, "first request must return a ticketId");
             for (int i = 1; i < REQUEST_COUNT; i++) {
-                String result = requests.get(i).result().toString();
-                assertEquals(firstResult, result,
+                io.vertx.redis.client.Response response = requests.get(i).result();
+                assertEquals("EXISTS", response.get(0).toString(),
+                        "request " + i + " must be a replay");
+                assertEquals(firstResult, response.get(1).toString(),
                         "request " + i + " must return the same ticketId as request 0 (idempotent)");
             }
 

@@ -138,6 +138,15 @@ public final class EngineKpis {
         outboxPublishLagSeconds.set(lag == null ? 0L : Math.max(0L, lag.toSeconds()));
     }
 
+    /**
+     * A confirmation found the database at its write limit and was deferred instead of issued
+     * (W17, ADR 0022). Counted, not logged alone: a deferral is the protection working, and a
+     * rate that climbs means the database, not the matchmaker, is the thing to look at.
+     */
+    public void dbWriteDeferred() {
+        registry.counter(MetricNames.DB_WRITE_DEFERRED).increment();
+    }
+
     private AtomicLong gauge(String name, Tags tags, Map<String, AtomicLong> holders, String key,
             String description) {
         return holders.computeIfAbsent(key, ignored -> {

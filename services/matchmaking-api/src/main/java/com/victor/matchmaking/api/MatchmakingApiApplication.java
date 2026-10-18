@@ -42,8 +42,11 @@ public final class MatchmakingApiApplication {
 
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
         Redis redis = Redis.createClient(vertx, com.victor.matchmaking.redis.RedisClients.options(redisUri));
+        int queueMaxDepth = com.victor.matchmaking.api.AdmissionConfig.queueMaxDepth();
         com.victor.matchmaking.redis.TicketRepository repository =
-                new RedisTicketRepository(redis);
+                new RedisTicketRepository(redis, queueMaxDepth);
+        com.victor.matchmaking.redis.RateLimiter rateLimiter = com.victor.matchmaking.api.AdmissionConfig
+                .rateLimiterFromEnv(redis);
         com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);
         com.victor.matchmaking.api.presentation.WsHub wsHub =
                 new com.victor.matchmaking.api.presentation.WsHub(publisher);
@@ -51,6 +54,17 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
         com.victor.matchmaking.db.MatchRepository matchRepository =
                 com.victor.matchmaking.db.MatchRepository.connect(vertx, dbConfig);
+        // Readiness is built from the two dependencies the instance actually needs to serve a
+        // player: the hot state it reads and writes, and the source of truth behind history
+        // (W18, ADR 0024). /health stays liveness - the process is up - and is not a claim about
+        // either of them.
+        com.victor.matchmaking.api.presentation.Readiness readiness =
+                new com.victor.matchmaking.api.presentation.Readiness(java.util.List.of(
+                        new com.victor.matchmaking.api.presentation.Readiness.Check("redis",
+                                () -> redis.send(io.vertx.redis.client.Request.cmd(
+                                        io.vertx.redis.client.Command.PING)).map(response -> true)),
+                        new com.victor.matchmaking.api.presentation.Readiness.Check("postgres",
+                                () -> matchRepository.ping().map(ignored -> true))));
         com.victor.matchmaking.redis.RedisSubscriber.subscribe(vertx, redisUri,
                 com.victor.matchmaking.redis.RedisKeys.CHANNEL_PLAYER_NOTIFICATIONS,
                 msg -> wsHub.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
@@ -61,7 +75,7 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.domain.player.SkillProvider skillProvider =
                 new com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider();
         Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository,
-                skillProvider, partyStore, metrics.registry());
+                skillProvider, partyStore, metrics.registry(), rateLimiter, readiness);
 
         com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(), metricsPort)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,

@@ -24,12 +24,14 @@ import com.victor.matchmaking.engine.infrastructure.OutboxMetricsPoller;
 import com.victor.matchmaking.engine.infrastructure.PostgresOutboxQueue;
 import com.victor.matchmaking.engine.infrastructure.QueueMetricsPoller;
 import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
+import com.victor.matchmaking.engine.infrastructure.WriteGate;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
 import com.victor.matchmaking.redis.RedisKeys;
 import com.victor.matchmaking.redis.RedisScanner;
 import com.victor.matchmaking.redis.RedisPlayerNotifier;
 import com.victor.matchmaking.redis.RedisPublisher;
+import com.victor.matchmaking.redis.RedisScript;
 import com.victor.matchmaking.redis.RedisSubscriber;
 import com.victor.matchmaking.redis.RedisTicketRepository;
 import com.victor.matchmaking.redis.TicketRepository;
@@ -95,10 +97,45 @@ public final class MatchmakingEngineApplication {
     static final long MATCH_CONFIRMED_TTL_SECONDS = 300;
     private static final int TICKET_ID_LENGTH = 8;
     /**
+     * How many writes the engine may have in flight against Postgres (W17, ADR 0022). A bound,
+     * not a queue size: the pairing is the source of the confirmations and one tick can form
+     * hundreds of matches, so without this a slow database receives every transaction at once
+     * and the engine's own throughput becomes the outage. Sized small on purpose: the point is
+     * to find out the database is behind while it still is behind, and the number is measured
+     * (the {@code matchmaking_db_writes_in_flight} gauge) rather than assumed.
+     */
+    static final int DB_MAX_IN_FLIGHT = 8;
+    /**
+     * How long a confirmation that could not write waits before trying again. Short against the
+     * database's latency (tens of milliseconds when healthy) and long against a hot loop that
+     * would turn a saturated database into a busy-wait.
+     */
+    static final long DB_WRITE_RETRY_MS = 100;
+    /**
+     * How many times a deferred confirmation tries before giving up. Bounded so a database that
+     * never comes back cannot leave timers alive forever; the window is longer than the
+     * pending-match key's life, so the retry outlives the state it is racing.
+     */
+    static final int DB_WRITE_MAX_ATTEMPTS = 600;
+    /**
      * Package-private with the pairing entry points below: the stale-member test drives one
      * pairing tick directly, which needs the script the app loads at startup.
      */
-    static volatile String PAIR_SCRIPT_SHA = "";
+    /**
+     * The pairing script. A {@link RedisScript} rather than a bare SHA (W18, ADR 0024): Redis
+     * drops its script cache on a restart, a failover or a {@code SCRIPT FLUSH}, and a caller
+     * that only remembers the SHA stops matching until it is restarted itself. Measured in W18:
+     * a Redis restart left the engine looping on {@code NOSCRIPT} with the queue untouched.
+     *
+     * <p>Package-private and volatile because the tests drive one pairing tick by hand: they
+     * install a script of their own against the same Redis.
+     */
+    static volatile RedisScript PAIR_SCRIPT;
+
+    /** The pairing script against this client; package-private for the by-hand pairing tests. */
+    static RedisScript pairScript(io.vertx.redis.client.Redis redis) {
+        return new RedisScript(redis, "/pair.lua");
+    }
 
     private MatchmakingEngineApplication() {
     }
@@ -141,13 +178,24 @@ public final class MatchmakingEngineApplication {
             outbox.close();
         }, "engine-outbox-close"));
 
-        RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
-                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, outbox, kpis));
+        // The database's concurrency bound (W17, ADR 0022): the pairing checks it before forming
+        // a match and the confirmation waits for a slot instead of issuing its transaction. The
+        // gauge is read from the gate itself, so the exposition carries the number the engine is
+        // actually deciding on.
+        WriteGate dbGate = WriteGate.of(DB_MAX_IN_FLIGHT);
+        metrics.registry().gauge(com.victor.matchmaking.metrics.MetricNames.DB_WRITES_IN_FLIGHT, dbGate,
+                WriteGate::inFlight);
 
-        // Load the atomic pairing script before starting the pairing loop
-        loadPairScript(redis).onSuccess(sha -> {
-            PAIR_SCRIPT_SHA = sha;
-            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> pairAcrossQueues(vertx, redis, tickets, pending, notifier, kpis));
+        RedisSubscriber.subscribe(vertx, redisUri, RedisKeys.CHANNEL_MATCH_CONFIRMATIONS,
+                msg -> handleConfirmation(msg, redis, tickets, pending, notifier, outbox, kpis, dbGate, vertx));
+
+        // Load the atomic pairing script before starting the pairing loop. The SHA is cached
+        // inside the script (which reloads it when Redis forgets it): the engine no longer has to
+        // be restarted because Redis was.
+        PAIR_SCRIPT = pairScript(redis);
+        PAIR_SCRIPT.load().onSuccess(sha -> {
+            vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> pairAcrossQueues(vertx, redis, tickets, pending,
+                    notifier, kpis, dbGate));
             vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier, kpis));
             vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
                     .onSuccess(kpis::relayDrained)
@@ -168,17 +216,6 @@ public final class MatchmakingEngineApplication {
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadPairScript", err));
     }
 
-    static Future<String> loadPairScript(io.vertx.redis.client.Redis redis) {
-        String script;
-        try {
-            script = new String(MatchmakingEngineApplication.class.getResourceAsStream("/pair.lua").readAllBytes());
-        } catch (Exception e) {
-            return Future.failedFuture(e);
-        }
-        return redis.send(Request.cmd(Command.SCRIPT).arg("LOAD").arg(script))
-                .map(resp -> resp != null ? resp.toString() : null);
-    }
-
     /**
      * Every queue the engine can pair from, from the closed set of game modes and regions
      * ({@link RedisKeys#allQueueKeys()}).
@@ -194,15 +231,29 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void pairAcrossQueues(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
-            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
+        if (dbGate.saturated()) {
+            // The database is at its write limit: forming more matches would only create more
+            // confirmations it cannot take. The queue waits, and the boundary that can say no to
+            // a player (the admission cap) is what absorbs the arrival rate (W17, ADR 0022).
+            LOG.log(System.Logger.Level.WARNING,
+                    "engine.backpressure pairing paused: database writes in flight={0} limit={1}",
+                    String.valueOf(dbGate.inFlight()), String.valueOf(dbGate.limit()));
+            return;
+        }
         for (String queueKey : queueKeys()) {
-            tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis);
+            tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis, dbGate);
         }
     }
 
     static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
-        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true);
+        tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis, WriteGate.unbounded());
+    }
+
+    static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
+        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true, dbGate);
     }
 
     /**
@@ -213,11 +264,15 @@ public final class MatchmakingEngineApplication {
      *                     the event loop while letting a queue drain at Redis speed
      * @param mayLookAgain false on the pass that follows a reap, so a queue made only of
      *                     ghosts cannot make this tick loop
+     * @param dbGate       refuses to form a match while the database is at its write limit
      */
     private static void pairBatch(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, int budget,
-            boolean mayLookAgain) {
+            boolean mayLookAgain, WriteGate dbGate) {
         if (budget <= 0) {
+            return;
+        }
+        if (dbGate.saturated()) {
             return;
         }
         GameMode gameMode = gameModeOfQueueKey(queueKey);
@@ -234,7 +289,7 @@ public final class MatchmakingEngineApplication {
                 // the ghost get their turn now instead of waiting for a tick of their own.
                 reapStaleMembers(queueKey, redis, tickets).onComplete(reaped -> {
                     if (mayLookAgain) {
-                        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget, false);
+                        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget, false, dbGate);
                     }
                 });
                 return;
@@ -254,7 +309,7 @@ public final class MatchmakingEngineApplication {
             // and then this tick is done with the queue.
             pair(roster, queueKey, redis, tickets, pending, notifier, kpis).onComplete(paired -> {
                 if (paired.succeeded() && Boolean.TRUE.equals(paired.result())) {
-                    pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget - 1, mayLookAgain);
+                    pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget - 1, mayLookAgain, dbGate);
                 }
             });
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -396,15 +451,21 @@ public final class MatchmakingEngineApplication {
         // whose read overlapped another tick's pairing must take nothing, or it removes the
         // wrong members and stores a roster nobody paired (W16). A nil answer means another
         // worker won the race and we skip.
-        Request pairRequest = Request.cmd(Command.EVALSHA).arg(PAIR_SCRIPT_SHA)
-                .arg("1").arg(queueKey)
-                .arg(pm.matchId()).arg(pm.toJson().encode())
-                .arg(String.valueOf(PENDING_KEY_TTL_SECONDS))
-                .arg(String.valueOf(roster.size()));
-        for (MatchmakingTicket candidate : candidates) {
-            pairRequest.arg(candidate.id());
-        }
-        return redis.send(pairRequest)
+        //
+        // The request is built from the SHA inside the lambda, not held in a field: after a Redis
+        // restart the script reloads with a new SHA, and a request built from the old one is
+        // exactly the NOSCRIPT this class recovers from (W18, ADR 0024).
+        return PAIR_SCRIPT.eval(sha -> {
+            Request pairRequest = Request.cmd(Command.EVALSHA).arg(sha)
+                    .arg("1").arg(queueKey)
+                    .arg(pm.matchId()).arg(pm.toJson().encode())
+                    .arg(String.valueOf(PENDING_KEY_TTL_SECONDS))
+                    .arg(String.valueOf(roster.size()));
+            for (MatchmakingTicket candidate : candidates) {
+                pairRequest.arg(candidate.id());
+            }
+            return pairRequest;
+        })
                 .compose(result -> {
                     if (result == null) {
                         // Another worker already removed these tickets from the queue
@@ -469,6 +530,13 @@ public final class MatchmakingEngineApplication {
     static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
             TicketRepository tickets, PendingMatchStore pending,
             RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
+        handleConfirmation(msg, redis, tickets, pending, notifier, outbox, kpis, WriteGate.unbounded(), null);
+    }
+
+    static void handleConfirmation(JsonObject msg, io.vertx.redis.client.Redis redis,
+            TicketRepository tickets, PendingMatchStore pending,
+            RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis, WriteGate dbGate,
+            Vertx vertx) {
         Payloads.MatchConfirmation command;
         try {
             command = Payloads.MatchConfirmation.fromJson(msg);
@@ -501,8 +569,8 @@ public final class MatchmakingEngineApplication {
                             matchId, playerId);
                     return;
                 }
-                String confirmedKey = "match-confirmed:" + matchId;
-                String claimKey = "match-confirmed-claim:" + matchId;
+                String confirmedKey = RedisKeys.matchConfirmedKey(matchId);
+                String claimKey = RedisKeys.matchConfirmedClaimKey(matchId);
                 redisCommands(redis, Request.cmd(Command.SADD).arg(confirmedKey).arg(playerId))
                         .flatMap(v -> redisCommands(redis, Request.cmd(Command.EXPIRE)
                                 .arg(confirmedKey).arg(String.valueOf(MATCH_CONFIRMED_TTL_SECONDS))))
@@ -542,7 +610,7 @@ public final class MatchmakingEngineApplication {
                                 redisCommands(redis, Request.cmd(Command.DEL).arg(confirmedKey))
                                         .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                                                 "engine.error stage=deleteConfirmedSet matchId=" + matchId, err));
-                                confirm(pm, tickets, pending, notifier, outbox, kpis);
+                                confirm(pm, tickets, pending, notifier, outbox, kpis, dbGate, vertx, 0);
                             }
                         })
                         .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -553,24 +621,92 @@ public final class MatchmakingEngineApplication {
     }
 
     private static void confirm(PendingMatch pm, TicketRepository tickets, PendingMatchStore pending,
-            RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
-        // Load both tickets, then transition them and persist the durable match row.
+            RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis, WriteGate dbGate,
+            Vertx vertx, int attempt) {
+        // The database's concurrency bound comes first, before any side effect: a confirmation
+        // that cannot write yet must not leave the match half-done (tickets CONFIRMED, row
+        // missing). The claim key keeps the match alive for the sweep, and the pending match is
+        // what the retry keys off, so nothing is written until there is a slot (W17, ADR 0022).
+        if (!dbGate.tryEnter()) {
+            kpis.dbWriteDeferred();
+            if (vertx == null) {
+                LOG.log(System.Logger.Level.ERROR,
+                        "engine.backpressure confirmations must be retried with a scheduler matchId={0}",
+                        pm.matchId());
+                return;
+            }
+            if (attempt >= DB_WRITE_MAX_ATTEMPTS) {
+                LOG.log(System.Logger.Level.ERROR,
+                        "engine.backpressure gave up persisting a confirmed match matchId={0} attempts={1} inFlight={2}",
+                        pm.matchId(), String.valueOf(attempt), String.valueOf(dbGate.inFlight()));
+                return;
+            }
+            LOG.log(System.Logger.Level.WARNING,
+                    "engine.backpressure confirmation deferred matchId={0} attempt={1} inFlight={2} limit={3}",
+                    pm.matchId(), String.valueOf(attempt), String.valueOf(dbGate.inFlight()),
+                    String.valueOf(dbGate.limit()));
+            vertx.setTimer(DB_WRITE_RETRY_MS, id -> pending.findById(pm.matchId()).onSuccess(latest -> {
+                if (latest != null) {
+                    confirm(latest, tickets, pending, notifier, outbox, kpis, dbGate, vertx, attempt + 1);
+                }
+            }));
+            return;
+        }
+        // One release point for the slot, whatever the outcome: a permit that is not given back
+        // shrinks the database's concurrency for the life of the process.
+        //
+        // A write that FAILS is retried like a write that had to wait, and for the same reason
+        // (W18, ADR 0024): a database that is unreachable for a moment must not cost the players
+        // their match while the sweep's deadline is still minutes away. The tickets are still
+        // CONFIRMING (the durable fact is written before the hot state moves), so a retry that
+        // succeeds finishes the same match, and a retry that runs out of attempts leaves a state
+        // the sweep can requeue rather than hot state nobody can repair.
+        persistConfirmedMatch(pm, tickets, pending, notifier, outbox, kpis)
+                .onFailure(err -> {
+                    LOG.log(System.Logger.Level.ERROR,
+                            "engine.backpressure confirmation write failed matchId={0} attempt={1} inFlight={2}",
+                            pm.matchId(), String.valueOf(attempt), String.valueOf(dbGate.inFlight()));
+                    if (vertx == null || attempt >= DB_WRITE_MAX_ATTEMPTS) {
+                        return;
+                    }
+                    vertx.setTimer(DB_WRITE_RETRY_MS, id -> pending.findById(pm.matchId()).onSuccess(latest -> {
+                        if (latest != null) {
+                            confirm(latest, tickets, pending, notifier, outbox, kpis, dbGate, vertx,
+                                    attempt + 1);
+                        }
+                    }));
+                })
+                .onComplete(done -> dbGate.leave());
+    }
+
+    /**
+     * Writes the match with its event and only then moves the players' tickets to CONFIRMED.
+     *
+     * <p>Ordering matters and is the point of the shape (W18, ADR 0024). The durable fact goes
+     * first: the row, the roster and the event are one transaction (W14), and until that
+     * transaction lands the players are still {@code CONFIRMING}. A write that fails therefore
+     * leaves a state the sweep already knows how to recover — the pending match dissolves on its
+     * deadline and the tickets go back to {@code SEARCHING} — instead of hot state that nobody
+     * can repair (measured before this: the tickets went {@code CONFIRMED} while the row was
+     * never written, and the sweep could not requeue what was no longer {@code CONFIRMING}).
+     *
+     * <p>The notification comes last, for the same reason: it is what tells a player "you are in
+     * a match", and sending it before the row is durable tells him something the database does
+     * not know yet.
+     */
+    private static Future<Void> persistConfirmedMatch(PendingMatch pm, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, OutboxQueue outbox, EngineKpis kpis) {
         List<Future<MatchmakingTicket>> loaded = pm.players().stream()
                 .map(p -> tickets.findById(p.ticketId()))
                 .toList();
-        Future.all(loaded).onSuccess(cf -> {
+        return Future.all(loaded).compose(cf -> {
             List<MatchmakingTicket> found = loaded.stream().map(Future::result).toList();
             if (found.stream().anyMatch(t -> t == null || t.status() != TicketState.CONFIRMING)) {
                 LOG.log(System.Logger.Level.WARNING,
                         "match.confirmRejected matchId={0} reason=tickets not in CONFIRMING", pm.matchId());
-                return;
+                return Future.succeededFuture();
             }
             MatchmakingTicket first = found.get(0);
-            for (MatchmakingTicket t : found) {
-                tickets.save(null, transition(t, TicketState.CONFIRMED))
-                        .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                "engine.error stage=saveConfirmedTicket ticketId=" + t.id(), err));
-            }
             List<com.victor.matchmaking.domain.match.MatchPlayer> players = new ArrayList<>();
             List<String> assignments = teamAssignments(found, pm.players().size());
             for (int i = 0; i < pm.players().size(); i++) {
@@ -596,7 +732,7 @@ public final class MatchmakingEngineApplication {
                     occurredAtOf(event),
                     Instant.now(),
                     0);
-            outbox.writeMatchWithEvent(match, players, record)
+            return outbox.writeMatchWithEvent(match, players, record)
                     .onSuccess(ignored -> {
                         // The match is a fact now: counted here, not when the event reaches the
                         // broker (that is the outbox KPI's job). Same moment, different question.
@@ -604,18 +740,32 @@ public final class MatchmakingEngineApplication {
                         LOG.log(System.Logger.Level.INFO,
                                 "match.confirmed matchId={0} players={1} persisted=true eventId={2} outbox=PENDING",
                                 pm.matchId(), pm.playerIds(), record.eventId());
+                        // The hot state follows the durable fact, never the other way around
+                        // (W18, ADR 0024). These writes used to run before the row existed: with
+                        // the database unavailable the tickets became CONFIRMED for a match that
+                        // was never written, and the timeout sweep could no longer return them to
+                        // the queue (it only requeues what is still CONFIRMING) - measured: 0 rows,
+                        // 2 tickets CONFIRMED for good. A failure here leaves the tickets
+                        // CONFIRMING and the pending match in place, which is a state the sweep
+                        // already knows how to recover.
+                        for (MatchmakingTicket t : found) {
+                            tickets.save(null, transition(t, TicketState.CONFIRMED))
+                                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                            "engine.error stage=saveConfirmedTicket ticketId=" + t.id(), err));
+                        }
+                        pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
+                        for (PendingMatch.PendingPlayer player : pm.players()) {
+                            notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CONFIRMED",
+                                    new Payloads.MatchConfirmed(pm.matchId())), Payloads.MatchConfirmed::toJson)
+                                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                            "engine.error stage=notifyConfirmed playerId=" + player.playerId(), err));
+                        }
                     })
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                             "engine.error stage=persistMatchWithEvent matchId=" + pm.matchId(), err));
-            pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                    "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
-            for (PendingMatch.PendingPlayer player : pm.players()) {
-                notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CONFIRMED",
-                        new Payloads.MatchConfirmed(pm.matchId())), Payloads.MatchConfirmed::toJson)
-                        .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                                "engine.error stage=notifyConfirmed playerId=" + player.playerId(), err));
-            }
-        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadTicketsForConfirm", err));
+        }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                "engine.error stage=loadTicketsForConfirm", err));
     }
 
     private static void dissolve(PendingMatch pm, String reasonTag, String detail, TicketRepository tickets,
@@ -638,8 +788,8 @@ public final class MatchmakingEngineApplication {
         }
         pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                 "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
-        redis.send(Request.cmd(Command.DEL).arg("match-confirmed:" + pm.matchId())
-                        .arg("match-confirmed-claim:" + pm.matchId()))
+        redis.send(Request.cmd(Command.DEL).arg(RedisKeys.matchConfirmedKey(pm.matchId()))
+                        .arg(RedisKeys.matchConfirmedClaimKey(pm.matchId())))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                         "engine.error stage=deleteConfirmedSet matchId=" + pm.matchId(), err));
         for (PendingMatch.PendingPlayer player : pm.players()) {
@@ -666,8 +816,11 @@ public final class MatchmakingEngineApplication {
      * the one set of keys the engine cannot name in advance, so they are found with a real
      * {@code SCAN} - every page of it ({@link RedisScanner}); the single-page version used to
      * miss them the same way it missed the queues (W16).
+     *
+     * <p>Package-private so a test can run one sweep by hand: it is also the recovery path when a
+     * confirmation could not be written (W18, ADR 0024).
      */
-    private static void sweepExpired(io.vertx.redis.client.Redis redis, TicketRepository tickets,
+    static void sweepExpired(io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         RedisScanner.scanAll(redis, "match-pending:*")
                 .onSuccess(keys -> {
@@ -675,8 +828,11 @@ public final class MatchmakingEngineApplication {
                         pending.findById(key.substring("match-pending:".length()))
                                 .onSuccess(pm -> {
                                     if (pm != null && Instant.now().isAfter(pm.expiresAt())) {
-                                        dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_TIMEOUT,
-                                                "timeout", tickets, pending, notifier, redis, kpis);
+                                        // A claimed match is one every player already confirmed and
+                                        // whose row is being written (possibly waiting for a database
+                                        // write slot, W17). Dissolving it would cancel a match the
+                                        // players accepted, so the sweep lets the claim own it.
+                                        skipIfClaimed(redis, pm, tickets, pending, notifier, kpis);
                                     }
                                 })
                                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -684,5 +840,23 @@ public final class MatchmakingEngineApplication {
                     }
                 })
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=sweepExpired", err));
+    }
+
+    /** Dissolves an expired match unless its confirmation claim says it is spoken for. */
+    private static void skipIfClaimed(io.vertx.redis.client.Redis redis, PendingMatch pm,
+            TicketRepository tickets, PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
+        redis.send(Request.cmd(Command.EXISTS).arg(RedisKeys.matchConfirmedClaimKey(pm.matchId())))
+                .onSuccess(exists -> {
+                    if (exists != null && exists.toLong() == 1L) {
+                        LOG.log(System.Logger.Level.INFO,
+                                "engine.sweepSkipped matchId={0} reason=confirmed-awaiting-persist",
+                                pm.matchId());
+                        return;
+                    }
+                    dissolve(pm, com.victor.matchmaking.metrics.MetricNames.REASON_TIMEOUT,
+                            "timeout", tickets, pending, notifier, redis, kpis);
+                })
+                .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                        "engine.error stage=sweepClaimCheck matchId=" + pm.matchId(), err));
     }
 }

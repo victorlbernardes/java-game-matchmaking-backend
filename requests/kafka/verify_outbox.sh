@@ -80,6 +80,17 @@ start_engine() {
       -Dexec.mainClass="$ENGINE_MAIN" </dev/null >"$ENGINE_LOG" 2>&1 &)
 }
 
+# The epoch of the running engine's own "engine.started" line. start_engine truncates the
+# log, so the first match is this boot's. macOS and GNU date disagree on the flag, so try
+# both (the failure of the first is silent).
+engine_started_epoch() {
+  local stamp
+  stamp="$(grep -m1 -E 'engine\.started' "$ENGINE_LOG" 2>/dev/null | awk '{print $1, $2}')"
+  [ -n "$stamp" ] || return 1
+  date -j -f "%Y-%m-%d %H:%M:%S" "$stamp" +%s 2>/dev/null \
+    || date -d "$stamp" +%s 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 step "0. preconditions"
 # ---------------------------------------------------------------------------
@@ -147,11 +158,27 @@ fi
 # back the event was out again; the steady-state lag the relay adds is in ADR 0018.
 PUBLISHED_AT="$(scalar "SELECT extract(epoch FROM published_at)::bigint FROM outbox_events WHERE event_id = '${EVENT_ID}'")"
 RECOVERY_S=$((PUBLISHED_AT - REWIND_AT))
-note "the event was out again ${RECOVERY_S}s after the engine came back (engine boot included)"
-if [ "$RECOVERY_S" -lt 15 ]; then
-  ok "a queue that outlives its relay drains again in ${RECOVERY_S}s"
+# What matters here is the relay's share, not the launch: the engine's own boot (Maven
+# resolving, a JVM, Flyway) is the scenario's cost, and on a busy box it alone can take
+# the better part of the window. The engine logs when it considers itself up, so the
+# wait is split into boot and drain and the assertion is on the drain.
+STARTED_AT="$(engine_started_epoch || true)"
+if [ -n "$STARTED_AT" ]; then
+  BOOT_S=$((STARTED_AT - REWIND_AT))
+  DRAIN_S=$((PUBLISHED_AT - STARTED_AT))
+  note "the event was out again ${RECOVERY_S}s after the launch, of which ${BOOT_S}s was the engine's own boot"
+  if [ "$DRAIN_S" -lt 10 ]; then
+    ok "the relay drained a row that was already waiting ${DRAIN_S}s after the engine reported itself up"
+  else
+    bad "the relay took ${DRAIN_S}s after boot to drain a row that was already waiting (see $ENGINE_LOG)"
+  fi
 else
-  bad "the relay took ${RECOVERY_S}s to drain a row that was already waiting"
+  note "the engine did not log engine.started; measuring from the launch (boot included)"
+  if [ "$RECOVERY_S" -lt 30 ]; then
+    ok "a queue that outlives its relay drains again in ${RECOVERY_S}s"
+  else
+    bad "the relay took ${RECOVERY_S}s to drain a row that was already waiting"
+  fi
 fi
 note "row age when it went out (occurred_at -> published_at): $(scalar "SELECT round(extract(epoch FROM (published_at - occurred_at)) * 1000) FROM outbox_events WHERE event_id = '${EVENT_ID}'") ms, attempts: $(scalar "SELECT attempts FROM outbox_events WHERE event_id = '${EVENT_ID}'")"
 

@@ -43,8 +43,32 @@ public final class RedisKeys {
         return keys;
     }
 
+    /**
+     * One token bucket: {@code ratelimit:{scope}:{id}} (W17, ADR 0023). The scope names what is
+     * being limited (a player's ticket creations, a caller's requests) so two different limits
+     * never share a bucket.
+     */
+    public static String rateLimitKey(String scope, String id) {
+        return "ratelimit:" + scope + ":" + id;
+    }
+
     public static String matchPendingKey(String matchId) {
         return "match-pending:" + matchId;
+    }
+
+    /** The set of players who confirmed a match (W8). */
+    public static String matchConfirmedKey(String matchId) {
+        return "match-confirmed:" + matchId;
+    }
+
+    /**
+     * The claim that says a match is spoken for (W16): the first confirmation to create it is
+     * the one that persists the match, and every later one is refused. Its existence also says
+     * "this match is confirmed and owed a row", which is what keeps the timeout sweep from
+     * dissolving a match the players already accepted (W17).
+     */
+    public static String matchConfirmedClaimKey(String matchId) {
+        return "match-confirmed-claim:" + matchId;
     }
 
     public static String partyKey(String partyId) {

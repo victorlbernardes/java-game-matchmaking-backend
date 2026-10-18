@@ -34,6 +34,35 @@ public final class MetricNames {
      */
     public static final String QUEUE_OLDEST_WAIT_SECONDS = "matchmaking.queue.oldest.wait.seconds";
 
+    // ── Admission control: what the system said no to, and why (W17, ADR 0022/0023) ──
+
+    /**
+     * Arrivals the boundary refused, tagged by reason. A refusal is a load-shedding decision, and
+     * a decision nobody counts is indistinguishable from a system that is down: the queue full is
+     * the system working, the rate limit is a caller misbehaving, and both must be visible.
+     */
+    public static final String TICKETS_REJECTED = "matchmaking.tickets.rejected";
+    /** A queue was at its admission limit (503, try again shortly). */
+    public static final String REASON_QUEUE_FULL = "queue_full";
+    /** The caller exceeded its own request budget (429). */
+    public static final String REASON_RATE_LIMITED = "rate_limited";
+
+    // ── Backpressure: what the engine does when the database is behind (W17, ADR 0022) ──
+
+    /**
+     * Writes the engine has in flight against Postgres. The bound is the point: a number that
+     * climbs to the limit and stays there says the database is the constraint, and it says it
+     * before the database goes down (which is the failure it exists to prevent).
+     */
+    public static final String DB_WRITES_IN_FLIGHT = "matchmaking.db.writes.in.flight";
+    /**
+     * Confirmations that found the database at its limit and were asked to wait. Each one is a
+     * match whose players confirmed and whose row is not written yet: a count that grows is a
+     * database that needs attention, not a matchmaker that is broken.
+     */
+    public static final String DB_WRITE_DEFERRED = "matchmaking.db.write.deferred";
+
+
     // ── The outbox: is what happened getting out? (ADR 0018) ────────────────────────
 
     /** Rows per status: PENDING is the backlog, PARKED is what needs a human. */
@@ -62,6 +91,24 @@ public final class MetricNames {
     public static final String REASON_TIMEOUT = "timeout";
     /** A match dissolved because a player declined it. */
     public static final String REASON_DECLINED = "declined";
+
+    // ── Dependencies: who is down, and is it us? (W18, ADR 0024) ─────────────────────
+
+    /**
+     * Requests the API refused because a dependency is unreachable. Counted where the refusal is
+     * decided, tagged by dependency ({@link #TAG_DEPENDENCY}), so "the hot state is down" is a
+     * series and not a hunt through 500s. An unavailable dependency is a 503: nothing is broken,
+     * the answer is "not now" - and a 500 here teaches a client to retry the wrong way (or not
+     * at all).
+     */
+    public static final String DEPENDENCY_ERRORS = "matchmaking.dependency.errors";
+
+    /** The hot state: tickets, queues, the rate-limit buckets (Redis). */
+    public static final String TAG_DEPENDENCY_REDIS = "redis";
+    /** The source of truth: match history (PostgreSQL). */
+    public static final String TAG_DEPENDENCY_POSTGRES = "postgres";
+
+    public static final String TAG_DEPENDENCY = "dependency";
 
     private MetricNames() {
     }

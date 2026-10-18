@@ -117,13 +117,31 @@ wait_for_empty_group() {
   return 1
 }
 
-# Whole dead letter topic into $DLQ_DUMP: one line per record, headers first, payload
+# The dead letter topic is shared and only grows: every run of this scenario appends to it
+# and a dead letter cannot be deleted. It used to be read as "the oldest 100 records", so
+# once the topic passed 100 records (it holds 133 now) the dump stopped containing the
+# letter this run had just produced -- and the "newest of this stage" selection below read
+# a stale one from a previous run, failing every header assertion against the wrong record.
+# Read the tail of the topic instead: the letters of interest are always the recent ones.
+DLQ_SCAN="${DLQ_SCAN:-200}"
+
+dlq_end_offset() {
+  docker exec "$KAFKA_CONTAINER" kafka-get-offsets \
+    --bootstrap-server "$BROKER_IN_CONTAINER" --topic "$DLQ_TOPIC" 2>/dev/null \
+    | awk -F: -v p="$PARTITION" '$2 == p { print $3; exit }'
+}
+
+# The dead letter topic into $DLQ_DUMP: one line per record, headers first, payload
 # last, tab separated (the console consumer's own format).
 dump_dlq() {
+  local end start
+  end="$(dlq_end_offset)"
+  [ -n "$end" ] || end=0
+  start=$(( end > DLQ_SCAN ? end - DLQ_SCAN : 0 ))
   docker exec "$KAFKA_CONTAINER" kafka-console-consumer \
     --bootstrap-server "$BROKER_IN_CONTAINER" \
-    --topic "$DLQ_TOPIC" --partition "$PARTITION" --offset earliest \
-    --max-messages 100 --timeout-ms 4000 \
+    --topic "$DLQ_TOPIC" --partition "$PARTITION" --offset "$start" \
+    --max-messages "$DLQ_SCAN" --timeout-ms 4000 \
     --property print.headers=true --property print.offset=true \
     > "$DLQ_DUMP" 2>/dev/null || true
 }

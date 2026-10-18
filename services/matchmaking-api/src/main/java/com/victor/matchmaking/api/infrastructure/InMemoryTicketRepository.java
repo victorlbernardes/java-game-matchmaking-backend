@@ -51,6 +51,16 @@ public final class InMemoryTicketRepository implements TicketRepository {
     }
 
     @Override
+    public Future<Long> queueDepth(String gameModeLabel, String regionName) {
+        long depth = ticketsById.values().stream()
+                .filter(ticket -> ticket.status() == com.victor.matchmaking.domain.ticket.TicketState.SEARCHING)
+                .filter(ticket -> ticket.gameMode().label().equals(gameModeLabel)
+                        && ticket.region().name().equals(regionName))
+                .count();
+        return Future.succeededFuture(depth);
+    }
+
+    @Override
     public Future<List<String>> createPartyTickets(List<MatchmakingTicket> tickets) {
         if (tickets.isEmpty()) {
             return Future.succeededFuture(List.of());

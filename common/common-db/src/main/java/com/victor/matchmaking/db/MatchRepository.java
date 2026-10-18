@@ -31,6 +31,15 @@ public final class MatchRepository {
     }
 
     /**
+     * Round-trips a {@code SELECT 1}: what a readiness probe needs, and nothing more (W18, ADR
+     * 0024). It asks "can this instance reach the source of truth", not "is the data good" — the
+     * answer changes the routing decision, so it must be cheap enough to ask often.
+     */
+    public Future<Void> ping() {
+        return pool.query("SELECT 1").execute().mapEmpty();
+    }
+
+    /**
      * Inserts a match and its players in one transaction. Idempotent on match id
      * (retry-safe for W7/W8).
      */

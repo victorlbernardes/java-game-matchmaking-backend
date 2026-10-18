@@ -109,6 +109,75 @@
           "name": "health",
           "item": [
             {
+              "name": "GET /health/ready",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 200 when the dependencies answer', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('every dependency is named', () => {",
+                      "  pm.expect(body.checks).to.have.property('redis');",
+                      "  pm.expect(body.checks).to.have.property('postgres');",
+                      "});",
+                      "pm.test('status is UP', () => pm.expect(body.status).to.eql('UP'));"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/health/ready",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "health",
+                    "ready"
+                  ]
+                }
+              },
+              "description": "Readiness probe (no auth, W18, ADR 0024).\n\n**Expected (every dependency up):** 200 with `{\"status\":\"UP\",\"checks\":{\"redis\":\"UP\",\"postgres\":\"UP\"}}`.\n\n**Expected (a dependency down):** 503 with the offending dependency named, e.g. `{\"status\":\"DOWN\",\"checks\":{\"redis\":\"DOWN\",\"postgres\":\"UP\"}}`. Each check is capped at 1 s, so a hung dependency answers the probe instead of holding it.\n\nThis is the endpoint a router or an orchestrator should use: `/health` stays 200 while a dependency is down (the process is fine; killing it does not fix Redis), so routing on liveness during a Redis outage sends traffic to instances that cannot serve it. `requests/resilience/verify_degradation.sh` asserts both answers with the dependency actually stopped."
+            },
+            {
+              "name": "GET /health/ready — dependency down (503)",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 503 when a dependency is down', () => pm.response.to.have.status(503));",
+                      "const body = pm.response.json();",
+                      "pm.test('the offending dependency is named DOWN', () => {",
+                      "  const down = Object.keys(body.checks).filter(k => body.checks[k] === 'DOWN');",
+                      "  pm.expect(down.length).to.be.above(0);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{apiBaseUrl}}/health/ready",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "health",
+                    "ready"
+                  ]
+                }
+              },
+              "description": "The same endpoint, asked while a dependency is stopped (W18, ADR 0024).\n\nPrecondition: stop one dependency, e.g. `docker stop game-matchmaking-backend-redis-1` (or start the API with Postgres down and watch the boot path instead).\n\n**Expected:** 503 and `checks` naming the dependency that is DOWN while the others stay UP. Stop the container again when done: `docker start game-matchmaking-backend-redis-1`."
+            },
+            {
               "name": "GET /health",
               "event": [
                 {
@@ -431,6 +500,120 @@
                 }
               },
               "description": "Unknown id → expect 404."
+            },
+            {
+              "name": "POST /v1/matchmaking/tickets — rate limited (429)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{playerToken}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+                },
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                }
+              },
+              "description": "Send this request more than RATE_LIMIT_BURST times in a row (default 20) with the same player's token inside a few seconds. The token bucket lives in Redis (ratelimit:tickets:{playerId}), so the limit is per player and survives an API restart.\n\nExpect the first RATE_LIMIT_BURST requests to answer 201 and the next ones 429 with:\n- Retry-After: seconds until the next token (RATE_LIMIT_REFILL_PER_SECOND, default 5/s)\n- X-RateLimit-Limit: the burst, so a client can size itself without guessing\n- X-RateLimit-Remaining: 0\n- body: {\"error\": \"rate limit exceeded: at most N enqueue requests are admitted per burst\"}\n\nBy hand it is quicker with curl (a loop of 60 requests): this is what step 1 of requests/backpressure/verify_load_shedding.sh does, and it asserts the count stays within burst + refill × elapsed. The API counts the refusals as matchmaking_tickets_rejected_total{reason=\"rate_limited\"} on :9090/metrics."
+            },
+            {
+              "name": "POST /v1/matchmaking/tickets — queue full (503)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{playerToken}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+                },
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                }
+              },
+              "description": "A queue that is deep enough to promise nobody a game admits nobody more (ADR 0022).\n\nPrecondition: the target queue holds QUEUE_MAX_DEPTH tickets (default 1000). Reach it by stopping the engine so nothing drains and enqueueing past the cap — requests/backpressure/verify_load_shedding.sh does exactly that in its step 3 (engine stopped, 1100 arrivals, 1000 admitted).\n\nExpect 503 with Retry-After: 5 and a body naming the queue it refused for:\n{\"error\":\"queue full\",\"queue\":\"queue:1v1:NA\",\"depth\":1000,\"capacity\":1000,\"retryAfterSeconds\":5}\n\nThe refusal is temporary: once the queue drains below the cap, the same request is admitted. A replay of a ticket that was already accepted is still answered while the queue is full — the player did enqueue, and refusing the retry would lose a ticket that exists. Counted as matchmaking_tickets_rejected_total{reason=\"queue_full\"}."
+            },
+            {
+              "name": "POST /v1/matchmaking/tickets — hot state unavailable (503)",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('status 503 while Redis is down', () => pm.response.to.have.status(503));",
+                      "pm.test('Retry-After tells the client when to come back', () => pm.expect(pm.response.headers.get('Retry-After')).to.eql('1'));",
+                      "const body = pm.response.json();",
+                      "pm.test('the body names the dependency', () => pm.expect(body.dependency).to.eql('redis'));",
+                      "pm.test('the body carries no internal address', () => {",
+                      "  pm.expect(pm.response.text()).to.not.include('localhost');",
+                      "  pm.expect(pm.response.text()).to.not.include('6379');",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{playerToken}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+                },
+                "url": {
+                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+                  "host": [
+                    "{{apiBaseUrl}}"
+                  ],
+                  "path": [
+                    "v1",
+                    "matchmaking",
+                    "tickets"
+                  ]
+                }
+              },
+              "description": "What an arrival hears when the hot state is gone (W18, ADR 0024).\n\nPrecondition: `docker stop game-matchmaking-backend-redis-1`. Start it again afterwards (`docker start game-matchmaking-backend-redis-1`) — the services do not need restarting, which is the other half of the change: their Lua SHAs reload on the next call.\n\nExpected: **503** with `Retry-After: 1` and a body that names what is unavailable without saying where it lives:\n{\"error\":\"hot state unavailable\",\"dependency\":\"redis\",\"retryAfterSeconds\":1}\n\nBefore this, the same request answered `500 {\"error\":\"Connection refused: localhost/127.0.0.1:6379\"}` — the wrong status (it tells the client to stop), plus a map of the internal network. The refusal is counted as `matchmaking_dependency_errors_total{dependency=\"redis\"}` on the API's scrape (:9090).\n\nRedis RESTARTED (not down) is the same endpoint answering 201: the cached script SHA is rebuilt on the first `EVALSHA` that reports `NOSCRIPT`, so a cache restart is not an outage."
             }
           ]
         },

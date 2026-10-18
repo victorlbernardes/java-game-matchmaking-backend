@@ -16,7 +16,13 @@ public interface TicketRepository {
 
     Future<Void> save(String idempotencyKey, MatchmakingTicket ticket);
 
-    /** Atomic idempotent create: GET idem:{key} + SET ticket + ZADD queue + SET idem in one Lua script. */
+    /**
+     * Atomic idempotent create: GET idem:{key} + capacity check + SET ticket + ZADD queue + SET
+     * idem in one Lua script.
+     *
+     * @throws QueueFullException when the queue is at its admission limit; the ticket was not
+     *         created and nothing was written, so the caller can shed the arrival
+     */
     Future<String> createIdempotent(String idempotencyKey, MatchmakingTicket ticket);
 
     /**
@@ -24,6 +30,9 @@ public interface TicketRepository {
      * in creation order. The caller links them to the party afterwards.
      */
     Future<List<String>> createPartyTickets(List<MatchmakingTicket> tickets);
+
+    /** Tickets waiting in one queue. The party path consults it for a bounded admission check. */
+    Future<Long> queueDepth(String gameModeLabel, String regionName);
 
     String newTicketId();
 

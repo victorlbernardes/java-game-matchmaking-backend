@@ -138,9 +138,15 @@ else
   exit 1
 fi
 
-# What the 900 s TTL does: the ticket key is gone, the member stays in the ZSET.
-redis del "ticket:$ghost_ticket" >/dev/null
-queued="$(redis zcard "$QUEUE_KEY")"
+# What the 900 s TTL does: the ticket key is gone, the member stays in the ZSET. The delete
+# and the read are one Lua script on purpose: the engine's sweep removes the member as soon
+# as the ticket is gone, so two separate `redis-cli` calls race the very fix under test
+# (observed in W18 - the read found 0 members because the reaper had run in between). While
+# the ticket exists the member is legitimate, so an atomic delete-and-count always reports
+# the decay the scenario is about.
+queued="$(redis eval \
+  "redis.call('DEL', KEYS[1]); return redis.call('ZCARD', KEYS[2])" 2 \
+  "ticket:$ghost_ticket" "$QUEUE_KEY" | tr -d '\r')"
 if [ "$queued" = "1" ]; then
   ok "the ghost is real: the ticket is gone and the queue still holds the member"
 else

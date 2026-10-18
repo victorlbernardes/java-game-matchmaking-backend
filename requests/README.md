@@ -14,7 +14,7 @@ Single Postman/Insomnia collection for the entire matchmaking backend.
 matchmaking/
 ├── auth-service/          # POST /v1/auth/login, GET /.well-known/jwks.json
 ├── matchmaking-api/
-│   ├── health/            # GET /health
+│   ├── health/            # GET /health (liveness), GET /health/ready (readiness, W18)
 │   ├── tickets/           # POST/GET/DELETE /v1/matchmaking/tickets (+ error cases, + party enqueue)
 │   ├── parties/           # GET/POST /v1/parties, POST members, DELETE member, DELETE party (+ error cases)
 │   ├── history/           # GET /v1/players/{id}/matches (+ error cases)
@@ -41,11 +41,18 @@ requests/
 ├── kafka/verify_idempotent_consumer.sh # consumer: a replay must not apply anything twice (W13)
 ├── kafka/verify_dlq.sh                # consumer: a record that cannot be handled must not stall the partition (W13)
 ├── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
-└── observability/
-    ├── check_metrics.sh               # KPIs: exposition, the numbers moving, Prometheus + Grafana (W15)
-    ├── pending_match.py               # helper: the pending match of two given players
-    ├── check_slos.sh                  # SLOs: rules loaded, ratios agree with a hand count, alerts alive (W16)
-    └── slo_ratios.py                  # helper: the counters of a scrape, and the ratios of a window
+├── observability/
+│   ├── check_metrics.sh               # KPIs: exposition, the numbers moving, Prometheus + Grafana (W15)
+│   ├── pending_match.py               # helper: the pending match of two given players
+│   ├── check_slos.sh                  # SLOs: rules loaded, ratios agree with a hand count, alerts alive (W16)
+│   └── slo_ratios.py                  # helper: the counters of a scrape, and the ratios of a window
+├── backpressure/
+│   ├── verify_load_shedding.sh        # the three refusals: 429, 503, and waiting on the database (W17)
+│   ├── fill_queue.py                  # helper: arrivals until the API refuses, and what it said
+│   └── db_backpressure.py             # helper: a confirmation burst against a deliberately slow Postgres
+└── resilience/
+    ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
+    └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
 ```
 
 ## Party flow (W11)
@@ -90,7 +97,7 @@ deliberate — a running pod must never invent a schema version.
 ## Automated tests
 
 ```bash
-mvn -B clean test            # unit + integration + race + stress (135 tests, 12 modules)
+mvn -B clean test            # unit + integration + race + stress (162 tests, 12 modules)
 ```
 
 The engine concurrency tests touch `queue:*` and `match-pending:*` in Redis
@@ -179,6 +186,7 @@ Read the event back — bytes decoded through the registry into JSON:
 ```bash
 requests/kafka/verify_match_confirmed.sh                   # any confirmed match
 requests/kafka/verify_match_confirmed.sh match-551dc626     # one specific match
+SCAN_RECORDS=0 requests/kafka/verify_match_confirmed.sh     # scan the whole log
 ```
 
 It decodes the topic with `kafka-protobuf-console-consumer`, asserts the envelope
@@ -186,6 +194,15 @@ It decodes the topic with `kafka-protobuf-console-consumer`, asserts the envelop
 skill snapshot) and prints `EVENT_JSON` / `EVENT_CREATE_TIME_MS` as evidence — the
 E2E uses exactly that output for its assertions. Re-run it with
 `QUIET_WINDOW_MS=10000 .../verify_match_confirmed.sh` when the broker is slow.
+
+The scan starts at the end of the log minus `SCAN_RECORDS` (default **2000**) and prints
+the window it read (`SCANNED_FROM`, `LOG_END_OFFSET`), because the topic is shared and only
+grows: after the W16/W17 load runs it held **18 650 records**, and reading all of it is ~38
+`docker exec` calls that each start a JVM — ~16 minutes for the check, bounded only by
+`MAX_READS`. The records the scenarios care about are the recent ones. `SCAN_RECORDS=0`
+examines everything, which is what the poison-record accounting of the dead-letter scenario
+wants (the check then reads "every record in the scanned window was decoded or accounted
+for", with the window printed).
 
 Measured in E2E S10 (`EVENT_CREATE_TIME_MS` minus the moment both `CONFIRM`s were
 published, 4 runs): **416–831 ms, median ~600 ms** — it covers Redis, the Postgres
@@ -293,7 +310,9 @@ the registry by `verify_match_confirmed.sh`. It then inserts a row whose topic d
 requires it to end `PARKED`, with `last_error` saying why, while a good row behind it still goes
 out. Preconditions: the docker stack plus at least one confirmed match in `outbox_events` (E2E
 S11 or any confirmation); the script runs `mvn install` itself and leaves the engine running. 14
-checks, ~90 s.
+checks, ~2 min. The drain is measured from the engine's own `engine.started` line, not from the
+launch: Maven + JVM + Flyway alone reached 15 s on a busy machine, and a check about the relay must
+not fail because the JVM was slow.
 
 Reading the queue by hand:
 
@@ -372,6 +391,14 @@ event** — which is the point of keeping the bytes. The script needs the orches
 running and something already projected (E2E S11 leaves both), creates the dead letter
 topic if it is missing, and restores the inbox row it perturbed. See
 `docs/adr/0019-dlq-retry.md`.
+
+The dead letter topic is shared and only accumulates (one record per dead letter — **133**
+at the time of writing), so the script reads its **tail** (`DLQ_SCAN`, default **200**)
+rather than the oldest records. It used to ask for the oldest 100, and once the topic
+passed 100 the letter the run had just produced was not in the dump at all: the "newest
+of this stage" selection then answered with a stale letter from a previous run and every
+header assertion failed against the wrong record (found in W18 — 8 failures, all against
+a record the run did not produce).
 
 The dead letter topic is a deployment precondition, not something the service invents:
 
@@ -493,7 +520,7 @@ Four objectives live as code in `ops/prometheus/rules/matchmaking-slos.yml` (10 
 | SL-4 | a waiting player never waits > 30 s while his queue has work | threshold |
 
 ```bash
-bash requests/observability/check_slos.sh      # 34 checks, ~2 min
+bash requests/observability/check_slos.sh      # 36 checks, ~2 min
 ```
 
 The scenario asserts the rules are loaded **and are this repository's file**, computes the SL-1 and
@@ -509,6 +536,147 @@ Two traps are worth knowing before writing another ratio rule: the objective's b
 string while the client renders the edge `le="10.0"` (hence `le=~"10(\.0)?"`). A rule file that
 loads nothing also looks healthy — a relative `rule_files` entry resolves against the config file's
 directory — which is why the scenario asserts the groups exist and checks their path.
+
+The Prometheus this runs against is **not** a quiet stack: it holds every load and chaos run of the
+repository. Since W18 the scenario therefore treats a firing **burn** as evidence to verify rather
+than noise to demand away — all four burns (fast and slow) are checked against their own condition —
+and the SL-1/SL-2 ratio and budget checks accept a shortfall only while the recorded burn agrees with
+it, so a rule that stopped measuring still fails. The window is in `(1 - ratio)`, and after the W18
+chaos run the 1 h confirmation window held **46 formed / 19 confirmed**: a match formed while Redis or
+Postgres is down is never confirmed, which is the objective measuring exactly what it describes.
+
+## Backpressure — what the system says no to (W17)
+
+```bash
+bash requests/backpressure/verify_load_shedding.sh    # 35 checks, ~1 min
+```
+
+Three refusals, three reasons, and three different places to stop (ADR 0022, ADR 0023):
+
+| Refusal | Where the decision is made | Answer | What it protects |
+| --- | --- | --- | --- |
+| Rate limit | `ratelimit.lua` in Redis, key `ratelimit:tickets:{playerId}` | `429` + `Retry-After` + `X-RateLimit-Limit` / `-Remaining` | One authenticated player cannot turn the queue into a weapon |
+| Queue cap | `create.lua`, in the same atomic step as the write | `503` + `Retry-After: 5` + `{queue, depth, capacity}` | A queue deep enough to promise nobody a game admits nobody more |
+| Database | `WriteGate` in the engine (a permit, not a lock) | the confirmation *waits*; the pairing pauses | A database that is behind is not asked harder |
+
+The cap is inside the Lua script and not in Java for the reason the whole sprint exists: a `ZCARD`
+followed by a `ZADD` is a check that N in-flight arrivals all pass at the same moment, so a queue
+"capped" at M grows without bound under exactly the load the cap is for. The same argument put
+idempotency (W6) and the roster (W16) in scripts.
+
+**The hole the load run found.** The admission check lived on the idempotency path only, so an
+arrival *without* an `Idempotency-Key` — a curl, a player's second device, the load generator —
+took the plain write path and walked around the cap. Measured before the fix: **4000 arrivals
+against a cap of 1000, zero refusals, the queue at 3146**. Both paths now go through the script
+(with an empty key when the caller sent none), and `QueueCapacityTest.arrivalsWithoutAnIdempotencyKeyAreCappedToo`
+is the test that fails if it comes back. Two questions that look like one — *is this a replay?* and
+*is there room?* — are answered independently.
+
+The scenario proves each refusal against the running stack:
+
+1. **Rate limit** — 60 requests in a row from one player: the API advertises `X-RateLimit-Limit: 20`,
+   ~18 are refused with `429` + `Retry-After`, the admitted count is checked against
+   `burst + refill × elapsed` (not against a hard-coded number, so the check survives a
+   reconfiguration), the refusal reports `X-RateLimit-Remaining: 0`, the KPI
+   `matchmaking_tickets_rejected_total{reason="rate_limited"}` counts them, and after the
+   `Retry-After` the same player is served again — the bucket refills. If the limiter's own store is
+   unreachable the API **fails open, loudly**: the queue cap is the real guard, and a guard that
+   becomes the outage it exists to prevent is worse than the load.
+2. **Queue cap** — the engine is stopped (nothing drains, so the cap is what answers), 1100 real
+   arrivals go in: **1000 admitted, 100 refused** with `capacity=1000`, `depth=1000`, `Retry-After: 5`,
+   Redis's `ZCARD` at exactly 1000, and the replay of an already-accepted ticket still answered with
+   its ticket while the queue is full. Then the queue is cleaned up, the engine restarted and a new
+   arrival admitted — the refusal was temporary, not a closed door.
+3. **Database** — Postgres is made genuinely slow with a `BEFORE INSERT ON matches` trigger that
+   sleeps 3 s, and `db_backpressure.py` drives a real burst: 24 players → 12 matches → 24
+   confirmations published at once. It samples `pg_stat_activity` for the sessions actually running
+   the insert (the ground truth, not the engine's opinion) and the `matchmaking_db_writes_in_flight`
+   gauge. Result: **12/12 written, 0 lost**; Postgres never ran more than a handful of inserts at a
+   time and the gauge peaked at exactly `DB_MAX_IN_FLIGHT` (8); **118 confirmations were deferred**
+   (KPI + `engine.backpressure confirmation deferred` in the log) and the burst took 11 s — longer
+   than one database wait, which is what proves the trigger was real. The scenario leaves no rows
+   behind.
+
+Under load, the same cap at 4000 players (1v1/NA, concurrency 192, one build):
+
+| Run | Admitted | Refused | Refusal p50 / p99 | Peak depth | Wait p50 / p95 / p99 | Matches confirmed | Dissolved |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `QUEUE_MAX_DEPTH=1000` | 2862 | 1138 | 672 / 904 ms | 984 | 7.43 / 10.57 / 11.28 s | 1431 | 0 |
+| `QUEUE_MAX_DEPTH=0` (uncapped) | 4000 | 0 | — | 2182 | 11.11 / 16.86 / 20.86 s | 2000 | 0 |
+
+The capped run is honest about what it bought: a third of the arrivals got a fast, explicit "no" in
+under a second instead of a match 20 s later, and the players who *were* admitted waited much less
+(the backlog is bounded, so the wait is bounded with it). Nothing was lost in either run — no
+dissolved match, no duplicate event. `run_load.py` counts the shed separately from errors for this
+reason: a refusal on purpose is not a failure, but a run that hides it would be.
+
+Two traps that cost time here, both about measuring under pressure: the harness's own probe
+(`SELECT count(*) FROM pg_stat_activity WHERE query ILIKE '%insert into matches%'`) matches **its
+own** statement, so it counted itself until it excluded `pg_backend_pid()` — and one `DEL` with N
+keys is one round trip through the Docker daemon, while N `docker exec redis-cli del` calls are N
+(2000 of them turned a 30 s cleanup into minutes).
+
+## Degradation — what a dependency going away may do (W18)
+
+```bash
+bash requests/resilience/verify_degradation.sh     # 45 checks, 5 phases, ~5 min (ADR 0024)
+```
+
+The sprint is not about the player arriving too fast (W17) — it is about the dependency on the other
+end of the wire stopping. Each phase stops (or restarts) one dependency with the stack alive and
+traffic flowing, drives the affected flow, and asserts **both halves**: what the absence is allowed to
+affect, and what it must not. The measured "before", on this stack:
+
+| Phase | Dependency | Before |
+| --- | --- | --- |
+| 1 | Redis **restarted** | `POST /tickets` → **500 `NOSCRIPT`**, permanently; the matching loop stopped with it. Both services had to be restarted because a cache was. |
+| 2 | Redis **down** | `500 {"error":"Connection refused: localhost/127.0.0.1:6379"}` — the wrong status *and* the internal address; `/health` → **200 UP** |
+| 3 | Postgres **down** | the confirmation answered "fine": 2 tickets **`CONFIRMED`**, **0 rows**, the pending match swept, the tickets stranded forever; `/history` → 500 with the driver's message |
+| 4 | Kafka **down** | (pre-W14) published on the confirmation path — a broker outage and a confirmation were the same failure |
+| 5 | Schema Registry **down** | never exercised |
+
+What the scenario asserts now:
+
+1. **Redis restart.** An enqueue before and after the restart (`201` both), and — because a restart
+   also kills the **Pub/Sub connections**, which is where the confirmations arrive — a full match
+   driven to `CONFIRMED` after the restart, **with both service PIDs unchanged**. The scripts reload
+   (`RedisScript`) and the subscription is rebuilt (`RedisSubscriber`).
+2. **Redis down.** 20 arrivals → **20 × 503**, p50 **8.7 ms** / p99 **15.1 ms** / max **67.7 ms**
+   (a refusal, not a wait), `Retry-After: 1`, a body naming `redis` and carrying **no internal
+   address**; `GET /health` stays **200** while `GET /health/ready` turns **503 naming redis**; the
+   refusals are counted in `matchmaking_dependency_errors_total{dependency="redis"}` (**+21**); the
+   first arrival after Redis returns is admitted.
+3. **Postgres down around a confirmation.** The match is formed and both tickets are `CONFIRMING`
+   *before* the database is stopped; both confirmations are published and the engine **claims the
+   match** (the assertion that the confirmation actually arrived); then: **no ticket reaches
+   `CONFIRMED`, no row exists**, the pending match is still there. When Postgres returns, the same
+   confirmation is **written** (the retry the gate already had) and only then do the tickets reach
+   `CONFIRMED`. `/history` is a **503** that names the dependency and leaks no address.
+4. **Kafka down.** The match is written in Postgres, the ticket is `CONFIRMED`, and the event sits
+   `PENDING` in the outbox — a broker is not the source of truth. When the broker returns the event
+   is published (**15 s**, the relay's backoff), **nothing parked, nothing duplicated**.
+5. **Schema Registry down at engine start.** A fresh engine starts (the schema id is resolved at
+   publish time, not at boot), the match is still written, the event waits in the outbox and is
+   published when the registry returns (**6 s**).
+
+Result of the run behind this section: **45 passed, 0 failed**. The first run of the same script was
+**33 passed, 7 failed** — all seven caused by the dead subscription (phases 3 and 4) or by the
+`500`/`503` detection, which is what turned a scenario into the evidence for two defects.
+
+W18 touches code the earlier scenarios exercise, so they were re-run green afterwards: E2E
+**52/52**, SLOs **36/36**, metrics **35/35**, backpressure **35/35**, dead letter **38/38**,
+outbox **14/14**, queue reaper **10/10** — and the full suite, **162 tests, 0 failures**. Four of
+those scenarios needed a fix of their own to get there (they were answering about the shared test
+state instead of about the system); each one is documented where it lives (`requests/kafka` for the
+two scans, `requests/kafka/verify_outbox.sh` for boot-vs-drain, `requests/engine` for the ghost race,
+`requests/observability` for the burns).
+
+The two traps this scenario paid for are worth more than the checks: **`flushall` does not clear the
+script cache** (only `SCRIPT FLUSH` or a server restart does, so the phase restarts Redis), and **a
+Redis restart silently kills the subscriptions** — the first run of this scenario had phases 3 and 4
+fail for a reason that was not theirs: the engine had received no confirmation since phase 1, every
+match dissolved at its deadline, and both processes looked healthy. That is the class of failure the
+sprint exists for, found by running the thing (ADR 0024, `MelhoriasFutura.md` item 7).
 
 ## Typical flow
 
@@ -527,12 +695,22 @@ directory — which is why the scenario asserts the groups exist and checks thei
    refuses what the registry accepts (renumbering, removal without `reserved`, rename)
 9. Publisher durability (W14): `bash requests/kafka/verify_outbox.sh` — a row with no engine
    running is still published after the restart, and a poison row is parked instead of stalling
-8. Consumers (W13): start `match-orchestrator`, confirm a match (E2E S11) and watch the
+10. Consumers (W13): start `match-orchestrator`, confirm a match (E2E S11) and watch the
    projection row appear; then `requests/kafka/verify_idempotent_consumer.sh` to rewind
    the group and prove a full replay applies nothing twice
-9. Failure paths (W13): `requests/kafka/verify_dlq.sh` produces a poison record and a
+11. Failure paths (W13): `requests/kafka/verify_dlq.sh` produces a poison record and a
    conflicting effect, and proves that both end on the dead letter topic with the offset
    committed instead of stalling the partition
-10. KPIs (W15): `docker compose up -d prometheus grafana`, start both services with the
+12. KPIs (W15): `docker compose up -d prometheus grafana`, start both services with the
     metrics ports, `bash requests/observability/check_metrics.sh` (Prometheus:
     http://localhost:9095, Grafana: http://localhost:3000 → folder *Matchmaking*)
+13. SLOs (W16): `bash requests/observability/check_slos.sh` — the rules are the repository's,
+    the ratios match a hand count, and each alert expression is alive
+14. Backpressure (W17): `bash requests/backpressure/verify_load_shedding.sh` — the rate limiter
+    refuses a burst with `Retry-After`, the queue cap refuses at exactly its capacity, and a
+    3 s-slow Postgres is asked to hold at most `DB_MAX_IN_FLIGHT` transactions at a time while
+    every confirmed match is still written
+15. Degradation (W18): `bash requests/resilience/verify_degradation.sh` — five phases stop and
+    start Redis (restart and outage), Postgres, Kafka and the Schema Registry, and assert what
+    each absence may and may not affect; `GET /health/ready` is the probe to route on (see the
+    matrix below)

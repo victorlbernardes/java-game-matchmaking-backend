@@ -62,9 +62,10 @@ class StaleRosterTest {
         Redis redis = Redis.createClient(vertx, new RedisOptions().setConnectionString(REDIS_URI));
         try {
             clean(redis);
-            MatchmakingEngineApplication.PAIR_SCRIPT_SHA = MatchmakingEngineApplication.loadPairScript(redis)
+            MatchmakingEngineApplication.PAIR_SCRIPT = MatchmakingEngineApplication.pairScript(redis);
+            String pairScriptSha = MatchmakingEngineApplication.PAIR_SCRIPT.load()
                     .toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
-            assertNotNull(MatchmakingEngineApplication.PAIR_SCRIPT_SHA, "pair.lua must load");
+            assertNotNull(pairScriptSha, "pair.lua must load");
 
             TicketRepository tickets = new RedisTicketRepository(redis);
             PendingMatchStore pending = new RedisPendingMatchStore(redis);

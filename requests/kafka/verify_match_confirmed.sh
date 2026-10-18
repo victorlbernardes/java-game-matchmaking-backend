@@ -17,9 +17,17 @@
 # the same thing at the tool level: it steps over the records it cannot read, counts
 # them, and still requires that the record it was asked about is there and decodes.
 #
+# The topic is shared and only grows (every load run appends; W16-W17 left ~18k records),
+# and one chunk read is a `docker exec` that starts a JVM, so the scan starts near the end
+# of the log: the last SCAN_RECORDS (default 2000). SCAN_RECORDS=0 examines the whole log,
+# which is what the poison-record accounting of the W13 scenario wants. The script prints
+# the window it scanned and the log's end offset, so a check never claims to have read
+# more than it did.
+#
 # Usage:
 #   requests/kafka/verify_match_confirmed.sh                 # any confirmed match
 #   requests/kafka/verify_match_confirmed.sh match-551dc626  # one specific match
+#   SCAN_RECORDS=0 requests/kafka/verify_match_confirmed.sh   # the whole log
 #
 # Exit code: 0 when the subject is registered, at least one record decodes, and the
 # requested match (when one was named) is on the log.
@@ -39,6 +47,12 @@ SUBJECT="${TOPIC}-value"
 # quickly. --timeout-ms acts as a quiet window, so this never hangs.
 MAX_MESSAGES="${MAX_MESSAGES:-500}"
 QUIET_WINDOW_MS="${QUIET_WINDOW_MS:-4000}"
+# How much of the log to examine, counted back from the end. A shared test topic grows with
+# every load run - the W16/W17 load scenarios left 18k records on it - and each chunk is a
+# `docker exec` that starts a JVM (~8 s), so scanning all of it turns a 30 s check into
+# minutes. The records of interest are always the recent ones; `SCAN_RECORDS=0` examines the
+# whole log, which is what the dead-letter accounting wants after poison records are placed.
+SCAN_RECORDS="${SCAN_RECORDS:-2000}"
 # The topic is created by the broker with its default single partition; reading it
 # with an explicit offset assignment skips the consumer-group join (several seconds
 # per call) that a subscribe would pay.
@@ -57,14 +71,14 @@ versions="$(curl -fsS --max-time 5 "${REGISTRY_URL}/subjects/${SUBJECT}/versions
 python3 - "${EXPECTED_MATCH_ID}" "${SUBJECT}" "${versions}" \
     "${KAFKA_CONTAINER}" "${REGISTRY_CONTAINER}" "${TOPIC}" "${PARTITION}" \
     "${BROKER_IN_CONTAINER}" "${BROKER_FOR_REGISTRY}" "${REGISTRY_IN_CONTAINER}" \
-    "${MAX_MESSAGES}" "${QUIET_WINDOW_MS}" <<'PY'
+    "${MAX_MESSAGES}" "${QUIET_WINDOW_MS}" "${SCAN_RECORDS}" <<'PY'
 import json
 import re
 import subprocess
 import sys
 
 (expected_match_id, subject, versions, kafka, registry, topic, partition, broker,
- registry_broker, registry_url, max_messages, quiet_window_ms) = sys.argv[1:13]
+ registry_broker, registry_url, max_messages, quiet_window_ms, scan_records) = sys.argv[1:14]
 
 failures = []
 MAX_READS = 200
@@ -127,9 +141,12 @@ def skill_at_match(player):
 
 
 end = log_end_offset()
+scan_from = 0
+if int(scan_records) > 0:
+    scan_from = max(0, end - int(scan_records))
 records = []
 undecodable = 0
-offset = 0
+offset = scan_from
 reads = 0
 while offset < end and reads < MAX_READS:
     reads += 1
@@ -146,17 +163,23 @@ check("records decode as MatchConfirmed", bool(records), f"{len(records)} record
 if undecodable:
     print(f"NOTE: {undecodable} record(s) on the topic do not decode - stepped over "
           f"(the dead letter queue covers them: docs/adr/0019-dlq-retry.md)")
-check("every record on the partition was decoded or accounted for",
-      len(records) + undecodable == end,
-      f"decoded={len(records)} undecodable={undecodable} records={end}")
+scanned = end - scan_from
+check("every record in the scanned window was decoded or accounted for",
+      len(records) + undecodable == scanned,
+      f"decoded={len(records)} undecodable={undecodable} scanned={scanned} log_end={end}")
+if scan_from:
+    print(f"NOTE: scanned offsets {scan_from}..{end}; the {scan_from} earlier record(s) were not "
+          f"examined (SCAN_RECORDS={scan_records}; SCAN_RECORDS=0 scans the whole log)")
 print(f"DECODED_RECORDS={len(records)}")
 print(f"UNDECODABLE_RECORDS={undecodable}")
+print(f"SCANNED_FROM={scan_from}")
+print(f"LOG_END_OFFSET={end}")
 
 selected = records
 if expected_match_id:
     selected = [record for record in records if record[2].get("matchId") == expected_match_id]
     check(f"record for matchId={expected_match_id} is on the log", bool(selected),
-          "found=" + str([record[2].get("matchId") for record in records]))
+          "found=" + str([record[2].get("matchId") for record in records][-5:]) + f" (of {len(records)})")
 
 for create_time_ms, _, event in selected:
     match_id = event.get("matchId", "?")

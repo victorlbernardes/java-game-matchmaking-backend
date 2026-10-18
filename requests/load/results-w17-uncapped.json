@@ -1,0 +1,198 @@
+{
+  "label": "w17-uncapped",
+  "players": 4000,
+  "concurrency": 192,
+  "mode": "1v1",
+  "region": "NA",
+  "skill": 14,
+  "logins": {
+    "count": 4000,
+    "seconds": 15.86,
+    "per_second": 252.2
+  },
+  "enqueue": {
+    "count": 4000,
+    "seconds": 18.83,
+    "per_second": 212.4,
+    "p50_ms": 869.3,
+    "p95_ms": 1159.6,
+    "p99_ms": 1263.5,
+    "max_ms": 1369.3
+  },
+  "shed": {
+    "count": 0,
+    "rate_limited": 0,
+    "capacity": null,
+    "p50_ms": null,
+    "p95_ms": null,
+    "p99_ms": null,
+    "max_ms": null
+  },
+  "drain": {
+    "peak_depth": 2182,
+    "leftover": 0,
+    "seconds": 19.47,
+    "completed": true,
+    "players_per_second": 112.1,
+    "matches_per_second": 56.04,
+    "peak_players_per_second": 141.0,
+    "observed_players_per_second": 118.2,
+    "observed_matches_per_second": 59.1
+  },
+  "wait": {
+    "p50_s": 11.107262644458332,
+    "p95_s": 16.860918025559496,
+    "p99_s": 20.861269723214285,
+    "queued_players_per_second_effective": 112.1
+  },
+  "matches": {
+    "enqueued_metric": 0.0,
+    "formed": 2000.0,
+    "confirmed": 2000.0,
+    "dissolved_timeout": 0.0,
+    "confirm_rate": 1.0,
+    "confirmed_by_client": 2000,
+    "notifications_received": 8000,
+    "pending_notifications_received": 4000,
+    "confirmations_sent": 4000
+  },
+  "resources": {
+    "engine_cpu_peak": 0.1963943841735801,
+    "system_cpu_peak": 0.938953488372093,
+    "heap_used_peak_mb": 76.9,
+    "redis_ops_peak": 2652,
+    "redis_memory_mb": 3.72,
+    "postgres_tx_in_run": 12556,
+    "postgres_tx_per_second": 191.1
+  },
+  "outbox": {
+    "publish_lag_s": 0.0,
+    "oldest_pending_s": 0.0
+  },
+  "events": {
+    "matches_rows": 2000,
+    "events": 2000,
+    "distinct_matches": 2000,
+    "duplicate_events": 0
+  },
+  "errors": [],
+  "samples": [
+    {
+      "t": 0.43,
+      "depth": 2182,
+      "oldest_wait_s": 10.4,
+      "engine_cpu": 0.04318509295916512,
+      "system_cpu": 0.938953488372093,
+      "heap_mb": 56.83586883544922,
+      "redis_ops": 1763,
+      "formed": 5668.0,
+      "confirmed": 5668.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 18.0
+    },
+    {
+      "t": 2.69,
+      "depth": 1960,
+      "oldest_wait_s": 11.7,
+      "engine_cpu": 0.05219883850818654,
+      "system_cpu": 0.9100499722376457,
+      "heap_mb": 53.883628845214844,
+      "redis_ops": 2490,
+      "formed": 5780.0,
+      "confirmed": 5772.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 24.0
+    },
+    {
+      "t": 5.03,
+      "depth": 1636,
+      "oldest_wait_s": 12.7,
+      "engine_cpu": 0.1963943841735801,
+      "system_cpu": 0.9259259259259259,
+      "heap_mb": 76.93321990966797,
+      "redis_ops": 1872,
+      "formed": 5943.0,
+      "confirmed": 5936.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 37.0
+    },
+    {
+      "t": 7.38,
+      "depth": 1344,
+      "oldest_wait_s": 13.5,
+      "engine_cpu": 0.08250107763394181,
+      "system_cpu": 0.8776709401709402,
+      "heap_mb": 45.921974182128906,
+      "redis_ops": 2652,
+      "formed": 6090.0,
+      "confirmed": 6084.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 0.0
+    },
+    {
+      "t": 9.69,
+      "depth": 1018,
+      "oldest_wait_s": 14.4,
+      "engine_cpu": 0.11799281496763178,
+      "system_cpu": 0.9226608977825852,
+      "heap_mb": 67.93720245361328,
+      "redis_ops": 2607,
+      "formed": 6252.0,
+      "confirmed": 6249.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 23.0
+    },
+    {
+      "t": 11.99,
+      "depth": 694,
+      "oldest_wait_s": 15.4,
+      "engine_cpu": 0.0979561819139434,
+      "system_cpu": 0.9217665615141956,
+      "heap_mb": 43.89332580566406,
+      "redis_ops": 2114,
+      "formed": 6414.0,
+      "confirmed": 6409.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 19.0
+    },
+    {
+      "t": 14.58,
+      "depth": 370,
+      "oldest_wait_s": 16.6,
+      "engine_cpu": 0.06638859118075872,
+      "system_cpu": 0.9202898550724637,
+      "heap_mb": 64.9323501586914,
+      "redis_ops": 2193,
+      "formed": 6575.0,
+      "confirmed": 6570.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 25.0
+    },
+    {
+      "t": 16.92,
+      "depth": 48,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.08462962067592283,
+      "system_cpu": 0.904359141184125,
+      "heap_mb": 39.95185089111328,
+      "redis_ops": 2478,
+      "formed": 6736.0,
+      "confirmed": 6731.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 24.0
+    },
+    {
+      "t": 18.89,
+      "depth": 0,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.016698604688576285,
+      "system_cpu": 0.794855305466238,
+      "heap_mb": 53.95185089111328,
+      "redis_ops": 35,
+      "formed": 6759.0,
+      "confirmed": 6759.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 0.0
+    }
+  ]
+}
