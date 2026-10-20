@@ -209,16 +209,16 @@ public final class MatchmakingEngineApplication {
             // The derived KPIs: the queues live in Redis, the outbox in Postgres, and both are
             // read asynchronously into gauges (never from the scrape thread).
             QueueMetricsPoller queueKpis = new QueueMetricsPoller(redis, kpis, java.time.Clock.systemUTC(),
-                    QUEUE_PARTITIONS);
+                    QUEUE_PARTITIONS, SERVED_REGIONS);
             OutboxMetricsPoller outboxKpis = new OutboxMetricsPoller(outbox, kpis);
             vertx.setPeriodic(KPI_POLL_INTERVAL_MS, id -> queueKpis.pollOnce()
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=queueKpis", err)));
             vertx.setPeriodic(KPI_POLL_INTERVAL_MS, id -> outboxKpis.pollOnce()
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=outboxKpis", err)));
 
-            LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2} pairScript={3}",
+            LOG.log(System.Logger.Level.INFO, "engine.started pairingIntervalMs={0} sweepIntervalMs={1} confirmationTimeoutS={2} regions={3} pairScript={4}",
                     String.valueOf(PAIRING_INTERVAL_MS), String.valueOf(SWEEP_INTERVAL_MS),
-                    String.valueOf(CONFIRMATION_TIMEOUT_SECONDS), sha);
+                    String.valueOf(CONFIRMATION_TIMEOUT_SECONDS), SERVED_REGIONS, sha);
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=loadPairScript", err));
     }
 
@@ -228,6 +228,16 @@ public final class MatchmakingEngineApplication {
      * written to partition 3 is invisible to an engine that reads one key.
      */
     static final int QUEUE_PARTITIONS = QueuePartitions.partitionsFromEnv();
+
+    /**
+     * The regions this deployment serves (W21, ADR 0039). Unset means every region, which is the
+     * single engine of W1-W20. A regional engine pairs only its own queues: a queue it formed a
+     * match from would be a match on a region it cannot host, and a KPI for a region it does not
+     * serve would be a zero pretending to be a measurement.
+     */
+    static final com.victor.matchmaking.domain.ticket.ServedRegions SERVED_REGIONS =
+            com.victor.matchmaking.domain.ticket.ServedRegions.parse(
+                    System.getenv(com.victor.matchmaking.domain.ticket.ServedRegions.ENV));
 
     /**
      * The queues the engine pairs from: the closed set of game modes, regions and partitions
@@ -241,6 +251,17 @@ public final class MatchmakingEngineApplication {
      */
     private static void pairAcrossQueues(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
+        pairAcrossQueues(SERVED_REGIONS, vertx, redis, tickets, pending, notifier, kpis, dbGate);
+    }
+
+    /**
+     * The same loop, over an explicit set of regions. The deployment's set is {@link #SERVED_REGIONS};
+     * the parameter exists so the property "an engine never pairs a region it does not serve" can be
+     * tested without restarting the JVM with a different environment.
+     */
+    static void pairAcrossQueues(com.victor.matchmaking.domain.ticket.ServedRegions served, Vertx vertx,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
         if (dbGate.saturated()) {
             // The database is at its write limit: forming more matches would only create more
             // confirmations it cannot take. The queue waits, and the boundary that can say no to
@@ -251,7 +272,7 @@ public final class MatchmakingEngineApplication {
             return;
         }
         for (GameMode gameMode : GameMode.values()) {
-            for (Region region : Region.values()) {
+            for (Region region : served.list()) {
                 // One (mode, region) is one logical queue, spread over its partitions. The tick
                 // reads every partition's head and merges them, so the partitions spread the
                 // storage and the writes without becoming a matching boundary (W20).

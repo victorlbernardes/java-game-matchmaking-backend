@@ -8,10 +8,13 @@ import com.victor.matchmaking.api.application.CreateTicketUseCase;
 import com.victor.matchmaking.api.application.DissolvePartyUseCase;
 import com.victor.matchmaking.api.application.GetPartyUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
+import com.victor.matchmaking.api.application.PlayerLatency;
+import com.victor.matchmaking.api.application.RegionPlacement;
 import com.victor.matchmaking.api.application.RemoveMemberUseCase;
 import com.victor.matchmaking.api.application.PartyUseCases;
 import com.victor.matchmaking.db.MatchRepository;
 import com.victor.matchmaking.domain.player.SkillProvider;
+import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.redis.PartyStore;
 import com.victor.matchmaking.redis.QueueFullException;
 import com.victor.matchmaking.redis.RateLimiter;
@@ -23,10 +26,14 @@ import com.victor.matchmaking.redis.TicketCodec;
 import com.victor.matchmaking.redis.RedisPublisher;
 import com.victor.matchmaking.metrics.MetricNames;
 
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.auth.User;
 import io.vertx.ext.auth.authentication.TokenCredentials;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.Router;
@@ -138,11 +145,25 @@ public final class HttpRoutes {
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
             MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
+                registry, rateLimiter, readiness, RegionPlacement.all(), PlayerLatency.none());
+    }
+
+    /**
+     * Main wiring plus the region placement (W21, ADR 0039): which regions this deployment serves,
+     * the operator's declared distances, and the player's measured ones. {@code all()}+{@code none()}
+     * is a deployment with no region boundary and no probes - the behaviour of W1-W20.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement,
+            PlayerLatency latency) {
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
-                new PartyUseCases(partyStore, repository, skillProvider), registry, rateLimiter, readiness);
+                new PartyUseCases(partyStore, repository, skillProvider), registry, rateLimiter, readiness,
+                placement, latency);
     }
 
     /**
@@ -159,13 +180,13 @@ public final class HttpRoutes {
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
                 new PartyUseCases(partyStore, repository, skillProvider), new SimpleMeterRegistry(), null,
-                Readiness.none());
+                Readiness.none(), RegionPlacement.all(), PlayerLatency.none());
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
             GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, PartyUseCases partyUseCases, MeterRegistry registry,
-            RateLimiter rateLimiter, Readiness readiness) {
+            RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement, PlayerLatency latency) {
 
         Router router = Router.router(vertx);
         router.route().handler(ctx -> {
@@ -180,13 +201,16 @@ public final class HttpRoutes {
         });
         router.route().handler(BodyHandler.create());
 
-        // Liveness, plus the name of the instance answering (W19, ADR 0026). With more than one
-        // instance, "it is UP" is not actionable until it can say *which* one said so - the probe
-        // that follows a socket to whatever instance holds it has to be able to tell them apart.
+        // Liveness, plus the name of the instance answering (W19, ADR 0026) and the regions it
+        // serves (W21, ADR 0039). With more than one instance, "it is UP" is not actionable until
+        // it can say *which* one said so - and with more than one region, not until it can say
+        // which regions are its own.
         router.get("/health").handler(ctx -> ctx.response()
                 .putHeader("content-type", "application/json")
                 .end(new JsonObject().put("status", "UP")
-                        .put("instance", connectionRegistry.instanceId()).encode()));
+                        .put("instance", connectionRegistry.instanceId())
+                        .put("regions", regionNames(placement.served().list()))
+                        .encode()));
 
         // Readiness, not liveness (W18, ADR 0024): whether the dependencies this instance needs
         // are answering. Measured in W18: with Redis stopped, /health said UP while every enqueue
@@ -197,6 +221,96 @@ public final class HttpRoutes {
             probed.forEach((name, up) -> checks.put(name, up ? "UP" : "DOWN"));
             respond(ctx, healthy ? 200 : 503,
                     new JsonObject().put("status", healthy ? "UP" : "DOWN").put("checks", checks));
+        }));
+
+        router.get("/v1/regions").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region home = homeRegionOf(user);
+            String playerId = user.subject();
+            // Only this deployment's regions have a store this endpoint may read: a region's
+            // measurements live in that region, like its queue (ADR 0039). The rest of the entry is
+            // the operator's declared distance, which is the same map everywhere.
+            java.util.Map<Region, Integer> measured = new java.util.concurrent.ConcurrentHashMap<>();
+            java.util.List<Future<Void>> reads = new java.util.ArrayList<>();
+            for (Region region : placement.served().list()) {
+                reads.add(latency.rtt(playerId, region)
+                        .recover(err -> {
+                            LOG.log(System.Logger.Level.WARNING,
+                                    "http.latency.unavailable player={0} region={1} reason={2}",
+                                    playerId, region, String.valueOf(err.getMessage()));
+                            return Future.succeededFuture(null);
+                        })
+                        .map(rtt -> {
+                            if (rtt != null) {
+                                measured.put(region, rtt);
+                            }
+                            return (Void) null;
+                        }));
+            }
+            Future.all(reads)
+                    .onSuccess(ignored -> respond(ctx, 200, directoryOf(home, placement, measured)))
+                    .onFailure(err -> failInternal(ctx, err));
+        }));
+
+        // The probe is the server's measurement, not the client's claim (W21, ADR 0039): the first
+        // request is stamped by this server, the second is timed against that stamp. The client can
+        // only make the number worse, never better.
+        router.get("/v1/regions/:region/ping").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region region = regionOfPath(ctx);
+            if (region == null) {
+                return;
+            }
+            if (!placement.served().contains(region)) {
+                refuseUnsupportedRegion(ctx, registry, placement, region);
+                return;
+            }
+            latency.issue(user.subject(), region)
+                    .onSuccess(probe -> respond(ctx, 201, new JsonObject()
+                            .put("nonce", probe.nonce())
+                            .put("region", region.name())))
+                    .onFailure(err -> shedUnavailable(ctx, registry,
+                            MetricNames.TAG_DEPENDENCY_REDIS, "latency probes unavailable", err));
+        }));
+
+        router.post("/v1/regions/:region/pong").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region region = regionOfPath(ctx);
+            if (region == null) {
+                return;
+            }
+            if (!placement.served().contains(region)) {
+                refuseUnsupportedRegion(ctx, registry, placement, region);
+                return;
+            }
+            String nonce = nonceOf(ctx.body() != null ? ctx.body().asJsonObject() : null);
+            if (nonce == null) {
+                fail(ctx, 400, "nonce is required");
+                return;
+            }
+            latency.complete(user.subject(), region, nonce)
+                    .onSuccess(rtt -> {
+                        if (rtt == null) {
+                            registry.counter(MetricNames.LATENCY_PROBES,
+                                    MetricNames.TAG_RESULT, MetricNames.RESULT_INVALID_NONCE).increment();
+                            respond(ctx, 422, new JsonObject()
+                                    .put("error", "invalid_nonce")
+                                    .put("region", region.name()));
+                            return;
+                        }
+                        registry.counter(MetricNames.LATENCY_PROBES,
+                                MetricNames.TAG_RESULT, MetricNames.RESULT_MEASURED).increment();
+                        DistributionSummary.builder(MetricNames.PLAYER_RTT)
+                                .tags(MetricNames.TAG_REGION, region.name())
+                                .description("Round trip from the player to the region, timed by the server")
+                                .publishPercentileHistogram()
+                                .minimumExpectedValue(1.0)
+                                .maximumExpectedValue(1000.0)
+                                .register(registry)
+                                .record(rtt);
+                        respond(ctx, 200, new JsonObject()
+                                .put("region", region.name())
+                                .put("rttMs", rtt));
+                    })
+                    .onFailure(err -> shedUnavailable(ctx, registry,
+                            MetricNames.TAG_DEPENDENCY_REDIS, "latency probes unavailable", err));
         }));
 
         router.get("/v1/ws").handler(ctx -> {
@@ -225,36 +339,15 @@ public final class HttpRoutes {
 
         router.post("/v1/matchmaking/tickets").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> withRateLimit(ctx, user.subject(), rateLimiter, registry, () -> {
+                    CreateTicketCommand command;
                     try {
-                        CreateTicketCommand command = TicketRequestParser.parseCreate(
+                        command = TicketRequestParser.parseCreate(
                                 ctx.body() != null ? ctx.body().asJsonObject() : null);
-                        createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
-                                .onSuccess(result -> {
-                                    if (!result.created()) {
-                                        respond(ctx, 200, TicketCodec.toJson(result.ticket()));
-                                        return;
-                                    }
-                                    countEnqueuedTicket(registry, result.ticket());
-                                    respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
-                                })
-                                .onFailure(err -> {
-                                    if (err instanceof QueueFullException full) {
-                                        shedQueueFull(ctx, registry, full);
-                                        return;
-                                    }
-                                    if (isDependencyUnavailable(err)) {
-                                        // The hot state is down: unavailable, not broken. A 500
-                                        // here would tell the client to give up on a request that
-                                        // works again the moment Redis is back (W18, ADR 0024).
-                                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_REDIS,
-                                                "hot state unavailable", err);
-                                        return;
-                                    }
-                                    failInternal(ctx, err);
-                                });
                     } catch (IllegalArgumentException e) {
                         fail(ctx, 400, e.getMessage());
+                        return;
                     }
+                    admitThenCreate(ctx, registry, createTicket, placement, latency, user, command);
                 })));
 
         router.get("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
@@ -343,6 +436,174 @@ public final class HttpRoutes {
                 }));
 
         return router;
+    }
+
+    /**
+     * The placement decision, then the write (W21, ADR 0039).
+     *
+     * <p>Two server-side numbers are read before a ticket can enter a queue: the deployment's served
+     * set (a region this endpoint does not own is refused, not queued for nobody) and the player's
+     * distance to the target region, which is the larger of the declared matrix and the player's
+     * own probe. The client's {@code maxLatencyMs} is the ceiling; it is never the measurement.
+     */
+    private static void admitThenCreate(RoutingContext ctx, MeterRegistry registry,
+            CreateTicketUseCase createTicket, RegionPlacement placement, PlayerLatency latency,
+            User user, CreateTicketCommand command) {
+        Region target = command.region();
+        if (!placement.served().contains(target)) {
+            refuseUnsupportedRegion(ctx, registry, placement, target);
+            return;
+        }
+        Region home = homeRegionOf(user);
+        latency.rtt(user.subject(), target)
+                .recover(err -> {
+                    // Losing the measurement must not lose the request: the declared floor is still a
+                    // server-side number, and a hot state that is really down is answered by the use
+                    // case below with the 503 the degradation matrix defines (ADR 0024).
+                    LOG.log(System.Logger.Level.WARNING,
+                            "http.latency.unavailable player={0} region={1} reason={2}",
+                            user.subject(), target, String.valueOf(err.getMessage()));
+                    return Future.succeededFuture(null);
+                })
+                .onSuccess(measured -> placement
+                        .check(target, command.maxLatencyMs(), home, measured)
+                        .ifPresentOrElse(
+                                denial -> refuseLatencyBudget(ctx, registry, denial),
+                                () -> enqueue(ctx, registry, createTicket, user, command)));
+    }
+
+    private static void enqueue(RoutingContext ctx, MeterRegistry registry, CreateTicketUseCase createTicket,
+            User user, CreateTicketCommand command) {
+        createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
+                .onSuccess(result -> {
+                    if (!result.created()) {
+                        respond(ctx, 200, TicketCodec.toJson(result.ticket()));
+                        return;
+                    }
+                    countEnqueuedTicket(registry, result.ticket());
+                    respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
+                })
+                .onFailure(err -> {
+                    if (err instanceof QueueFullException full) {
+                        shedQueueFull(ctx, registry, full);
+                        return;
+                    }
+                    if (isDependencyUnavailable(err)) {
+                        // The hot state is down: unavailable, not broken. A 500
+                        // here would tell the client to give up on a request that
+                        // works again the moment Redis is back (W18, ADR 0024).
+                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_REDIS,
+                                "hot state unavailable", err);
+                        return;
+                    }
+                    failInternal(ctx, err);
+                });
+    }
+
+    /**
+     * A region this deployment does not serve. The body lists the ones it does, so the client can
+     * re-ask the right endpoint instead of probing why.
+     */
+    private static void refuseUnsupportedRegion(RoutingContext ctx, MeterRegistry registry,
+            RegionPlacement placement, Region region) {
+        registry.counter(MetricNames.TICKETS_REJECTED,
+                MetricNames.TAG_REASON, MetricNames.REASON_REGION_UNSUPPORTED).increment();
+        LOG.log(System.Logger.Level.INFO, "http.region.refused reason=region_unsupported region={0} served={1}",
+                String.valueOf(region), placement.served());
+        respond(ctx, 422, new JsonObject()
+                .put("error", MetricNames.REASON_REGION_UNSUPPORTED)
+                .put("region", region != null ? region.name() : null)
+                .put("served", regionNames(placement.served().list())));
+    }
+
+    /**
+     * The player cannot reach the region within its own ceiling. The three numbers travel in the
+     * body - what it costs, what the operator declared and what was measured - because "too slow"
+     * without a number is not actionable for the client that has to pick the next region.
+     */
+    private static void refuseLatencyBudget(RoutingContext ctx, MeterRegistry registry,
+            RegionPlacement.Denial denial) {
+        registry.counter(MetricNames.TICKETS_REJECTED,
+                MetricNames.TAG_REASON, MetricNames.REASON_LATENCY_BUDGET).increment();
+        LOG.log(System.Logger.Level.INFO,
+                "http.region.refused reason=latency_budget region={0} rttMs={1} maxLatencyMs={2}",
+                denial.target().name(), String.valueOf(denial.rttMs()),
+                String.valueOf(denial.maxLatencyMs()));
+        respond(ctx, 422, new JsonObject()
+                .put("error", MetricNames.REASON_LATENCY_BUDGET)
+                .put("region", denial.target().name())
+                .put("rttMs", denial.rttMs())
+                .put("declaredRttMs", denial.declaredRttMs())
+                .put("measuredRttMs", denial.measuredRttMs())
+                .put("maxLatencyMs", denial.maxLatencyMs()));
+    }
+
+    /**
+     * What this endpoint knows about the regions: which ones it serves, what the operator declared
+     * between the player's home and each of them, and what the player measured here. A region this
+     * endpoint does not serve has no measurement to show - its profile lives in its own Redis, and
+     * pretending otherwise would be a number from nowhere.
+     */
+    private static JsonObject directoryOf(Region home, RegionPlacement placement,
+            java.util.Map<Region, Integer> measured) {
+        JsonArray regions = new JsonArray();
+        for (Region region : Region.values()) {
+            boolean servedHere = placement.served().contains(region);
+            Integer measuredHere = servedHere ? measured.get(region) : null;
+            regions.add(new JsonObject()
+                    .put("region", region.name())
+                    .put("served", servedHere)
+                    .put("rttMs", placement.effectiveRttMs(region, home, measuredHere))
+                    .put("declaredRttMs", placement.declaredRttMs(home, region))
+                    .put("measuredRttMs", measuredHere));
+        }
+        return new JsonObject()
+                .put("playerRegion", home != null ? home.name() : null)
+                .put("served", regionNames(placement.served().list()))
+                .put("regions", regions);
+    }
+
+    /**
+     * The account's home region, from the token's {@code region} claim (W21). It is identity, not
+     * preference: the caller cannot set it per request, which is what makes the declared distance
+     * a server-side number.
+     */
+    private static Region homeRegionOf(User user) {
+        if (user == null || user.principal() == null) {
+            return null;
+        }
+        Object claim = user.principal().getValue("region");
+        if (claim == null) {
+            return null;
+        }
+        try {
+            return Region.valueOf(String.valueOf(claim).toUpperCase(java.util.Locale.ENGLISH));
+        } catch (IllegalArgumentException unknown) {
+            return null;
+        }
+    }
+
+    private static Region regionOfPath(RoutingContext ctx) {
+        String raw = ctx.pathParam("region");
+        try {
+            return Region.valueOf(raw.toUpperCase(java.util.Locale.ENGLISH));
+        } catch (RuntimeException unknown) {
+            fail(ctx, 400, "unknown region: " + raw);
+            return null;
+        }
+    }
+
+    private static String nonceOf(JsonObject body) {
+        String nonce = body != null ? body.getString("nonce") : null;
+        return nonce != null && !nonce.isBlank() ? nonce : null;
+    }
+
+    private static JsonArray regionNames(java.util.List<Region> regions) {
+        JsonArray names = new JsonArray();
+        for (Region region : regions) {
+            names.add(region.name());
+        }
+        return names;
     }
 
     /**

@@ -27,7 +27,8 @@ public final class AuthRoutes {
         router.route().handler(BodyHandler.create());
 
         router.post("/v1/auth/login").handler(ctx -> {
-            String playerId = parsePlayerId(ctx.body() != null ? ctx.body().asJsonObject() : null);
+            JsonObject body = ctx.body() != null ? ctx.body().asJsonObject() : null;
+            String playerId = parsePlayerId(body);
             if (playerId == null) {
                 LOG.log(System.Logger.Level.WARNING, "login.rejected reason=playerId is required");
                 ctx.response().setStatusCode(400)
@@ -35,8 +36,19 @@ public final class AuthRoutes {
                         .end("{\"error\":\"playerId is required\"}");
                 return;
             }
-            SessionTokenIssuer.IssuedToken token = issuer.issue(playerId);
-            LOG.log(System.Logger.Level.INFO, "login.issued playerId={0}", playerId);
+            String regionRaw = parseRegion(body);
+            if (regionRaw == null) {
+                LOG.log(System.Logger.Level.WARNING, "login.rejected reason=unknown region playerId={0}", playerId);
+                ctx.response().setStatusCode(400)
+                        .putHeader("content-type", "application/json")
+                        .end(new JsonObject().put("error", "unknown region; known: "
+                                + java.util.List.of(com.victor.matchmaking.domain.ticket.Region.values())).encode());
+                return;
+            }
+            com.victor.matchmaking.domain.ticket.Region homeRegion =
+                    com.victor.matchmaking.domain.ticket.Region.valueOf(regionRaw);
+            SessionTokenIssuer.IssuedToken token = issuer.issue(playerId, homeRegion);
+            LOG.log(System.Logger.Level.INFO, "login.issued playerId={0} region={1}", playerId, homeRegion);
             ctx.response().putHeader("content-type", "application/json")
                     .end(new TokenResponse(token.token(), token.expiresInSeconds()).toJson().encode());
         });
@@ -54,5 +66,27 @@ public final class AuthRoutes {
         }
         String playerId = body.getString("playerId");
         return playerId != null && !playerId.isBlank() ? playerId : null;
+    }
+
+    /**
+     * The account's home region (W21, ADR 0039). Absent means {@code NA} - the stub of W2 had no
+     * region and every existing caller keeps working; present, it must name a region the domain
+     * knows, because a typo here would follow the player into every latency decision.
+     *
+     * @return the region name, or null when the body names one that does not exist
+     */
+    private static String parseRegion(JsonObject body) {
+        String raw = body != null ? body.getString("region") : null;
+        if (raw == null || raw.isBlank()) {
+            return com.victor.matchmaking.domain.ticket.Region.NA.name();
+        }
+        String normalized = raw.trim().toUpperCase(java.util.Locale.ENGLISH);
+        for (com.victor.matchmaking.domain.ticket.Region region
+                : com.victor.matchmaking.domain.ticket.Region.values()) {
+            if (region.name().equals(normalized)) {
+                return normalized;
+            }
+        }
+        return null;
     }
 }

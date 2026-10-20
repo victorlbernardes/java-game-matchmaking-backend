@@ -84,8 +84,19 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.redis.PartyStore partyStore = new com.victor.matchmaking.redis.RedisPartyStore(redis);
         com.victor.matchmaking.domain.player.SkillProvider skillProvider =
                 new com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider();
+        // The regions this deployment serves and the operator's declared distances (W21, ADR 0039).
+        // Both are read once: a region list that changes under a running process would leave tickets
+        // in queues nobody pairs, and a distance that changes per request is not a policy.
+        com.victor.matchmaking.domain.ticket.ServedRegions servedRegions =
+                com.victor.matchmaking.domain.ticket.ServedRegions.parse(
+                        System.getenv(com.victor.matchmaking.domain.ticket.ServedRegions.ENV));
+        com.victor.matchmaking.api.application.RegionPlacement placement =
+                com.victor.matchmaking.api.application.RegionPlacement.parse(servedRegions,
+                        System.getenv(com.victor.matchmaking.api.application.RegionPlacement.ENV_REGION_RTT_MS));
+        com.victor.matchmaking.api.application.PlayerLatency playerLatency =
+                new com.victor.matchmaking.api.infrastructure.RedisPlayerLatency(redis);
         Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository,
-                skillProvider, partyStore, metrics.registry(), rateLimiter, readiness);
+                skillProvider, partyStore, metrics.registry(), rateLimiter, readiness, placement, playerLatency);
 
         com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(), metricsPort)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
@@ -98,8 +109,9 @@ public final class MatchmakingApiApplication {
         server.requestHandler(router)
                 .listen(port)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
-                        "api.started port={0} instance={1} jwksUrl={2}", String.valueOf(s.actualPort()),
-                        instanceId, jwksUrl))
+                        "api.started port={0} instance={1} regions={2} declaredRtts={3} jwksUrl={4}",
+                        String.valueOf(s.actualPort()), instanceId, servedRegions,
+                        String.valueOf(placement.hasDeclaredRtts()), jwksUrl))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "api.start.failed port=" + port, err));
     }
 

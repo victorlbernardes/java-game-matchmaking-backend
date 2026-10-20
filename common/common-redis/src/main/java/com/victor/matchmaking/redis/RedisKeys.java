@@ -53,11 +53,20 @@ public final class RedisKeys {
      * has no dependency on how much else Redis is holding.
      */
     public static java.util.List<String> allQueueKeys(int partitions) {
+        return allQueueKeys(partitions, java.util.List.of(
+                com.victor.matchmaking.domain.ticket.Region.values()));
+    }
+
+    /**
+     * Every queue key that can exist for a partition count, restricted to the regions a deployment
+     * serves (W21, ADR 0039): a regional engine reads its own queues and publishes its own KPIs.
+     */
+    public static java.util.List<String> allQueueKeys(int partitions,
+            java.util.List<com.victor.matchmaking.domain.ticket.Region> regions) {
         java.util.List<String> keys = new java.util.ArrayList<>();
         for (com.victor.matchmaking.domain.ticket.GameMode gameMode
                 : com.victor.matchmaking.domain.ticket.GameMode.values()) {
-            for (com.victor.matchmaking.domain.ticket.Region region
-                    : com.victor.matchmaking.domain.ticket.Region.values()) {
+            for (com.victor.matchmaking.domain.ticket.Region region : regions) {
                 keys.addAll(queueKeys(gameMode.label(), region.name(), partitions));
             }
         }
@@ -94,6 +103,24 @@ public final class RedisKeys {
 
     public static String partyKey(String partyId) {
         return "party:" + partyId;
+    }
+
+    /**
+     * One in-flight latency probe (W21, ADR 0039): the instant the server issued it, in epoch
+     * millis, bound to the player and the region that asked. Short lived and single use - a nonce
+     * that could be answered twice would let one round trip be reported as several.
+     */
+    public static String latencyProbeKey(String nonce) {
+        return "latency-probe:" + nonce;
+    }
+
+    /**
+     * The player's measured distance to each region (W21): a hash {@code region -> rttMs}, holding
+     * the best recent sample. It lives in the Redis of the region that measured it, because a
+     * region's measurements are region-local hot state, like its queue.
+     */
+    public static String playerLatencyKey(String playerId) {
+        return "latency:" + playerId;
     }
 
     /**

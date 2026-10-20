@@ -59,6 +59,29 @@ public final class MetricNames {
     public static final String REASON_QUEUE_FULL = "queue_full";
     /** The caller exceeded its own request budget (429). */
     public static final String REASON_RATE_LIMITED = "rate_limited";
+    /** The ticket asked for a region this deployment does not serve (422, W21). */
+    public static final String REASON_REGION_UNSUPPORTED = "region_unsupported";
+    /** The player's server-side distance to the region is above its own ceiling (422, W21). */
+    public static final String REASON_LATENCY_BUDGET = "latency_budget";
+
+    // ── Regions and the distance to them (W21, ADR 0039) ────────────────────────────
+
+    /**
+     * The player's measured round trip to a region, as the server timed it (millis, in the name so
+     * no client has to guess the unit). The distribution the placement decision is made on - and,
+     * next to the declared matrix, the evidence that a region a player was moved to really costs
+     * what the model says.
+     */
+    public static final String PLAYER_RTT = "matchmaking.player.rtt.ms";
+    /**
+     * Probes per outcome: {@code measured} (a nonce came back and was timed) or
+     * {@code invalid_nonce} (unknown, expired, replayed, or another player's). A probe is a
+     * placement input, so what the server refused to measure is a number too.
+     */
+    public static final String LATENCY_PROBES = "matchmaking.latency.probes";
+    public static final String RESULT_MEASURED = "measured";
+    public static final String RESULT_INVALID_NONCE = "invalid_nonce";
+
     // ── Backpressure: what the engine does when the database is behind (W17, ADR 0022) ──
 
     /**

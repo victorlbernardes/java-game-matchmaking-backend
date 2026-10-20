@@ -2621,6 +2621,623 @@
       ]
     },
     {
+      "name": "multiregion-w21 (regions, placement and failover)",
+      "description": "Requires the two regions the W21 scenario starts: `KEEP=1 bash requests/multiregion/verify_multiregion.sh` leaves auth on 8091, the EU API on 8097 (scrape 9198), the NA API on 8096 (scrape 9196), their engines, both Redis containers and a delay proxy on 8099 in front of NA. Run the items top to bottom.",
+      "item": [
+        {
+          "name": "1. Login p1 in EU (the token carries the home region)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenRegionP1', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the token says EU', () => pm.expect(pm.environment.get('tokenRegionP1')).to.be.a('string'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login",
+              "host": [
+                "{{authBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"postman-region-p1\",\n  \"region\": \"EU\"\n}"
+            },
+            "description": "`region` is a claim the server puts in the token (default NA, unknown -> 400). The client cannot move its home region by asking at ticket time."
+          }
+        },
+        {
+          "name": "2. Login p2 in EU",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenRegionP2', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login",
+              "host": [
+                "{{authBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"postman-region-p2\",\n  \"region\": \"EU\"\n}"
+            }
+          }
+        },
+        {
+          "name": "3. Login in an unknown region (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login",
+              "host": [
+                "{{authBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"postman-region-p3\",\n  \"region\": \"MARS\"\n}"
+            }
+          }
+        },
+        {
+          "name": "4. GET /v1/regions — the directory from the EU endpoint",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the player is at home in EU', () => pm.expect(pm.response.json().playerRegion).to.eql('EU'));",
+                  "pm.test('this endpoint serves EU only', () => pm.expect(pm.response.json().served).to.eql(['EU']));",
+                  "pm.environment.set('declaredEuNa', pm.response.json().regions.find(r => r.region === 'NA').declaredRttMs);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              }
+            ],
+            "url": {
+              "raw": "{{regionEuApiBaseUrl}}/v1/regions",
+              "host": [
+                "{{regionEuApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions"
+              ]
+            },
+            "description": "Answers with the caller's home region (from the token), the regions this endpoint serves, and per region the declared distance and — only if this endpoint measured it — the player's own RTT."
+          }
+        },
+        {
+          "name": "5. GET /v1/regions/EU/ping — issue the probe (near)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('nonceEu', pm.response.json().nonce);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              }
+            ],
+            "url": {
+              "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/ping",
+              "host": [
+                "{{regionEuApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "EU",
+                "ping"
+              ]
+            },
+            "description": "Step one of the two-request probe: the server issues a nonce (30 s, single use, bound to this player and this region) and stamps the instant it was issued."
+          }
+        },
+        {
+          "name": "6. POST /v1/regions/EU/pong — press it (the server times the gap)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the region answers for itself', () => pm.expect(pm.response.json().region).to.eql('EU'));",
+                  "pm.test('a measured rtt', () => pm.expect(pm.response.json().rttMs).to.be.a('number'));",
+                  "pm.environment.set('rttEuEu', pm.response.json().rttMs);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/pong",
+              "host": [
+                "{{regionEuApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "EU",
+                "pong"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nonce\": \"{{nonceEu}}\"\n}"
+            },
+            "description": "The number is the server's: it is the gap between the two requests, not a value the client reports. The profile keeps the minimum of the samples, with a 5 min TTL."
+          }
+        },
+        {
+          "name": "7. POST /v1/regions/EU/pong — replay the same nonce (422 invalid_nonce)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 422', () => pm.response.to.have.status(422));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/pong",
+              "host": [
+                "{{regionEuApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "EU",
+                "pong"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nonce\": \"{{nonceEu}}\"\n}"
+            },
+            "description": "A nonce is consumed by the pong that matches it: one round trip cannot be reported as two measurements."
+          }
+        },
+        {
+          "name": "8. GET /v1/regions/NA/ping — measure the far region (through the delay proxy)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('nonceNa', pm.response.json().nonce);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              }
+            ],
+            "url": {
+              "raw": "{{regionProxyBaseUrl}}/v1/regions/NA/ping",
+              "host": [
+                "{{regionProxyBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "NA",
+                "ping"
+              ]
+            },
+            "description": "The proxy adds 40 ms each way (80 ms RTT). Without it, run this against the NA API directly ({{regionNaApiBaseUrl}}) and the measurement is a local one."
+          }
+        },
+        {
+          "name": "9. POST /v1/regions/NA/pong — the far measurement",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.environment.set('rttEuNa', pm.response.json().rttMs);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionProxyBaseUrl}}/v1/regions/NA/pong",
+              "host": [
+                "{{regionProxyBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "NA",
+                "pong"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nonce\": \"{{nonceNa}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "10. GET /v1/regions — the measurement is region-local",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('NA shows the measurement NA took', () => {",
+                  "  const na = pm.response.json().regions.find(r => r.region === 'NA');",
+                  "  pm.expect(na.served).to.eql(true);",
+                  "  pm.expect(na.measuredRttMs).to.be.a('number');",
+                  "});",
+                  "pm.test('the EU measurement is not visible here: it lives in the EU Redis', () => {",
+                  "  const eu = pm.response.json().regions.find(r => r.region === 'EU');",
+                  "  pm.expect(eu.served).to.eql(false);",
+                  "  pm.expect(eu.measuredRttMs).to.be.null;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              }
+            ],
+            "url": {
+              "raw": "{{regionNaApiBaseUrl}}/v1/regions",
+              "host": [
+                "{{regionNaApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions"
+              ]
+            },
+            "description": "Measurements live in the Redis of the region that took them, so an endpoint never shows another region's number as if it were its own."
+          }
+        },
+        {
+          "name": "11. GET /v1/regions/EU/ping at the NA endpoint (422 region_unsupported)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 422', () => pm.response.to.have.status(422));",
+                  "pm.test('the body names what this endpoint serves', () => pm.expect(pm.response.json().served).to.eql(['NA']));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              }
+            ],
+            "url": {
+              "raw": "{{regionNaApiBaseUrl}}/v1/regions/EU/ping",
+              "host": [
+                "{{regionNaApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "regions",
+                "EU",
+                "ping"
+              ]
+            },
+            "description": "An endpoint that measured another region would measure itself and call it the other region."
+          }
+        },
+        {
+          "name": "12. Enqueue in NA with a 60 ms budget (422 latency_budget)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 422', () => pm.response.to.have.status(422));",
+                  "pm.test('the refusal says latency_budget', () => pm.expect(pm.response.json().error).to.eql('latency_budget'));",
+                  "pm.test('and carries the three numbers', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.rttMs).to.be.a('number');",
+                  "  pm.expect(body.maxLatencyMs).to.eql(60);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionProxyBaseUrl}}/v1/matchmaking/tickets",
+              "host": [
+                "{{regionProxyBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 60\n}"
+            },
+            "description": "`rttMs` is `max(declared, measured)`: the operator's floor or the player's own path, whichever is larger. The client can choose another region with the numbers in hand."
+          }
+        },
+        {
+          "name": "13. Enqueue in NA with a 150 ms budget (201, the far region takes the player)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('the ticket was placed in NA', () => pm.expect(pm.response.json().region).to.eql('NA'));",
+                  "pm.environment.set('regionTicket', pm.response.json().ticketId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionProxyBaseUrl}}/v1/matchmaking/tickets",
+              "host": [
+                "{{regionProxyBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+            }
+          }
+        },
+        {
+          "name": "14. Enqueue in EU at the NA endpoint (422 region_unsupported)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 422', () => pm.response.to.have.status(422));",
+                  "pm.test('a 1000 ms budget does not buy a region this endpoint does not serve', () =>",
+                  "  pm.expect(pm.response.json().error).to.eql('region_unsupported'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenRegionP1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{regionNaApiBaseUrl}}/v1/matchmaking/tickets",
+              "host": [
+                "{{regionNaApiBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"EU\",\n  \"maxLatencyMs\": 1000\n}"
+            },
+            "description": "Refused whatever the budget is: the region is not a distance question here, it is a deployment this endpoint does not have."
+          }
+        },
+        {
+          "name": "15. GET /health — the instance names the region it serves",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('it serves NA', () => pm.expect(pm.response.json().regions).to.eql(['NA']));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{regionNaApiBaseUrl}}/health",
+              "host": [
+                "{{regionNaApiBaseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "infra",
       "item": [
         {

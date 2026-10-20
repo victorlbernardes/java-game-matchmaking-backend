@@ -23,6 +23,7 @@ matchmaking/
 │   └── e2e-w11/           # Full W11 party flow (create → join → enqueue → fill/cancel)
 ├── routing-w19/           # two instances: routing, presence, heartbeat re-presentation (W19)
 ├── partitioning-w20/      # queue partitions: enqueue, per-partition depth, hotspot (W20)
+├── multiregion-w21/       # regions: the directory, the ping/pong probe, the two refusals (W21)
 └── infra/
     └── schema-registry/   # GET /config, /subjects, /schemas/types (W12)
 ```
@@ -55,9 +56,13 @@ requests/
 ├── resilience/
 │   ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
 │   └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
-└── routing/
+├── routing/
 │   ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
 │   └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
+└── multiregion/
+│   ├── verify_multiregion.sh          # two regions, two Redises, placement and failover (W21)
+│   ├── multiregion_probe.py           # helper: login, probe, ticket, play a full match
+│   └── delay_proxy.py                 # helper: a TCP proxy that adds latency (the "far" region)
 ```text
 requests/partitioning/
 ├── verify_partitioning.sh             # queue: one key vs 8, the hotspot, cross-partition pairing (W20)
@@ -755,6 +760,52 @@ By hand: `redis-cli zcard queue:1v1:NA:3` per partition, `redis-cli keys 'queue:
 `curl -s localhost:9194/metrics | grep queue_` for the gauges. With the default
 `QUEUE_PARTITIONS=1` the key is still the historical `queue:1v1:NA`, and every older scenario is
 unchanged.
+
+## Regions — a failure domain per region, and distance as a number (W21)
+
+```bash
+bash requests/multiregion/verify_multiregion.sh     # 54 checks, ~6 min (ADR 0039)
+```
+
+A region used to be a **label**: a value that built a key (`queue:1v1:NA`) and a column, inside one
+Redis. W21 makes it a deployment: each region runs its own API, its own engine and its own Redis,
+while Postgres and Kafka stay shared (one durable log, one event stream). The scenario runs two
+complete regions — NA on 8096/9197 with Redis 6380, EU on 8097/9199 with Redis 6381 — plus a delay
+proxy (8099) that puts 40 ms each way in front of NA.
+
+1. **The directory, before asking.** `GET /v1/regions` answers with the caller's home region (a
+   **token claim**, not a request field), the regions this endpoint serves, and for each one the
+   declared distance and — only if this endpoint measured it — the player's own RTT. EU→NA reads
+   `declaredRttMs: 120`; `measuredRttMs` is absent until the player probes.
+2. **The probe is the server's.** `GET /v1/regions/NA/ping` → `201 {nonce}`; `POST
+   /v1/regions/NA/pong {nonce}` → `200 {region, rttMs}`. The nonce is single-use, 30 s, bound to
+   (player, region). Measured: EU→EU **10 ms** (best of three), EU→NA through the proxy **99 ms**,
+   and the placement number is `max(declared 120, measured 99) = 120`.
+3. **A region this endpoint does not serve is refused**, even with a 1000 ms budget:
+   `422 region_unsupported`, body naming `served: ["NA"]`. A replayed nonce is `422 invalid_nonce`.
+4. **A budget is a distance, not a bias.** A 60 ms budget at the 120 ms region →
+   `422 latency_budget {rttMs: 120, declaredRttMs: 120, measuredRttMs: 99, maxLatencyMs: 60}`; the
+   same player with a 30 ms budget **inside** NA (declared 25 ms) is admitted.
+5. **Inside the region vs across it.** An EU pair matched in EU in **796.9 ms** with a 14 ms RTT; the
+   same pair, failed over to NA through the proxy, matched in **983.4 ms** with a 106 ms RTT.
+6. **Isolation.** With EU's Redis stopped, EU's `/health/ready` is **503** naming `redis`, an arrival
+   is **503 `hot state unavailable`**, and NA forms and confirms a match with no error.
+7. **Returning does not match twice.** After EU's Redis restarts, EU has **0 queue keys and 0 ticket
+   keys** (the region's Redis runs with `--save '' --appendonly no`: a queue is a claim about players
+   who are queued *now*), no ticket in EU belongs to the player who left, the API never restarted,
+   and Postgres holds **exactly one match** for that player.
+8. **The scrape and the database agree with the decisions**:
+   `matchmaking_tickets_rejected_total{reason="region_unsupported"|"latency_budget"}`,
+   `matchmaking_latency_probes_total{result="measured"|"invalid_nonce"}`,
+   `matchmaking_player_rtt_ms{region}` — and the matches of both regions in one `matches` table.
+
+Ports: the scenario owns auth **8091**, APIs **8096/8097** (scrapes **9196/9198**) and engines
+**9197/9199**, and starts its own Redis containers (`w21-redis-na`, `w21-redis-eu`). It starts its
+**own** auth on purpose: a shared one may be an older build without the `region` claim, and the
+scenario would then be measuring the wrong thing. By hand: `curl -s localhost:8096/v1/regions -H
+"authorization: Bearer $TOKEN"`, `redis-cli -p 6380 keys 'latency*'`, and the collection's
+`multiregion-w21` folder. The default deployment (`SERVED_REGIONS` unset, `REGION_RTT_MS` unset) is
+the pre-W21 behaviour: one region, no constraint.
 
 ## Typical flow
 

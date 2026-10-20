@@ -38,6 +38,7 @@ public final class QueueMetricsPoller {
     private final EngineKpis kpis;
     private final Clock clock;
     private final int partitions;
+    private final com.victor.matchmaking.domain.ticket.ServedRegions served;
 
     public QueueMetricsPoller(io.vertx.redis.client.Redis redis, EngineKpis kpis, Clock clock) {
         this(redis, kpis, clock, 1);
@@ -49,10 +50,21 @@ public final class QueueMetricsPoller {
      *                   and the hotspot ratio compares the deepest partition with the mean.
      */
     public QueueMetricsPoller(io.vertx.redis.client.Redis redis, EngineKpis kpis, Clock clock, int partitions) {
+        this(redis, kpis, clock, partitions, com.victor.matchmaking.domain.ticket.ServedRegions.all());
+    }
+
+    /**
+     * @param served the regions this deployment serves (W21, ADR 0039). A regional engine publishes
+     *               its own regions only: a zero for a region it does not pair is a dashboard
+     *               saying "nobody is waiting in a queue nobody serves".
+     */
+    public QueueMetricsPoller(io.vertx.redis.client.Redis redis, EngineKpis kpis, Clock clock, int partitions,
+            com.victor.matchmaking.domain.ticket.ServedRegions served) {
         this.redis = redis;
         this.kpis = kpis;
         this.clock = clock;
         this.partitions = Math.max(1, partitions);
+        this.served = served;
     }
 
     /** One pass: read every configured queue and publish all of them. */
@@ -62,7 +74,7 @@ public final class QueueMetricsPoller {
         List<Future<Void>> reads = new ArrayList<>();
         // The keys are built, not discovered: a SCAN page used to decide which queues existed,
         // and a queue that fell on a later page was published as an empty one (W16).
-        for (String queueKey : RedisKeys.allQueueKeys(partitions)) {
+        for (String queueKey : RedisKeys.allQueueKeys(partitions, served.list())) {
             reads.add(readQueue(queueKey, depth, headQueuedAtMillis));
         }
         return Future.all(reads)
@@ -138,7 +150,7 @@ public final class QueueMetricsPoller {
     private void publish(Map<String, Long> depth, Map<String, Long> headQueuedAtMillis) {
         Instant now = clock.instant();
         for (GameMode gameMode : GameMode.values()) {
-            for (Region region : Region.values()) {
+            for (Region region : served.list()) {
                 long total = 0;
                 long deepest = 0;
                 Long oldestHead = null;
