@@ -22,6 +22,7 @@ matchmaking/
 │   ├── e2e-w5/            # Full W5 E2E flow (login ×2 → WS → pair → confirm → history)
 │   └── e2e-w11/           # Full W11 party flow (create → join → enqueue → fill/cancel)
 ├── routing-w19/           # two instances: routing, presence, heartbeat re-presentation (W19)
+├── partitioning-w20/      # queue partitions: enqueue, per-partition depth, hotspot (W20)
 └── infra/
     └── schema-registry/   # GET /config, /subjects, /schemas/types (W12)
 ```
@@ -55,9 +56,12 @@ requests/
 │   ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
 │   └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
 └── routing/
-    ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
-    └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
-```
+│   ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
+│   └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
+```text
+requests/partitioning/
+├── verify_partitioning.sh             # queue: one key vs 8, the hotspot, cross-partition pairing (W20)
+└── partition_probe.py                 # helper: arrivals per partition, the scrape, the cross pairing
 
 ## Party flow (W11)
 
@@ -717,6 +721,41 @@ Two port traps, paid for here: the Schema Registry already holds host **8082** a
 the second instance uses **8092/8093** and its scrapes **9192/9193**. The script frees both ports
 before starting and kills only the instances it started (the 8080 API is untouched).
 
+## Partitioning — one queue is one key (W20)
+
+```bash
+bash requests/partitioning/verify_partitioning.sh   # 27 checks, ~4 min (ADR 0027/0028)
+```
+
+A queue is `queue:{mode}:{region}`: one key, one Redis slot, one shard. Every arrival (`ZADD`) and
+every pairing read (`ZRANGE`) of that (mode, region) lands on it, and in a Redis Cluster that key is
+one shard no matter how many nodes are added. W20 gives the queue a **partition key**
+(`QUEUE_PARTITIONS`, default 1) and makes the distribution visible. The scenario measures the same
+2000 arrivals in both layouts, then proves that a partition is not a matching boundary.
+
+1. **Before: one key.** 2000 arrivals → `{queue:1v1:NA: 2000}`, 100 % of the queue on one key —
+   against an 8-way target that is a hotspot ratio of **8.0**.
+2. **After: 8 keys.** `{0:246, 1:243, 2:256, 3:232, 4:239, 5:239, 6:273, 7:272}`, sum **2000**,
+   deepest **13.65 %** of the queue, hotspot **1.092**. The key is the jump consistent hash of the
+   enqueue key (`partyId` for a party, `playerId` otherwise), so a party stays whole in one
+   partition.
+3. **The scrape agrees with Redis.** Three 5v5 players (a queue that cannot pair, it needs ten) in
+   partitions 4 and 5: `matchmaking_queue_partition_depth{mode="5v5",region="NA",partition=…}` =
+   `[0,0,0,0,2,1,0,0]`, `matchmaking_queue_depth` **3**, `matchmaking_queue_hotspot_ratio` **5.333**
+   = 2 ÷ (3/8), and the series sum to the depth.
+4. **Two players in different partitions still pair** — the engine reads every partition's head,
+   merges by wait score and calls `pair.lua` with all partitions as `KEYS`. Measured: partitions 3
+   and 5 paired in **0.2 s**, both members left their own partition in the same script call.
+5. **The cap is not multiplied**: `QUEUE_MAX_DEPTH=100`, `P=8` → 12 per partition → 96 admitted,
+   104 refused, depth 96 ≤ 100 (the sum never exceeds the configured depth).
+
+Ports: the scenario owns API **8094** (scrape 9195) and engine **9194**, and stops any engine it
+finds before counting the queue — an engine left by a previous run pairs the arrivals mid-count.
+By hand: `redis-cli zcard queue:1v1:NA:3` per partition, `redis-cli keys 'queue:1v1:NA*'`, and
+`curl -s localhost:9194/metrics | grep queue_` for the gauges. With the default
+`QUEUE_PARTITIONS=1` the key is still the historical `queue:1v1:NA`, and every older scenario is
+unchanged.
+
 ## Typical flow
 
 1. `auth-service` → `POST /v1/auth/login` (captures `token`)
@@ -749,7 +788,10 @@ before starting and kills only the instances it started (the 8080 API is untouch
     refuses a burst with `Retry-After`, the queue cap refuses at exactly its capacity, and a
     3 s-slow Postgres is asked to hold at most `DB_MAX_IN_FLIGHT` transactions at a time while
     every confirmed match is still written
-15. Degradation (W18): `bash requests/resilience/verify_degradation.sh` — five phases stop and
+15. Regions (W21): `bash requests/multiregion/verify_multiregion.sh` — two complete regions, the
+    directory and the ping/pong probe, a budget refused with its numbers, one region's Redis dying
+    while the other keeps serving, and the returning region not matching its failed-over player twice
+16. Degradation (W18): `bash requests/resilience/verify_degradation.sh` — five phases stop and
     start Redis (restart and outage), Postgres, Kafka and the Schema Registry, and assert what
     each absence may and may not affect; `GET /health/ready` is the probe to route on (see the
     matrix below)

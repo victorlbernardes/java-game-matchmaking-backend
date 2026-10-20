@@ -26,6 +26,7 @@ public final class RedisTicketRepository implements TicketRepository {
 
     private final Redis client;
     private final int queueMaxDepth;
+    private final int partitions;
     private final RedisScript createScript;
 
     public RedisTicketRepository(Redis client) {
@@ -37,8 +38,19 @@ public final class RedisTicketRepository implements TicketRepository {
      *                      ({@link #UNBOUNDED_QUEUE} to disable)
      */
     public RedisTicketRepository(Redis client, int queueMaxDepth) {
+        this(client, queueMaxDepth, QueuePartitions.DEFAULT_PARTITIONS);
+    }
+
+    /**
+     * @param partitions how many keys a (mode, region) queue is spread over (W20, ADR 0028);
+     *                   {@code 1} is the historical single key. Every service that writes or reads
+     *                   the queue must use the same value — an arrival written to partition 3 is
+     *                   invisible to an engine that reads one key.
+     */
+    public RedisTicketRepository(Redis client, int queueMaxDepth, int partitions) {
         this.client = client;
         this.queueMaxDepth = queueMaxDepth;
+        this.partitions = Math.max(1, partitions);
         this.createScript = new RedisScript(client, "/create.lua");
     }
 
@@ -71,23 +83,46 @@ public final class RedisTicketRepository implements TicketRepository {
                         .arg(queuedAt)
                         .arg(String.valueOf(TICKET_TTL_SECONDS))
                         .arg(String.valueOf(TICKET_TTL_SECONDS))
-                        .arg(String.valueOf(queueMaxDepth)))
+                        .arg(String.valueOf(capacityPerPartition())))
                 .map(resp -> {
                     // {status, payload}: the status is a word, the payload is an id or a depth.
                     // A ticket id is not a good place to carry state - the reason exists (Regra 11).
                     String status = resp.get(0).toString();
                     String payload = resp.get(1).toString();
                     if ("FULL".equals(status)) {
-                        throw new QueueFullException(queueKey(ticket), Long.parseLong(payload), queueMaxDepth);
+                        throw new QueueFullException(queueKey(ticket), Long.parseLong(payload), capacityPerPartition());
                     }
                     return payload;
                 });
     }
 
+    /**
+     * The cap divided by the partitions, floored: the sum of the partitions' caps is then
+     * {@code <= queueMaxDepth}, so partitioning cannot raise the total the queue holds. With one
+     * partition this is the historical cap exactly; with {@code C < P} it degenerates to one per
+     * partition (the smallest cap that still refuses something).
+     */
+    private int capacityPerPartition() {
+        if (queueMaxDepth <= 0) {
+            return UNBOUNDED_QUEUE;
+        }
+        return Math.max(1, queueMaxDepth / partitions);
+    }
+
     @Override
     public Future<Long> queueDepth(String gameModeLabel, String regionName) {
-        return client.send(Request.cmd(Command.ZCARD).arg(RedisKeys.queueKey(gameModeLabel, regionName)))
-                .map(response -> response != null ? response.toLong() : 0L);
+        List<Future<Response>> reads = new ArrayList<>();
+        for (String key : RedisKeys.queueKeys(gameModeLabel, regionName, partitions)) {
+            reads.add(client.send(Request.cmd(Command.ZCARD).arg(key)));
+        }
+        return Future.all(reads).map(ignored -> {
+            long total = 0;
+            for (int i = 0; i < reads.size(); i++) {
+                Response response = reads.get(i).result();
+                total += response != null ? response.toLong() : 0L;
+            }
+            return total;
+        });
     }
 
     @Override
@@ -184,7 +219,11 @@ public final class RedisTicketRepository implements TicketRepository {
         return RedisKeys.idempotencyKey(key);
     }
 
-    private static String queueKey(MatchmakingTicket ticket) {
-        return RedisKeys.queueKey(ticket.gameMode().label(), ticket.region().name());
+    private String queueKey(MatchmakingTicket ticket) {
+        String enqueueKey = ticket.partyId() != null && !ticket.partyId().isBlank()
+                ? ticket.partyId()
+                : ticket.playerId();
+        int partition = QueuePartitions.partitionOf(enqueueKey, partitions);
+        return RedisKeys.queueKey(ticket.gameMode().label(), ticket.region().name(), partition, partitions);
     }
 }

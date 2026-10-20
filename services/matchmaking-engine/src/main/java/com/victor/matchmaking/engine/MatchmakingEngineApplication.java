@@ -2,6 +2,7 @@ package com.victor.matchmaking.engine;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -9,6 +10,7 @@ import java.util.UUID;
 
 import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
+import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.domain.ticket.TicketState;
 import com.victor.matchmaking.domain.ticket.TicketStateMachine;
 import com.victor.matchmaking.engine.application.FillPolicy;
@@ -27,6 +29,7 @@ import com.victor.matchmaking.engine.infrastructure.RedisPendingMatchStore;
 import com.victor.matchmaking.engine.infrastructure.WriteGate;
 import com.victor.matchmaking.redis.Envelope;
 import com.victor.matchmaking.redis.message.Payloads;
+import com.victor.matchmaking.redis.QueuePartitions;
 import com.victor.matchmaking.redis.RedisKeys;
 import com.victor.matchmaking.redis.RedisScanner;
 import com.victor.matchmaking.redis.RedisPlayerNotifier;
@@ -42,6 +45,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.redis.client.Command;
 import io.vertx.redis.client.Request;
 import io.vertx.redis.client.Response;
+import io.vertx.redis.client.ResponseType;
 
 /** Matchmaking worker: pairs queue heads, tracks confirmations, dissolves on decline/timeout. */
 public final class MatchmakingEngineApplication {
@@ -158,7 +162,8 @@ public final class MatchmakingEngineApplication {
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
         io.vertx.redis.client.Redis redis = io.vertx.redis.client.Redis.createClient(vertx,
                 com.victor.matchmaking.redis.RedisClients.options(redisUri));
-        TicketRepository tickets = new RedisTicketRepository(redis);
+        TicketRepository tickets = new RedisTicketRepository(redis, RedisTicketRepository.UNBOUNDED_QUEUE,
+                QUEUE_PARTITIONS);
         PendingMatchStore pending = new RedisPendingMatchStore(redis);
         RedisPublisher publisher = new RedisPublisher(redis);
         RedisPlayerNotifier notifier = new RedisPlayerNotifier(publisher);
@@ -203,7 +208,8 @@ public final class MatchmakingEngineApplication {
 
             // The derived KPIs: the queues live in Redis, the outbox in Postgres, and both are
             // read asynchronously into gauges (never from the scrape thread).
-            QueueMetricsPoller queueKpis = new QueueMetricsPoller(redis, kpis, java.time.Clock.systemUTC());
+            QueueMetricsPoller queueKpis = new QueueMetricsPoller(redis, kpis, java.time.Clock.systemUTC(),
+                    QUEUE_PARTITIONS);
             OutboxMetricsPoller outboxKpis = new OutboxMetricsPoller(outbox, kpis);
             vertx.setPeriodic(KPI_POLL_INTERVAL_MS, id -> queueKpis.pollOnce()
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=queueKpis", err)));
@@ -217,8 +223,15 @@ public final class MatchmakingEngineApplication {
     }
 
     /**
-     * Every queue the engine can pair from, from the closed set of game modes and regions
-     * ({@link RedisKeys#allQueueKeys()}).
+     * How many keys a (mode, region) queue is spread over (W20, ADR 0028). {@code 1} keeps the
+     * historical single key; the API must be started with the same value, because an arrival
+     * written to partition 3 is invisible to an engine that reads one key.
+     */
+    static final int QUEUE_PARTITIONS = QueuePartitions.partitionsFromEnv();
+
+    /**
+     * The queues the engine pairs from: the closed set of game modes, regions and partitions
+     * ({@link RedisKeys#allQueueKeys(int)}).
      *
      * <p>Why this replaced {@code SCAN}: the pairing used to ask Redis for one {@code SCAN} page
      * and ignore the cursor, so with a few hundred keys the answer was an empty page and the
@@ -226,10 +239,6 @@ public final class MatchmakingEngineApplication {
      * returned, the queue on page 6 of 39). Building the names is exact, and an empty queue
      * costs one trivial {@code ZRANGE}.
      */
-    static List<String> queueKeys() {
-        return RedisKeys.allQueueKeys();
-    }
-
     private static void pairAcrossQueues(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
         if (dbGate.saturated()) {
@@ -241,8 +250,14 @@ public final class MatchmakingEngineApplication {
                     String.valueOf(dbGate.inFlight()), String.valueOf(dbGate.limit()));
             return;
         }
-        for (String queueKey : queueKeys()) {
-            tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis, dbGate);
+        for (GameMode gameMode : GameMode.values()) {
+            for (Region region : Region.values()) {
+                // One (mode, region) is one logical queue, spread over its partitions. The tick
+                // reads every partition's head and merges them, so the partitions spread the
+                // storage and the writes without becoming a matching boundary (W20).
+                pairBatch(RedisKeys.queueKeys(gameMode.label(), region.name(), QUEUE_PARTITIONS), gameMode,
+                        redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true, dbGate);
+            }
         }
     }
 
@@ -251,22 +266,31 @@ public final class MatchmakingEngineApplication {
         tryPairFromQueue(queueKey, redis, tickets, pending, notifier, kpis, WriteGate.unbounded());
     }
 
+    /** One queue key (a single partition, or the only key when unpartitioned) on its own. */
     static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
-        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true, dbGate);
+        GameMode gameMode = gameModeOfQueueKey(queueKey);
+        if (gameMode == null) {
+            return;
+        }
+        pairBatch(List.of(queueKey), gameMode, redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true,
+                dbGate);
     }
 
     /**
-     * Pairs from one queue until the queue stops giving (no roster fits the head, or another
-     * worker took it) or this tick's budget is spent.
+     * Pairs from one logical queue (all its partitions) until it stops giving (no roster fits the
+     * head, or another worker took it) or this tick's budget is spent.
      *
+     * @param queueKeys    the partitions of one (mode, region); every head is read and merged, so
+     *                     a roster may span partitions
      * @param budget       matches still allowed in this tick; keeps a burst from monopolizing
      *                     the event loop while letting a queue drain at Redis speed
      * @param mayLookAgain false on the pass that follows a reap, so a queue made only of
      *                     ghosts cannot make this tick loop
      * @param dbGate       refuses to form a match while the database is at its write limit
      */
-    private static void pairBatch(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+    private static void pairBatch(List<String> queueKeys, GameMode gameMode,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, int budget,
             boolean mayLookAgain, WriteGate dbGate) {
         if (budget <= 0) {
@@ -275,21 +299,18 @@ public final class MatchmakingEngineApplication {
         if (dbGate.saturated()) {
             return;
         }
-        GameMode gameMode = gameModeOfQueueKey(queueKey);
-        if (gameMode == null) {
-            return;
-        }
         int playerCount = gameMode.playersPerMatch();
-        readHead(queueKey, playerCount, redis, tickets).onSuccess(head -> {
-            if (!head.deadMembers().isEmpty()) {
-                // A ticket expires on its TTL, but a ZSET member cannot: it stays in the
-                // queue as a ghost, and read as the head it blocks every compatible player
-                // behind it - the whole mode/region stops pairing (measured in W15). Reap
-                // the head batch and look once more in the same tick, so the players behind
-                // the ghost get their turn now instead of waiting for a tick of their own.
-                reapStaleMembers(queueKey, redis, tickets).onComplete(reaped -> {
+        readHeads(queueKeys, playerCount, redis, tickets).onSuccess(head -> {
+            if (!head.deadByKey().isEmpty()) {
+                // A ticket expires on its TTL, but a ZSET member cannot: it stays in its
+                // partition as a ghost, and read as the head it blocks every compatible player
+                // behind it - the whole (mode, region) stops pairing (measured in W15). Reap a
+                // bounded batch of each partition (REAP_BATCH, not the whole queue) and look
+                // once more in the same tick, so the players behind the ghost get their turn
+                // now instead of waiting for a tick of their own.
+                reapStale(queueKeys, redis, tickets).onComplete(reaped -> {
                     if (mayLookAgain) {
-                        pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget, false, dbGate);
+                        pairBatch(queueKeys, gameMode, redis, tickets, pending, notifier, kpis, budget, false, dbGate);
                     }
                 });
                 return;
@@ -307,79 +328,140 @@ public final class MatchmakingEngineApplication {
             // Chain the next attempt on this one's completion, so the queue is read after the
             // tickets are really off it; a nil from the script means somebody else paired them,
             // and then this tick is done with the queue.
-            pair(roster, queueKey, redis, tickets, pending, notifier, kpis).onComplete(paired -> {
+            pair(roster, queueKeys, redis, tickets, pending, notifier, kpis).onComplete(paired -> {
                 if (paired.succeeded() && Boolean.TRUE.equals(paired.result())) {
-                    pairBatch(queueKey, redis, tickets, pending, notifier, kpis, budget - 1, mayLookAgain, dbGate);
+                    pairBatch(queueKeys, gameMode, redis, tickets, pending, notifier, kpis, budget - 1,
+                            mayLookAgain, dbGate);
                 }
             });
         }).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
-                "engine.error stage=readQueue queue={0}", err, queueKey));
+                "engine.error stage=readQueue queue={0}", err, queueKeys));
     }
 
     /**
-     * The head of a queue: the tickets that are still alive, in queue order, and the members
-     * whose ticket is gone.
+     * The head of a logical queue: the live tickets in queue order, and the members whose ticket
+     * is gone, grouped by the partition that holds them (W20).
      */
-    private record QueueHead(List<MatchmakingTicket> candidates, List<String> deadMembers) {
+    private record QueueHead(List<MatchmakingTicket> candidates, Map<String, List<String>> deadByKey) {
     }
 
-    /** Reads up to {@code playerCount} members of a queue and resolves their tickets. */
-    private static Future<QueueHead> readHead(String queueKey, int playerCount,
+    /** One {@code ZRANGE ... WITHSCORES} entry: the ticket, its wait score and its partition. */
+    private record ScoredMember(String ticketId, double score, String queueKey) {
+    }
+
+    /**
+     * Reads the head of every partition and merges them by score, so the result is the true head
+     * of the logical queue: a player arriving at partition 7 competes for the same pairing as one
+     * at partition 0, and the oldest ticket is still the widening reference.
+     */
+    private static Future<QueueHead> readHeads(List<String> queueKeys, int playerCount,
             io.vertx.redis.client.Redis redis, TicketRepository tickets) {
-        return redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0").arg(String.valueOf(playerCount - 1)))
-                .compose(range -> resolve(queueKey, range, tickets));
+        List<Future<List<ScoredMember>>> reads = new ArrayList<>();
+        for (String queueKey : queueKeys) {
+            reads.add(redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0")
+                            .arg(String.valueOf(playerCount - 1)).arg("WITHSCORES"))
+                    .map(range -> scoredMembers(queueKey, range)));
+        }
+        return Future.all(reads).compose(ignored -> {
+            List<ScoredMember> merged = new ArrayList<>();
+            for (Future<List<ScoredMember>> read : reads) {
+                merged.addAll(read.result());
+            }
+            merged.sort(Comparator.comparingDouble(ScoredMember::score));
+            List<ScoredMember> head = merged.size() > playerCount
+                    ? new ArrayList<>(merged.subList(0, playerCount))
+                    : merged;
+            List<Future<MatchmakingTicket>> loaded = new ArrayList<>();
+            for (ScoredMember member : head) {
+                loaded.add(tickets.findById(member.ticketId()));
+            }
+            return Future.all(loaded).map(done -> {
+                List<MatchmakingTicket> candidates = new ArrayList<>();
+                Map<String, List<String>> deadByKey = new LinkedHashMap<>();
+                for (int i = 0; i < head.size(); i++) {
+                    MatchmakingTicket ticket = loaded.get(i).result();
+                    if (ticket == null) {
+                        deadByKey.computeIfAbsent(head.get(i).queueKey(), key -> new ArrayList<>())
+                                .add(head.get(i).ticketId());
+                    } else {
+                        candidates.add(ticket);
+                    }
+                }
+                return new QueueHead(candidates, deadByKey);
+            });
+        });
     }
 
     /**
-     * Inspects the head batch of a queue and takes out the members whose ticket no longer
-     * exists. Bounded on purpose: the head batch, not the whole queue, and only when a ghost
-     * was seen - a queue of thousands of ghosts clears in a few ticks of the 500 ms loop.
+     * Splits a {@code ZRANGE ... WITHSCORES} reply into members. Two shapes are accepted, the same
+     * two the KPI poller accepts: one nested {@code [member, score]} per member (what the client
+     * hands back here) and a flat {@code [member, score, ...]}.
      */
-    private static Future<Void> reapStaleMembers(String queueKey, io.vertx.redis.client.Redis redis,
-            TicketRepository tickets) {
-        return redis.send(Request.cmd(Command.ZRANGE).arg(queueKey).arg("0")
-                        .arg(String.valueOf(REAP_BATCH - 1)))
-                .compose(range -> resolve(queueKey, range, tickets))
-                .compose(head -> {
-                    if (head.deadMembers().isEmpty()) {
-                        return Future.succeededFuture();
-                    }
-                    Request zrem = Request.cmd(Command.ZREM).arg(queueKey);
-                    for (String member : head.deadMembers()) {
-                        zrem.arg(member);
-                    }
-                    return redis.send(zrem).onSuccess(removed -> LOG.log(System.Logger.Level.INFO,
-                                    "engine.reapedStaleMembers queue={0} inspected={1} removed={2}",
-                                    queueKey, String.valueOf(head.candidates().size() + head.deadMembers().size()),
-                                    String.valueOf(removed)))
-                            .mapEmpty();
-                });
+    private static List<ScoredMember> scoredMembers(String queueKey, Response range) {
+        List<ScoredMember> members = new ArrayList<>();
+        if (range == null) {
+            return members;
+        }
+        for (int i = 0; i < range.size(); i++) {
+            Response entry = range.get(i);
+            String ticketId;
+            double score;
+            try {
+                if (entry != null && entry.type() == ResponseType.MULTI && entry.size() >= 2) {
+                    ticketId = entry.get(0).toString();
+                    score = Double.parseDouble(entry.get(1).toString());
+                } else if (i + 1 < range.size()) {
+                    ticketId = entry.toString();
+                    score = Double.parseDouble(range.get(++i).toString());
+                } else {
+                    continue;
+                }
+            } catch (NumberFormatException notANumber) {
+                continue;
+            }
+            members.add(new ScoredMember(ticketId, score, queueKey));
+        }
+        return members;
     }
 
-    /** Splits the members of a {@code ZRANGE} reply into live tickets and dead members. */
-    private static Future<QueueHead> resolve(String queueKey, Response range, TicketRepository tickets) {
-        if (range == null || range.size() == 0) {
-            return Future.succeededFuture(new QueueHead(List.of(), List.of()));
+    /**
+     * Inspects a bounded batch of every partition and takes out the members whose ticket no longer
+     * exists (W16, ADR 0025). Bounded on purpose: {@link #REAP_BATCH} members per partition, so a
+     * queue of thousands of ghosts clears in a few ticks of the 500 ms loop while a healthy queue
+     * never pays for the inspection — this runs only after a ghost was seen at a head (W20: a
+     * ghost in one partition stalls only the merge that reads it, and the merge reads all of them).
+     */
+    private static Future<Void> reapStale(List<String> queueKeys,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets) {
+        return readHeads(queueKeys, (int) REAP_BATCH, redis, tickets)
+                .compose(head -> reapDead(head.deadByKey(), redis));
+    }
+
+    /**
+     * Takes the named members out of the partitions that hold them. Bounded on purpose: the head
+     * batch, not the whole queue.
+     */
+    private static Future<Void> reapDead(Map<String, List<String>> deadByKey,
+            io.vertx.redis.client.Redis redis) {
+        if (deadByKey.isEmpty()) {
+            return Future.succeededFuture();
         }
-        List<String> members = new ArrayList<>();
-        List<Future<MatchmakingTicket>> loaded = new ArrayList<>();
-        for (int i = 0; i < range.size(); i++) {
-            members.add(range.get(i).toString());
-            loaded.add(tickets.findById(members.get(i)));
-        }
-        return Future.all(loaded).map(done -> {
-            List<MatchmakingTicket> candidates = new ArrayList<>();
-            List<String> deadMembers = new ArrayList<>();
-            for (int i = 0; i < members.size(); i++) {
-                MatchmakingTicket ticket = loaded.get(i).result();
-                if (ticket == null) {
-                    deadMembers.add(members.get(i));
-                } else {
-                    candidates.add(ticket);
-                }
+        List<Future<Response>> removals = new ArrayList<>();
+        for (Map.Entry<String, List<String>> entry : deadByKey.entrySet()) {
+            Request zrem = Request.cmd(Command.ZREM).arg(entry.getKey());
+            for (String member : entry.getValue()) {
+                zrem.arg(member);
             }
-            return new QueueHead(candidates, deadMembers);
-        });
+            removals.add(redis.send(zrem));
+        }
+        return Future.all(removals).onSuccess(ignored -> {
+            long removed = 0;
+            for (Future<Response> removal : removals) {
+                removed += removal.result() != null ? removal.result().toLong() : 0L;
+            }
+            LOG.log(System.Logger.Level.INFO, "engine.reapedStaleMembers partitions={0} removed={1}",
+                    String.valueOf(deadByKey.size()), String.valueOf(removed));
+        }).mapEmpty();
     }
 
     /**
@@ -438,6 +520,12 @@ public final class MatchmakingEngineApplication {
     static Future<Boolean> pair(List<MatchmakingTicket> candidates, String queueKey,
             io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
+        return pair(candidates, List.of(queueKey), redis, tickets, pending, notifier, kpis);
+    }
+
+    static Future<Boolean> pair(List<MatchmakingTicket> candidates, List<String> queueKeys,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis) {
         String matchId = "match-" + UUID.randomUUID().toString().substring(0, TICKET_ID_LENGTH);
         List<PendingMatch.PendingPlayer> roster = new ArrayList<>();
         for (MatchmakingTicket candidate : candidates) {
@@ -457,8 +545,11 @@ public final class MatchmakingEngineApplication {
         // exactly the NOSCRIPT this class recovers from (W18, ADR 0024).
         return PAIR_SCRIPT.eval(sha -> {
             Request pairRequest = Request.cmd(Command.EVALSHA).arg(sha)
-                    .arg("1").arg(queueKey)
-                    .arg(pm.matchId()).arg(pm.toJson().encode())
+                    .arg(String.valueOf(queueKeys.size()));
+            for (String queueKey : queueKeys) {
+                pairRequest.arg(queueKey);
+            }
+            pairRequest.arg(pm.matchId()).arg(pm.toJson().encode())
                     .arg(String.valueOf(PENDING_KEY_TTL_SECONDS))
                     .arg(String.valueOf(roster.size()));
             for (MatchmakingTicket candidate : candidates) {

@@ -43,8 +43,11 @@ public final class MatchmakingApiApplication {
         String redisUri = System.getenv().getOrDefault("REDIS_URI", "redis://localhost:6379");
         Redis redis = Redis.createClient(vertx, com.victor.matchmaking.redis.RedisClients.options(redisUri));
         int queueMaxDepth = com.victor.matchmaking.api.AdmissionConfig.queueMaxDepth();
+        // The same QUEUE_PARTITIONS the engine runs with (W20, ADR 0028): both sides must agree
+        // on how many keys a queue has, or an arrival lands in a partition nobody pairs from.
+        int queuePartitions = com.victor.matchmaking.redis.QueuePartitions.partitionsFromEnv();
         com.victor.matchmaking.redis.TicketRepository repository =
-                new RedisTicketRepository(redis, queueMaxDepth);
+                new RedisTicketRepository(redis, queueMaxDepth, queuePartitions);
         com.victor.matchmaking.redis.RateLimiter rateLimiter = com.victor.matchmaking.api.AdmissionConfig
                 .rateLimiterFromEnv(redis);
         com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);

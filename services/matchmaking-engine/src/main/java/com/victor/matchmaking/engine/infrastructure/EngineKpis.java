@@ -49,6 +49,8 @@ public final class EngineKpis {
     private final MeterRegistry registry;
     private final Map<String, AtomicLong> queueDepth = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> queueOldestWaitSeconds = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> queuePartitionDepth = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> queueHotspotRatio = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> outboxBacklog = new ConcurrentHashMap<>();
     private final AtomicLong outboxOldestPendingSeconds = new AtomicLong();
     private final AtomicLong outboxPublishLagSeconds = new AtomicLong();
@@ -120,6 +122,37 @@ public final class EngineKpis {
         gauge(MetricNames.QUEUE_OLDEST_WAIT_SECONDS, tags, queueOldestWaitSeconds, key,
                 "How long the player at the head of this queue has been waiting, in seconds")
                 .set(oldestWait == null ? 0L : Math.max(0L, oldestWait.toSeconds()));
+    }
+
+    /**
+     * One partition of a queue (W20, ADR 0028). Published for every partition, zero included: a
+     * partition that stops being written keeps its last value forever, and a hotspot on a
+     * partition nobody uses is exactly the shape this sprint is looking for.
+     */
+    public void queuePartition(GameMode gameMode, Region region, int partition, long players) {
+        Tags tags = Tags.of(MetricNames.TAG_MODE, gameMode.label(), MetricNames.TAG_REGION, region.name(),
+                MetricNames.TAG_PARTITION, String.valueOf(partition));
+        String key = gameMode.label() + ":" + region.name() + ":" + partition;
+        gauge(MetricNames.QUEUE_PARTITION_DEPTH, tags, queuePartitionDepth,
+                key, "Players waiting in this partition of the queue").set(players);
+    }
+
+    /**
+     * Max partition depth over the mean, per queue (W20): 1.0 is even, {@code P} is one partition
+     * holding everything. 0 when the queue is empty - there is no hotspot in nothing.
+     */
+    public void queueHotspot(GameMode gameMode, Region region, double ratio) {
+        Tags tags = tagsOf(gameMode, region);
+        String key = gameMode.label() + ":" + region.name();
+        AtomicLong holder = queueHotspotRatio.computeIfAbsent(key, ignored -> {
+            AtomicLong created = new AtomicLong();
+            Gauge.builder(MetricNames.QUEUE_HOTSPOT_RATIO, created, value -> value.get() / 1000.0)
+                    .tags(tags)
+                    .description("Max partition depth divided by the mean (1 = even, partitions = one key holds all)")
+                    .register(registry);
+            return created;
+        });
+        holder.set(Math.max(0L, Math.round(ratio * 1000)));
     }
 
     /** Rows of the outbox in one status: PENDING is the backlog, PARKED needs a human. */

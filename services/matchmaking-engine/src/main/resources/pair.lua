@@ -1,6 +1,7 @@
 -- pair.lua
 -- Atomically: take the given tickets off the queue and create the pending match.
--- KEYS[1] = queue key (e.g. queue:1v1:NA)
+-- KEYS[1..N] = the queue partitions of one (mode, region), e.g. queue:1v1:NA:0 .. :7.
+--              N = 1 for a deployment that does not partition (W20, ADR 0028).
 -- ARGV[1] = matchId (e.g. match-abc123)
 -- ARGV[2] = pending match JSON (e.g. {"players":[...],"expiresAt":...})
 -- ARGV[3] = pending-match key TTL in seconds. It must exceed the confirmation
@@ -19,10 +20,12 @@
 -- showed it: 40 matches refused as "tickets not in CONFIRMING", 40 dissolved, and 186 tickets
 -- off the queue with nothing to pair them.
 --
--- All-or-nothing: every member must still be on the queue, or nothing is removed. Redis runs
--- the script as a single command, so exactly one caller finds all of its members there.
+-- All-or-nothing: every member must still be on one of the partitions, or nothing is removed.
+-- Redis runs the script as a single command, so exactly one caller finds all of its members
+-- there. A roster may span partitions - the engine merges the heads of every partition before
+-- choosing it (W20) - so each member is looked up across KEYS and removed from the key that
+-- holds it; the partitions spread the writes, they are not a matching boundary.
 
-local queueKey = KEYS[1]
 local count = tonumber(ARGV[4])
 if count < 2 then
     return nil
@@ -36,14 +39,22 @@ if #members ~= count then
     return nil
 end
 
+local memberKeys = {}
 for i = 1, #members do
-    if redis.call('ZSCORE', queueKey, members[i]) == false then
+    memberKeys[i] = nil
+    for k = 1, #KEYS do
+        if redis.call('ZSCORE', KEYS[k], members[i]) then
+            memberKeys[i] = k
+            break
+        end
+    end
+    if memberKeys[i] == nil then
         return nil
     end
 end
 
 for i = 1, #members do
-    redis.call('ZREM', queueKey, members[i])
+    redis.call('ZREM', KEYS[memberKeys[i]], members[i])
 end
 
 redis.call('SET', 'match-pending:' .. ARGV[1], ARGV[2], 'EX', tonumber(ARGV[3]))

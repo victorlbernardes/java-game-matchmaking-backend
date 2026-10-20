@@ -1,0 +1,94 @@
+{
+  "label": "w20-p8",
+  "players": 400,
+  "concurrency": 64,
+  "mode": "1v1",
+  "region": "NA",
+  "skill": 61,
+  "logins": {
+    "count": 400,
+    "seconds": 1.26,
+    "per_second": 317.9
+  },
+  "enqueue": {
+    "count": 400,
+    "seconds": 3.25,
+    "per_second": 123.1,
+    "p50_ms": 523.1,
+    "p95_ms": 691.8,
+    "p99_ms": 747.8,
+    "max_ms": 797.1
+  },
+  "shed": {
+    "count": 0,
+    "rate_limited": 0,
+    "capacity": null,
+    "p50_ms": null,
+    "p95_ms": null,
+    "p99_ms": null,
+    "max_ms": null
+  },
+  "drain": {
+    "peak_depth": 0,
+    "leftover": 0,
+    "seconds": 1.21,
+    "completed": true,
+    "players_per_second": 0.0,
+    "matches_per_second": 0.0,
+    "peak_players_per_second": 0.0,
+    "observed_players_per_second": null,
+    "observed_matches_per_second": null
+  },
+  "wait": {
+    "p50_s": 3.9207845365,
+    "p95_s": 5.553089028878787,
+    "p99_s": 5.691916254575757,
+    "queued_players_per_second_effective": 0.0
+  },
+  "matches": {
+    "enqueued_metric": 0.0,
+    "formed": 200.0,
+    "confirmed": 200.0,
+    "dissolved_timeout": 0.0,
+    "confirm_rate": 1.0,
+    "confirmed_by_client": 200,
+    "notifications_received": 800,
+    "pending_notifications_received": 400,
+    "confirmations_sent": 400
+  },
+  "resources": {
+    "engine_cpu_peak": 0.11535396514598499,
+    "system_cpu_peak": 0.8038478549314463,
+    "heap_used_peak_mb": 34.0,
+    "redis_ops_peak": 1897,
+    "redis_memory_mb": 2.69,
+    "postgres_tx_in_run": 1305,
+    "postgres_tx_per_second": 81.1
+  },
+  "outbox": {
+    "publish_lag_s": 0.0,
+    "oldest_pending_s": 0.0
+  },
+  "events": {
+    "matches_rows": 200,
+    "events": 200,
+    "distinct_matches": 200,
+    "duplicate_events": 0
+  },
+  "errors": [],
+  "samples": [
+    {
+      "t": 0.36,
+      "depth": 0,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.11535396514598499,
+      "system_cpu": 0.8038478549314463,
+      "heap_mb": 33.96537780761719,
+      "redis_ops": 1897,
+      "formed": 45.0,
+      "confirmed": 42.0,
+      "dissolved_timeout": 0.0,
+      "outbox_pending": 4.0
+    }
+  ]
+}

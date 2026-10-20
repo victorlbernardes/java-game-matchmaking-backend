@@ -37,11 +37,22 @@ public final class QueueMetricsPoller {
     private final io.vertx.redis.client.Redis redis;
     private final EngineKpis kpis;
     private final Clock clock;
+    private final int partitions;
 
     public QueueMetricsPoller(io.vertx.redis.client.Redis redis, EngineKpis kpis, Clock clock) {
+        this(redis, kpis, clock, 1);
+    }
+
+    /**
+     * @param partitions how many keys each (mode, region) is spread over (W20, ADR 0028). The
+     *                   total per queue is the sum; each partition is published as its own series,
+     *                   and the hotspot ratio compares the deepest partition with the mean.
+     */
+    public QueueMetricsPoller(io.vertx.redis.client.Redis redis, EngineKpis kpis, Clock clock, int partitions) {
         this.redis = redis;
         this.kpis = kpis;
         this.clock = clock;
+        this.partitions = Math.max(1, partitions);
     }
 
     /** One pass: read every configured queue and publish all of them. */
@@ -51,7 +62,7 @@ public final class QueueMetricsPoller {
         List<Future<Void>> reads = new ArrayList<>();
         // The keys are built, not discovered: a SCAN page used to decide which queues existed,
         // and a queue that fell on a later page was published as an empty one (W16).
-        for (String queueKey : RedisKeys.allQueueKeys()) {
+        for (String queueKey : RedisKeys.allQueueKeys(partitions)) {
             reads.add(readQueue(queueKey, depth, headQueuedAtMillis));
         }
         return Future.all(reads)
@@ -121,18 +132,33 @@ public final class QueueMetricsPoller {
 
     /**
      * Publishes every mode/region pair, whether or not Redis has a key for it: an empty queue
-     * is depth 0 with no wait, not a series that silently disappeared.
+     * is depth 0 with no wait, not a series that silently disappeared. Each partition is its own
+     * series (W20); the queue-level numbers are the sum and the oldest head across partitions.
      */
     private void publish(Map<String, Long> depth, Map<String, Long> headQueuedAtMillis) {
         Instant now = clock.instant();
         for (GameMode gameMode : GameMode.values()) {
             for (Region region : Region.values()) {
-                String queueKey = RedisKeys.queueKey(gameMode.label(), region.name());
-                long waiting = depth.getOrDefault(queueKey, 0L);
-                Long head = headQueuedAtMillis.get(queueKey);
-                Duration oldestWait = head == null ? null
-                        : Duration.between(Instant.ofEpochMilli(head), now);
-                kpis.queue(gameMode, region, waiting, oldestWait);
+                long total = 0;
+                long deepest = 0;
+                Long oldestHead = null;
+                for (int partition = 0; partition < partitions; partition++) {
+                    String queueKey = RedisKeys.queueKey(gameMode.label(), region.name(), partition, partitions);
+                    long waiting = depth.getOrDefault(queueKey, 0L);
+                    total += waiting;
+                    deepest = Math.max(deepest, waiting);
+                    kpis.queuePartition(gameMode, region, partition, waiting);
+                    Long head = headQueuedAtMillis.get(queueKey);
+                    if (head != null && (oldestHead == null || head < oldestHead)) {
+                        oldestHead = head;
+                    }
+                }
+                double mean = (double) total / partitions;
+                kpis.queueHotspot(gameMode, region, mean <= 0 ? 0 : deepest / mean);
+                Duration oldestWait = oldestHead == null
+                        ? null
+                        : Duration.between(Instant.ofEpochMilli(oldestHead), now);
+                kpis.queue(gameMode, region, total, oldestWait);
             }
         }
     }

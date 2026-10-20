@@ -28,6 +28,19 @@ public final class MetricNames {
 
     /** Players waiting right now, per mode and region. */
     public static final String QUEUE_DEPTH = "matchmaking.queue.depth";
+
+    /**
+     * Players waiting in one partition of a queue (W20, ADR 0028). The sum is {@link #QUEUE_DEPTH};
+     * the per-partition series is what makes a hotspot visible instead of implied.
+     */
+    public static final String QUEUE_PARTITION_DEPTH = "matchmaking.queue.partition.depth";
+
+    /**
+     * Max partition depth divided by the mean, per queue (W20). 1.0 is a perfectly even queue;
+     * {@code P} means one partition holds everything, which is what a single-key queue always was.
+     */
+    public static final String QUEUE_HOTSPOT_RATIO = "matchmaking.queue.hotspot.ratio";
+
     /**
      * How long the player at the head of a queue has been waiting. The depth alone lies -
      * a deep queue that moves is healthy, a shallow queue whose head is 10 minutes old is not.
@@ -46,7 +59,6 @@ public final class MetricNames {
     public static final String REASON_QUEUE_FULL = "queue_full";
     /** The caller exceeded its own request budget (429). */
     public static final String REASON_RATE_LIMITED = "rate_limited";
-
     // ── Backpressure: what the engine does when the database is behind (W17, ADR 0022) ──
 
     /**
@@ -82,6 +94,8 @@ public final class MetricNames {
 
     public static final String TAG_MODE = "mode";
     public static final String TAG_REGION = "region";
+    /** Which partition of a queue a sample is about (W20, ADR 0028). */
+    public static final String TAG_PARTITION = "partition";
     public static final String TAG_STATUS = "status";
     public static final String TAG_REASON = "reason";
     /** The outcome of an operation the caller can act on (e.g. a delivery: delivered or missed). */

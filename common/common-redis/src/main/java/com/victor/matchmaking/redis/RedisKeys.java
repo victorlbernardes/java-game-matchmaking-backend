@@ -22,8 +22,29 @@ public final class RedisKeys {
     }
 
     /**
-     * Every queue key that can exist: the clients pick a game mode and a region from the domain
-     * enums, so the queues are exactly this product.
+     * One partition of a queue (W20, ADR 0028). {@code partitions <= 1} keeps the historical key
+     * ({@code queue:{mode}:{region}}): a deployment that does not partition is byte-identical to
+     * what it was, and the partition count is what changes the shape.
+     */
+    public static String queueKey(String gameModeLabel, String regionName, int partition, int partitions) {
+        String base = queueKey(gameModeLabel, regionName);
+        return partitions <= 1 ? base : base + ":" + partition;
+    }
+
+    /** Every partition of one queue, in index order. */
+    public static java.util.List<String> queueKeys(String gameModeLabel, String regionName, int partitions) {
+        int count = Math.max(1, partitions);
+        java.util.List<String> keys = new java.util.ArrayList<>(count);
+        for (int partition = 0; partition < count; partition++) {
+            keys.add(queueKey(gameModeLabel, regionName, partition, count));
+        }
+        return keys;
+    }
+
+    /**
+     * Every queue key that can exist for a partition count: the closed product of game modes,
+     * regions and partitions. The engine reads the heads of all of them; the poller sums them per
+     * (mode, region) and publishes each partition as its own series (W20).
      *
      * <p>Building the names beats discovering them with {@code SCAN}. A {@code SCAN} page is not
      * the answer to "which queues are there" — it is one page of the keyspace, and reading a
@@ -31,13 +52,13 @@ public final class RedisKeys {
      * {@code SCAN 0 MATCH queue:*} returned none of them). One trivial read per key is exact and
      * has no dependency on how much else Redis is holding.
      */
-    public static java.util.List<String> allQueueKeys() {
+    public static java.util.List<String> allQueueKeys(int partitions) {
         java.util.List<String> keys = new java.util.ArrayList<>();
         for (com.victor.matchmaking.domain.ticket.GameMode gameMode
                 : com.victor.matchmaking.domain.ticket.GameMode.values()) {
             for (com.victor.matchmaking.domain.ticket.Region region
                     : com.victor.matchmaking.domain.ticket.Region.values()) {
-                keys.add(queueKey(gameMode.label(), region.name()));
+                keys.addAll(queueKeys(gameMode.label(), region.name(), partitions));
             }
         }
         return keys;
