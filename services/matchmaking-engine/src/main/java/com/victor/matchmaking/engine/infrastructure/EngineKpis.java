@@ -52,6 +52,7 @@ public final class EngineKpis {
     private final Map<String, AtomicLong> queuePartitionDepth = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> queueHotspotRatio = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> outboxBacklog = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> capacityFree = new ConcurrentHashMap<>();
     private final AtomicLong outboxOldestPendingSeconds = new AtomicLong();
     private final AtomicLong outboxPublishLagSeconds = new AtomicLong();
 
@@ -178,6 +179,27 @@ public final class EngineKpis {
      */
     public void dbWriteDeferred() {
         registry.counter(MetricNames.DB_WRITE_DEFERRED).increment();
+    }
+
+    /**
+     * The slots a (mode, region) still has, as the gate just read them (W22, ADR 0031).
+     * Published only when the region has a pool: an unknown region has no series, which is how a
+     * dashboard tells "no servers registered" from "servers registered and all full".
+     */
+    public void capacityFree(GameMode gameMode, Region region, long free) {
+        Tags tags = tagsOf(gameMode, region);
+        gauge(MetricNames.CAPACITY_FREE, tags, capacityFree, gameMode.label() + ":" + region.name(),
+                "Game server slots this (mode, region) can still host").set(free);
+    }
+
+    /**
+     * One pairing tick found no capacity and left the queue alone (W22). The counter is the
+     * difference between a queue that is being held (players still waiting, nothing lost) and a
+     * queue that is failing: the arrivals are admitted, the tickets stay SEARCHING, and this is the
+     * number that says why nobody is being matched.
+     */
+    public void pairingSuspended(GameMode gameMode, Region region) {
+        registry.counter(MetricNames.PAIRING_SUSPENDED, tagsOf(gameMode, region)).increment();
     }
 
     private AtomicLong gauge(String name, Tags tags, Map<String, AtomicLong> holders, String key,

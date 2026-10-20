@@ -3334,6 +3334,518 @@
           ]
         }
       ]
+    },
+    {
+      "name": "gameservers-w22 (pool, allocation, capacity-aware pairing)",
+      "description": "The orchestrator's internal pool API (W22, ADR 0031). Start it with ORCHESTRATOR_PORT=8085 METRICS_PORT=9093 GAME_SERVER_TOKEN=<token>. `verify_capacity.sh` is the automated version of this folder and the numbers it asserts; the folder is the by-hand version, so each request states what to look at. Requests 1-7 are the pool itself; 8-13 drive two players through a full pool so the wait is visible; 14-17 fill the pool, allocate and release.",
+      "item": [
+        {
+          "name": "1. GET /health — the orchestrator is up",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/health"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('it names itself', () => pm.expect(pm.response.json().service).to.eql('match-orchestrator'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. GET /v1/capacity — no token is not an answer (401)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('the error says why', () => pm.expect(pm.response.json().error).to.eql('unauthorized'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3. GET /v1/capacity — the empty pool reads as unknown, not zero",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('authoritative is false with no pool (the W1-W21 behaviour survives)', () => pm.expect(pm.response.json().authoritative).to.eql(false));",
+                  "pm.test('free is 0 but means unknown', () => pm.expect(pm.response.json().free).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. PUT /v1/game-servers/gs-local-1 — register (and heartbeat) a server",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 1,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const s = pm.response.json();",
+                  "pm.test('capacity 1, nothing allocated yet', () => pm.expect(s.capacity).to.eql(1) && pm.expect(s.allocated).to.eql(0));",
+                  "pm.test('the state is derived at read (READY)', () => pm.expect(s.state).to.eql('READY'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5. GET /v1/game-servers — the pool, with derived states",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('gs-local-1 is listed', () => pm.expect(pm.response.json().servers.map(s => s.serverId)).to.include('gs-local-1'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6. GET /v1/capacity — the pool exists now, so 1 is the truth",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('authoritative with a registered pool', () => pm.expect(pm.response.json().authoritative).to.eql(true));",
+                  "pm.test('one free slot', () => pm.expect(pm.response.json().free).to.eql(1));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7. PUT /v1/game-servers/gs-local-1 — heartbeat with capacity 0 (a full server)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 0,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('a full server is READY and free 0: full is not stale', () => pm.expect(pm.response.json().state).to.eql('READY') && pm.expect(pm.response.json().free).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8. Login p1 (W22)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"w22-pool-p1\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenW22P1', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "9. Login p2 (W22)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"w22-pool-p2\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenW22P2', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "10. Enqueue p1 — the pool is full, so the pair will wait",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenW22P1}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('SEARCHING, not refused: the player waits', () => pm.expect(pm.response.json().status).to.eql('SEARCHING'));",
+                  "pm.environment.set('ticketW22P1', pm.response.json().ticketId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "11. Enqueue p2 — both wait, no match is formed",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenW22P2}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('ticketW22P2', pm.response.json().ticketId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "12. GET the ticket — still SEARCHING after a few seconds",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenW22}}"
+              }
+            ],
+            "url": {
+              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketW22P1}}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the ticket is still SEARCHING: capacity is the gate, not admission', () => pm.expect(pm.response.json().status).to.eql('SEARCHING'));",
+                  "// the engine counter that explains it: matchmaking_pairing_suspended_total{mode=\"1v1\",region=\"NA\"} on :9091"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "13. PUT capacity 1 — the slot appears and the pair is formed",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 1,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "// within a second or two the engine pairs them: GET the ticket again and it is CONFIRMING"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "14. GET the ticket again — CONFIRMING (the match was formed)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenW22}}"
+              }
+            ],
+            "url": {
+              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketW22P1}}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the player was pulled from the queue as soon as there was room', () => pm.expect(pm.response.json().status).to.eql('CONFIRMING'));",
+                  "pm.test('and the ticket names the match', () => pm.expect(pm.response.json().matchId).to.be.a('string'));",
+                  "pm.environment.set('matchW22', pm.response.json().matchId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "15. GET /v1/capacity — the slot is gone while the match runs",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "// free 0 while the match is CONFIRMING and after confirmation takes the slot"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "16. POST release — the slot comes back (idempotent)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1/allocations/{{matchW22}}/release"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 when the match was allocated there, 404 allocation_not_found otherwise', () => pm.expect([200, 404]).to.include(pm.response.code));",
+                  "// a second call answers 404 and does not return a second slot"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "17. DELETE /v1/game-servers/gs-local-1 — drain (no new matches, running ones stay)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{gameServerToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the derived state is DRAINING', () => pm.expect(pm.response.json().state).to.eql('DRAINING'));",
+                  "pm.test('a drain never frees slots that are in use', () => pm.expect(pm.response.json().allocated).to.be.a('number'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

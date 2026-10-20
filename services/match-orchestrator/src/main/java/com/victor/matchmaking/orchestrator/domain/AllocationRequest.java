@@ -2,6 +2,7 @@ package com.victor.matchmaking.orchestrator.domain;
 
 import java.time.Instant;
 
+import com.victor.matchmaking.domain.match.AllocationStatus;
 import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.Region;
 

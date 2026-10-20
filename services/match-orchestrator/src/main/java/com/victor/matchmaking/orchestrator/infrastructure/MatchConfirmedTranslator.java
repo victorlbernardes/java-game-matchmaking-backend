@@ -11,7 +11,7 @@ import com.victor.matchmaking.orchestrator.application.DecodedEvent;
 import com.victor.matchmaking.orchestrator.application.MatchConfirmedDecoder;
 import com.victor.matchmaking.orchestrator.application.RawRecord;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
-import com.victor.matchmaking.orchestrator.domain.AllocationStatus;
+import com.victor.matchmaking.domain.match.AllocationStatus;
 
 /**
  * Translates the wire contract into the orchestrator's own records.

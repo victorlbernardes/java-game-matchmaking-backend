@@ -28,4 +28,19 @@ public enum GameMode {
     public int playersPerMatch() {
         return playersPerMatch;
     }
+
+    /**
+     * The mode as the wire names it ({@code "1v1"}, {@code "5v5"}), for the boundaries that read a
+     * label rather than a constant: the request body (W1) and the pool's {@code game_modes} column
+     * (W22). An unknown label is an {@link IllegalArgumentException}, which a boundary turns into
+     * a 400 and a deployment's configuration turns into a failed boot.
+     */
+    public static GameMode fromLabel(String label) {
+        for (GameMode mode : values()) {
+            if (mode.label.equals(label)) {
+                return mode;
+            }
+        }
+        throw new IllegalArgumentException("unknown game mode: '" + label + "'");
+    }
 }

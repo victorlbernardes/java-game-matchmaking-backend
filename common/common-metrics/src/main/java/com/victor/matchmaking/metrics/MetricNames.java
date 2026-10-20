@@ -113,6 +113,32 @@ public final class MetricNames {
     /** Rows the relay gave up on; each one needs a human. */
     public static final String OUTBOX_PARKED = "matchmaking.outbox.parked";
 
+    // ── Capacity and allocation: is there a server for the match? (W22, ADR 0031) ────
+
+    /**
+     * Matches the orchestrator tried to place on a game server, tagged by {@link #TAG_RESULT}.
+     * {@link #RESULT_ALLOCATED} is a match that will run somewhere; {@link #RESULT_NO_CAPACITY} is
+     * one that was confirmed and has nowhere to go — the number W23's timeout works through, and
+     * the reason the engine also refuses to form matches when the pool is full.
+     */
+    public static final String ALLOCATIONS = "matchmaking.allocations";
+    public static final String RESULT_ALLOCATED = "allocated";
+    public static final String RESULT_NO_CAPACITY = "no_capacity";
+
+    /**
+     * Slots a region still has, per mode, as the engine reads them (W22). Zero with a registered
+     * pool means matching is suspended for that (mode, region) — the gauge the gate decides on, and
+     * the one to look at when arrivals stop pairing and nothing looks broken.
+     */
+    public static final String CAPACITY_FREE = "matchmaking.capacity.free";
+
+    /**
+     * Pairing ticks that found no capacity and left the queue alone (W22). Not an error: the player
+     * waits instead of being confirmed into a match that cannot run. A rate that stays above zero
+     * is a pool that needs servers, said in the place an operator already looks.
+     */
+    public static final String PAIRING_SUSPENDED = "matchmaking.pairing.suspended";
+
     // ── Tags ────────────────────────────────────────────────────────────────────────
 
     public static final String TAG_MODE = "mode";

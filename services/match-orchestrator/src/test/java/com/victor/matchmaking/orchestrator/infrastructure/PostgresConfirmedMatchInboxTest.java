@@ -22,7 +22,7 @@ import com.victor.matchmaking.db.DatabasePool;
 import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
-import com.victor.matchmaking.orchestrator.domain.AllocationStatus;
+import com.victor.matchmaking.domain.match.AllocationStatus;
 import com.victor.matchmaking.orchestrator.domain.ProcessedEvent;
 import com.victor.matchmaking.orchestrator.domain.ProcessingOutcome;
 
@@ -50,13 +50,17 @@ class PostgresConfirmedMatchInboxTest {
     private static Vertx vertx;
     private static PostgresConfirmedMatchInbox inbox;
     private static Pool probe;
+    private static io.micrometer.core.instrument.simple.SimpleMeterRegistry registry;
 
     @BeforeAll
     static void connect() {
         DatabaseConfig config = DatabaseConfig.fromEnv();
         DatabaseMigrator.migrate(config);
+        registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
         vertx = Vertx.vertx();
-        inbox = PostgresConfirmedMatchInbox.connect(vertx, config);
+        // A real registry, because the allocation counter is part of what this class now
+        // promises (W22): the numbers are asserted, not just the rows.
+        inbox = PostgresConfirmedMatchInbox.connect(vertx, config, registry);
         // Second pool, used only to read what the inbox wrote.
         probe = DatabasePool.connect(vertx, config);
     }

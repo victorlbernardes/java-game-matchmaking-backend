@@ -67,6 +67,14 @@ public final class MatchmakingEngineApplication {
      */
     static final long KPI_POLL_INTERVAL_MS = 2000;
     /**
+     * How often the game server pool's capacity is read (W22, ADR 0031). One second is the whole
+     * staleness budget of the gate: a slot freed by an allocation that just happened can be used by
+     * the next match one tick later, and a match formed on a stale belief lands in
+     * {@code PENDING_ALLOCATION} instead of disappearing - the allocator, not this poll, is what
+     * cannot be wrong.
+     */
+    static final long CAPACITY_POLL_INTERVAL_MS = 1000;
+    /**
      * How many queue members one reaping pass inspects once an expired ticket is found (W16,
      * ADR 0025). Bounded on purpose: a queue full of ghosts is cleared over a few ticks of the
      * 500 ms loop instead of reading a whole queue in one tick.
@@ -169,7 +177,20 @@ public final class MatchmakingEngineApplication {
         RedisPlayerNotifier notifier = new RedisPlayerNotifier(publisher);
         com.victor.matchmaking.db.DatabaseConfig dbConfig = com.victor.matchmaking.db.DatabaseConfig.fromEnv();
         com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
-        PostgresOutboxQueue outbox = PostgresOutboxQueue.connect(vertx, dbConfig);
+        // One pool for the process: the outbox's transactions and the pool's capacity read are
+        // two users of the same connections (W22), and the engine does not need a second pool.
+        io.vertx.sqlclient.Pool dbPool = com.victor.matchmaking.db.DatabasePool.connect(vertx, dbConfig);
+        PostgresOutboxQueue outbox = new PostgresOutboxQueue(dbPool,
+                new com.victor.matchmaking.db.MatchRepository(dbPool));
+
+        // Capacity (W22, ADR 0031): read from the game server pool once a second and held in
+        // memory, so the pairing loop can ask "is forming this match worth anything" without a
+        // query per (mode, region) per tick.
+        com.victor.matchmaking.db.GameServerRepository gameServers =
+                new com.victor.matchmaking.db.GameServerRepository(dbPool,
+                        com.victor.matchmaking.db.GameServerRepository.ttlSecondsFromEnv());
+        com.victor.matchmaking.engine.infrastructure.PostgresCapacity capacity =
+                new com.victor.matchmaking.engine.infrastructure.PostgresCapacity(gameServers, kpis, SERVED_REGIONS);
 
         // Durable event log (Kafka): Redis carries the live push to the API, Kafka the
         // event every other consumer (orchestrator, analytics) reads. See ADR 0014/0016.
@@ -200,7 +221,11 @@ public final class MatchmakingEngineApplication {
         PAIR_SCRIPT = pairScript(redis);
         PAIR_SCRIPT.load().onSuccess(sha -> {
             vertx.setPeriodic(PAIRING_INTERVAL_MS, id -> pairAcrossQueues(vertx, redis, tickets, pending,
-                    notifier, kpis, dbGate));
+                    notifier, kpis, dbGate, capacity));
+            // The snapshot's freshness is the gate's whole staleness budget: one second between
+            // the pool changing and the pairing seeing it (PostgresCapacity).
+            vertx.setPeriodic(CAPACITY_POLL_INTERVAL_MS, id -> capacity.pollOnce()
+                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=capacityPoll", err)));
             vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier, kpis));
             vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
                     .onSuccess(kpis::relayDrained)
@@ -254,6 +279,12 @@ public final class MatchmakingEngineApplication {
         pairAcrossQueues(SERVED_REGIONS, vertx, redis, tickets, pending, notifier, kpis, dbGate);
     }
 
+    private static void pairAcrossQueues(Vertx vertx, io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate,
+            com.victor.matchmaking.engine.application.Capacity capacity) {
+        pairAcrossQueues(SERVED_REGIONS, vertx, redis, tickets, pending, notifier, kpis, dbGate, capacity);
+    }
+
     /**
      * The same loop, over an explicit set of regions. The deployment's set is {@link #SERVED_REGIONS};
      * the parameter exists so the property "an engine never pairs a region it does not serve" can be
@@ -262,6 +293,22 @@ public final class MatchmakingEngineApplication {
     static void pairAcrossQueues(com.victor.matchmaking.domain.ticket.ServedRegions served, Vertx vertx,
             io.vertx.redis.client.Redis redis, TicketRepository tickets,
             PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate) {
+        pairAcrossQueues(served, vertx, redis, tickets, pending, notifier, kpis, dbGate,
+                com.victor.matchmaking.engine.application.Capacity.UNLIMITED);
+    }
+
+    /**
+     * The same loop, with the pool's capacity as a gate (W22, ADR 0031).
+     *
+     * <p>A (mode, region) with no free slot is <b>skipped, not refused</b>: the tickets stay in the
+     * queue and keep waiting, which is a player waiting for a game instead of a player confirming a
+     * match that has nowhere to run and losing it at the deadline. The suspension is counted, so
+     * "nobody is being matched" has a reason attached to it.
+     */
+    static void pairAcrossQueues(com.victor.matchmaking.domain.ticket.ServedRegions served, Vertx vertx,
+            io.vertx.redis.client.Redis redis, TicketRepository tickets,
+            PendingMatchStore pending, RedisPlayerNotifier notifier, EngineKpis kpis, WriteGate dbGate,
+            com.victor.matchmaking.engine.application.Capacity capacity) {
         if (dbGate.saturated()) {
             // The database is at its write limit: forming more matches would only create more
             // confirmations it cannot take. The queue waits, and the boundary that can say no to
@@ -273,13 +320,38 @@ public final class MatchmakingEngineApplication {
         }
         for (GameMode gameMode : GameMode.values()) {
             for (Region region : served.list()) {
+                int budget = pairingBudget(capacity, gameMode, region, kpis);
+                if (budget == 0) {
+                    continue;
+                }
                 // One (mode, region) is one logical queue, spread over its partitions. The tick
                 // reads every partition's head and merges them, so the partitions spread the
                 // storage and the writes without becoming a matching boundary (W20).
                 pairBatch(RedisKeys.queueKeys(gameMode.label(), region.name(), QUEUE_PARTITIONS), gameMode,
-                        redis, tickets, pending, notifier, kpis, PAIR_BATCH_PER_TICK, true, dbGate);
+                        redis, tickets, pending, notifier, kpis, budget, true, dbGate);
             }
         }
+    }
+
+    /**
+     * How many matches this tick may form for one (mode, region).
+     *
+     * <p>Three answers, from {@link com.victor.matchmaking.engine.application.Capacity}: unknown
+     * (no pool) leaves the historical batch; zero slots suspends the queue and counts it; a positive
+     * number caps the batch, so a tick cannot form eight matches against a pool with one slot and
+     * leave seven of them waiting for a server.
+     */
+    private static int pairingBudget(com.victor.matchmaking.engine.application.Capacity capacity,
+            GameMode gameMode, Region region, EngineKpis kpis) {
+        java.util.OptionalInt free = capacity.free(gameMode, region);
+        if (free.isEmpty()) {
+            return PAIR_BATCH_PER_TICK;
+        }
+        if (free.getAsInt() <= 0) {
+            kpis.pairingSuspended(gameMode, region);
+            return 0;
+        }
+        return Math.min(PAIR_BATCH_PER_TICK, free.getAsInt());
     }
 
     static void tryPairFromQueue(String queueKey, io.vertx.redis.client.Redis redis, TicketRepository tickets,

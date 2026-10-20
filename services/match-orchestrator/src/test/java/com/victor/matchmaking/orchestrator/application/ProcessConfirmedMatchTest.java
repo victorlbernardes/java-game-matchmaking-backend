@@ -16,7 +16,7 @@ import org.junit.jupiter.api.Test;
 import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
-import com.victor.matchmaking.orchestrator.domain.AllocationStatus;
+import com.victor.matchmaking.domain.match.AllocationStatus;
 import com.victor.matchmaking.orchestrator.domain.ProcessedEvent;
 import com.victor.matchmaking.orchestrator.domain.ProcessingOutcome;
 

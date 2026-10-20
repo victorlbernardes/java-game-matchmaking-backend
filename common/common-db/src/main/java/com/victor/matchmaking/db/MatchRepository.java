@@ -124,7 +124,8 @@ public final class MatchRepository {
         return instant != null ? Timestamp.from(instant) : null;
     }
 
-    private static Instant instantOf(Object value) {
+    /** Shared with the pool's repository: one place that knows how a TIMESTAMPTZ arrives. */
+    static Instant instantOf(Object value) {
         if (value == null) {
             return null;
         }

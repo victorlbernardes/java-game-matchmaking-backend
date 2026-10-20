@@ -24,6 +24,7 @@ matchmaking/
 ├── routing-w19/           # two instances: routing, presence, heartbeat re-presentation (W19)
 ├── partitioning-w20/      # queue partitions: enqueue, per-partition depth, hotspot (W20)
 ├── multiregion-w21/       # regions: the directory, the ping/pong probe, the two refusals (W21)
+├── gameservers-w22/       # the pool, the atomic allocation and the capacity gate (W22)
 └── infra/
     └── schema-registry/   # GET /config, /subjects, /schemas/types (W12)
 ```
@@ -59,14 +60,24 @@ requests/
 ├── routing/
 │   ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
 │   └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
-└── multiregion/
+├── multiregion/
 │   ├── verify_multiregion.sh          # two regions, two Redises, placement and failover (W21)
 │   ├── multiregion_probe.py           # helper: login, probe, ticket, play a full match
 │   └── delay_proxy.py                 # helper: a TCP proxy that adds latency (the "far" region)
+└── gameservers/
+    ├── verify_capacity.sh             # the pool, the allocation, the gate and the TTL (W22)
+    └── capacity_probe.py              # helper: enqueue (without confirming) and confirm a match
+```
+
 ```text
 requests/partitioning/
 ├── verify_partitioning.sh             # queue: one key vs 8, the hotspot, cross-partition pairing (W20)
 └── partition_probe.py                 # helper: arrivals per partition, the scrape, the cross pairing
+
+requests/gameservers/
+├── verify_capacity.sh                 # pool: register, wait, allocate, release, over-commit (W22)
+└── capacity_probe.py                  # helper: enqueue/confirm separately (capacity sits between them)
+```
 
 ## Party flow (W11)
 
@@ -806,6 +817,61 @@ scenario would then be measuring the wrong thing. By hand: `curl -s localhost:80
 "authorization: Bearer $TOKEN"`, `redis-cli -p 6380 keys 'latency*'`, and the collection's
 `multiregion-w21` folder. The default deployment (`SERVED_REGIONS` unset, `REGION_RTT_MS` unset) is
 the pre-W21 behaviour: one region, no constraint.
+
+## Game servers — a confirmed match with nowhere to run (W22)
+
+```bash
+bash requests/gameservers/verify_capacity.sh       # 58 checks, 0 failures, ~103 s (ADR 0031)
+```
+
+Before W22 the system stopped at "the players confirmed". Which machine runs the match, and whether
+one existed at all, was nobody's question — so a region at capacity confirmed matches that then had
+nowhere to go and dissolved at the deadline, costing the wait **and** the match. W22 adds the pool
+(the orchestrator's new internal HTTP API, `ORCHESTRATOR_PORT`, default **8085**, scrape **9093**)
+and the two decisions that go with it: where a confirmed match runs, and whether forming one is
+worth doing.
+
+The scenario stops any engine and any orchestrator it finds (it needs to own the pairing loop and
+the consumer group) and starts its own API (**8098**), engine (metrics **9101**) and orchestrator
+(**8086**, metrics **9094**, `SERVER_TTL_SECONDS=10`). It plays the game servers too, re-registering
+them every phase — which is what an agent's heartbeat is.
+
+1. **No pool means no constraint.** `GET /v1/capacity` without the service token is **401**; with
+   it and nothing registered, `authoritative: false` — *unknown*, not zero. The two players still
+   pair and confirm exactly as in W21, and the match stays `PENDING_ALLOCATION` (W23 gives it a
+   deadline).
+2. **A pool with no room holds the queue.** A server registered with `capacity: 0` is `READY` and
+   `free: 0` (full is not stale). Two arrivals are admitted, stay `SEARCHING`, no match is formed,
+   `matchmaking_capacity_free{mode="1v1",region="NA"}` reads **0** and
+   `matchmaking_pairing_suspended_total` climbs (measured 7 → 25 across the wait).
+3. **A slot is one match.** Registering `capacity: 1` makes the waiting pair leave the queue within
+   one poll; on confirmation the orchestrator writes `match_allocations` with `server_id =
+   gs-w22-one` **and** takes the slot in the same transaction (`allocated 1, free 0`).
+   `matchmaking_allocations_total{result="allocated"}` moves.
+4. **The slot is consumed, and release gives it back once.** With the match running, the next pair
+   waits. `POST …/allocations/{matchId}/release` answers `200` (`allocated 0, free 1`); a second
+   call answers `404 allocation_not_found` and returns **no second slot**. The waiting pair takes
+   the freed slot and is allocated again.
+5. **Two confirmations cannot take the same last slot.** Two matches are formed against a pool with
+   two slots, the pool then shrinks to **one**, and both confirmations arrive together:
+   `match-90198069 → ALLOCATED`, `match-9da20a1c → PENDING_ALLOCATION`, `gs-w22-two` at
+   `allocated 1 / capacity 1`. The row lock and `allocated < capacity` are what make this true.
+6. **A silent server leaves by TTL, with no sweep.** Twelve seconds without a heartbeat drop the
+   fresh server out of the pool (`free 1 → 0`), the listing derives `STALE`, a new pair waits — and
+   pairs the moment the server speaks again.
+7. **A drain is a decision, not an outage.** `DELETE` derives `DRAINING`, takes the slot out of the
+   region (`free 0`, still authoritative) and the next pair waits instead of being refused; a
+   heartbeat clears the drain and the pair is formed — on the server that came back, then released.
+8. **Shrinking below what is running is refused** (`409 capacity_below_allocated`), and the row is
+   left untouched (`capacity 1 / allocated 1`). The database closes the loop: no server has
+   `allocated > capacity`, and `sum(allocated)` equals the `ALLOCATED` rows of this run.
+
+`SERVER_TTL_SECONDS` must be the **same** in the orchestrator and the engine: the engine's gate reads
+the same table. A mismatch is not fatal — the engine forms a match the allocator then refuses, so the
+match is `PENDING_ALLOCATION` instead of lost — but it is capacity nobody uses. Ports: the folder
+`gameservers-w22` in the collection is the by-hand version of the same path, against the default
+`ORCHESTRATOR_PORT=8085` and `GAME_SERVER_TOKEN` (default `local-game-server-token`, replaced by mTLS
+in a real deployment).
 
 ## Typical flow
 
