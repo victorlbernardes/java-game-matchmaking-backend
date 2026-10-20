@@ -48,8 +48,15 @@ public final class MatchmakingApiApplication {
         com.victor.matchmaking.redis.RateLimiter rateLimiter = com.victor.matchmaking.api.AdmissionConfig
                 .rateLimiterFromEnv(redis);
         com.victor.matchmaking.redis.RedisPublisher publisher = new com.victor.matchmaking.redis.RedisPublisher(redis);
-        com.victor.matchmaking.api.presentation.WsHub wsHub =
-                new com.victor.matchmaking.api.presentation.WsHub(publisher);
+        // The instance's name (W19, ADR 0026). Two instances behind the same Redis must be
+        // tellable apart: the name is logged, returned by /health and tagged on the socket-layer
+        // metrics, so "which instance is this player on" has an answer that is not "guess".
+        String instanceId = System.getenv().getOrDefault("INSTANCE_ID", "api-" + port);
+        com.victor.matchmaking.api.presentation.ConnectionRegistry connectionRegistry =
+                new com.victor.matchmaking.api.presentation.ConnectionRegistry(publisher, instanceId,
+                        new com.victor.matchmaking.api.infrastructure.RedisPlayerPresence(redis),
+                        new com.victor.matchmaking.api.infrastructure.RedisPendingConfirmationLookup(redis),
+                        metrics.registry());
         com.victor.matchmaking.db.DatabaseConfig dbConfig = com.victor.matchmaking.db.DatabaseConfig.fromEnv();
         com.victor.matchmaking.db.DatabaseMigrator.migrate(dbConfig);
         com.victor.matchmaking.db.MatchRepository matchRepository =
@@ -67,14 +74,14 @@ public final class MatchmakingApiApplication {
                                 () -> matchRepository.ping().map(ignored -> true))));
         com.victor.matchmaking.redis.RedisSubscriber.subscribe(vertx, redisUri,
                 com.victor.matchmaking.redis.RedisKeys.CHANNEL_PLAYER_NOTIFICATIONS,
-                msg -> wsHub.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
+                msg -> connectionRegistry.deliver(com.victor.matchmaking.redis.RoutedEnvelope.fromJson(msg)));
         JWTAuth jwtAuth = JWTAuth.create(vertx, new JWTAuthOptions().addJwk(fetchPublicJwk(jwksUrl)));
         // One shared, Redis-backed party store: a party created by one route must
         // be the same party the ticket (enqueue/cancel) routes resolve.
         com.victor.matchmaking.redis.PartyStore partyStore = new com.victor.matchmaking.redis.RedisPartyStore(redis);
         com.victor.matchmaking.domain.player.SkillProvider skillProvider =
                 new com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider();
-        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, wsHub, matchRepository,
+        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository,
                 skillProvider, partyStore, metrics.registry(), rateLimiter, readiness);
 
         com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(), metricsPort)
@@ -88,7 +95,8 @@ public final class MatchmakingApiApplication {
         server.requestHandler(router)
                 .listen(port)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
-                        "api.started port={0} jwksUrl={1}", String.valueOf(s.actualPort()), jwksUrl))
+                        "api.started port={0} instance={1} jwksUrl={2}", String.valueOf(s.actualPort()),
+                        instanceId, jwksUrl))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "api.start.failed port=" + port, err));
     }
 

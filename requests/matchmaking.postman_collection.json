@@ -1012,7 +1012,8 @@
                       "value": "{{token}}"
                     }
                   ]
-                }
+                },
+                "description": "Push notifications channel. Open the connection, then send frames.\n\n**Client→server:**\n- `{\"type\":\"PING\",\"payload\":{}}` → expect `PONG`; while a match is pending, the heartbeat also **re-presents** `MATCH_PENDING_CONFIRMATION` (W19, ADR 0026: a reconnect on any instance recovers what a lost notification owed)\n- `{\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"...\"}}` → confirm\n- `{\"type\":\"MATCH_DECLINE\",\"payload\":{\"matchId\":\"...\"}}` → decline\n\n**Server→client:** `PONG`, `MATCH_PENDING_CONFIRMATION`, `MATCH_CONFIRMED`, `MATCH_CANCELLED`, `ERROR`.\n\nThe socket is not pinned: `presence:<playerId>` in Redis names the instance holding it (TTL 90 s), `GET /health` returns the instance's name, and any instance accepts `MATCH_CONFIRM`.\n\nThe matchmaking-engine must be running for pairing/confirmation."
               },
               "description": "Push notifications channel. Open the connection, then send frames.\n\n**Client→server:**\n- `{\"type\":\"PING\",\"payload\":{}}` → expect `PONG`\n- `{\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"...\"}}` → confirm\n- `{\"type\":\"MATCH_DECLINE\",\"payload\":{\"matchId\":\"...\"}}` → decline\n\n**Server→client:** `PONG`, `MATCH_PENDING_CONFIRMATION`, `MATCH_CONFIRMED`, `MATCH_CANCELLED`, `ERROR`.\n\nThe matchmaking-engine must be running for pairing/confirmation."
             }
@@ -1968,6 +1969,394 @@
               ]
             }
           ]
+        }
+      ]
+    },
+    {
+      "name": "routing-w19 (two instances)",
+      "description": "W19 (ADR 0026): the WebSocket connection is not pinned to one instance.\n\nStart a second API instance first:\n`PORT=8093 METRICS_PORT=9193 INSTANCE_ID=api-b mvn -o -q -pl services/matchmaking-api exec:java`\n(the first instance stays on 8080, or use 8092/`api-a` with `apiBaseUrlA`).\n\nRun the items top to bottom. Steps 8-10 exercise the re-presentation: after the match is pending, kill the instance holding `tokenP1`, connect the same token to the other instance and send PING - the pending `MATCH_PENDING_CONFIRMATION` is sent again. The automated version is `requests/routing/verify_routing.sh`.",
+      "item": [
+        {
+          "name": "1. Login p1 (routing-a)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenP1', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"routing-a\"\n}"
+            },
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login",
+              "host": [
+                "{{authBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "login"
+              ]
+            }
+          }
+        },
+        {
+          "name": "2. Login p2 (routing-b)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('tokenP2', pm.response.json().token);",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"routing-b\"\n}"
+            },
+            "url": {
+              "raw": "{{authBaseUrl}}/v1/auth/login",
+              "host": [
+                "{{authBaseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "auth",
+                "login"
+              ]
+            }
+          }
+        },
+        {
+          "name": "3. GET /health — instance A names itself",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('the instance has a name', () => pm.expect(pm.response.json().instance).to.be.a('string'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiBaseUrlA}}/health",
+              "host": [
+                "{{apiBaseUrlA}}"
+              ],
+              "path": [
+                "health"
+              ]
+            }
+          }
+        },
+        {
+          "name": "4. WS Connect p1 — instance A",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8092/v1/ws?token={{tokenP1}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8092",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP1}}"
+                }
+              ]
+            },
+            "description": "Player p1's socket lives on instance A. `redis-cli get presence:routing-a` now names api-a."
+          }
+        },
+        {
+          "name": "5. WS Connect p2 — instance B",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8093/v1/ws?token={{tokenP2}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8093",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP2}}"
+                }
+              ]
+            },
+            "description": "Player p2's socket lives on instance B: one match, two instances."
+          }
+        },
+        {
+          "name": "6. Create ticket p1 (via A)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('ticketId', pm.response.json().ticketId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenP1}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrlA}}/v1/matchmaking/tickets",
+              "host": [
+                "{{apiBaseUrlA}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            }
+          }
+        },
+        {
+          "name": "7. Create ticket p2 (via B)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.environment.set('ticketId', pm.response.json().ticketId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{tokenP2}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+            },
+            "url": {
+              "raw": "{{apiBaseUrlB}}/v1/matchmaking/tickets",
+              "host": [
+                "{{apiBaseUrlB}}"
+              ],
+              "path": [
+                "v1",
+                "matchmaking",
+                "tickets"
+              ]
+            }
+          }
+        },
+        {
+          "name": "8. WS Send PING p1 — heartbeat",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8092/v1/ws?token={{tokenP1}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8092",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP1}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"PING\", \"payload\": {}}"
+            },
+            "description": "Expect PONG. While the match is pending, the same PING also re-presents `MATCH_PENDING_CONFIRMATION` (the client deduplicates by matchId)."
+          }
+        },
+        {
+          "name": "9. WS Connect p1 — instance B (A was killed)",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8093",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP1}}"
+                }
+              ]
+            },
+            "description": "Kill instance A (`kill -9 <pid>`) and reconnect the same token here: the player lands on instance B and the socket has not been pinned to anything."
+          }
+        },
+        {
+          "name": "10. WS Send PING p1 on B — re-presents the pending match",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8093",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP1}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"PING\", \"payload\": {}}"
+            },
+            "description": "Expect PONG and `MATCH_PENDING_CONFIRMATION` with the pending matchId - the notification A never delivered."
+          }
+        },
+        {
+          "name": "11. WS Send MATCH_CONFIRM p1",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8093",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP1}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"MATCH_CONFIRM\", \"payload\": {\"matchId\": \"{{matchId}}\"}}"
+            }
+          }
+        },
+        {
+          "name": "12. WS Send MATCH_CONFIRM p2",
+          "request": {
+            "header": [],
+            "url": {
+              "raw": "ws://localhost:8093/v1/ws?token={{tokenP2}}",
+              "protocol": "ws",
+              "host": [
+                "localhost"
+              ],
+              "port": "8093",
+              "path": [
+                "v1",
+                "ws"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{tokenP2}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"MATCH_CONFIRM\", \"payload\": {\"matchId\": \"{{matchId}}\"}}"
+            },
+            "description": "Any instance can finish the match: both confirmations go through B."
+          }
         }
       ]
     },

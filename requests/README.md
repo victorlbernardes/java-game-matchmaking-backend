@@ -21,6 +21,7 @@ matchmaking/
 │   ├── websocket/         # WS /v1/ws (PING, MATCH_CONFIRM, MATCH_DECLINE)
 │   ├── e2e-w5/            # Full W5 E2E flow (login ×2 → WS → pair → confirm → history)
 │   └── e2e-w11/           # Full W11 party flow (create → join → enqueue → fill/cancel)
+├── routing-w19/           # two instances: routing, presence, heartbeat re-presentation (W19)
 └── infra/
     └── schema-registry/   # GET /config, /subjects, /schemas/types (W12)
 ```
@@ -50,9 +51,12 @@ requests/
 │   ├── verify_load_shedding.sh        # the three refusals: 429, 503, and waiting on the database (W17)
 │   ├── fill_queue.py                  # helper: arrivals until the API refuses, and what it said
 │   └── db_backpressure.py             # helper: a confirmation burst against a deliberately slow Postgres
-└── resilience/
-    ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
-    └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
+├── resilience/
+│   ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
+│   └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
+└── routing/
+    ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
+    └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
 ```
 
 ## Party flow (W11)
@@ -677,6 +681,41 @@ Redis restart silently kills the subscriptions** — the first run of this scena
 fail for a reason that was not theirs: the engine had received no confirmation since phase 1, every
 match dissolved at its deadline, and both processes looked healthy. That is the class of failure the
 sprint exists for, found by running the thing (ADR 0024, `MelhoriasFutura.md` item 7).
+
+## Routing — the socket is not pinned to an instance (W19)
+
+```bash
+bash requests/routing/verify_routing.sh     # 35 checks, 2 instances, ~3 min (ADR 0026)
+```
+
+The WebSocket contract (`03`) promises that a player whose notification was lost gets it back on the
+next heartbeat. W4 implemented the local registry and the broadcast; W19 implements the rest. The
+scenario starts **two** API instances (`api-a` on 8092, `api-b` on 8093, metrics 9192/9193) against
+one Redis and one engine, and proves three things:
+
+1. **Each notification is delivered by the instance that holds the socket.** Player A on A, player B
+   on B: both are notified, and each instance also *counts* the notification it had no socket for
+   (`matchmaking_ws_notifications_total{result="no_local_connection"}`, 1 per instance).
+2. **A player who never received the notification still gets it.** Player D never connects; the match
+   forms; instance A (holding player C's socket) is killed with `SIGKILL`. C and D connect to B and
+   send `PING`: both receive `MATCH_PENDING_CONFIRMATION` with the same `matchId` — D for the first
+   time. D had no other way to learn it.
+3. **Any instance can finish the match.** Both confirm through B; the match is confirmed (claim
+   present, `match-pending` gone, reverse index cleared, `dissolved` unchanged), and a later heartbeat
+   re-presents nothing.
+
+Measured "before" (the same scenario with the re-presentation removed): **27 passed / 8 failed** (18/8
+in the probe), and the match **dissolved at its 30 s deadline** (`dissolved{reason="timeout"}` 0 → 1).
+After: **26/0** in the probe, **35/0** with the script; first heartbeat → re-presentation **5 ms**;
+presence `routing-2 → api-b` after the reconnect.
+
+Presence, by hand: `redis-cli get presence:<playerId>` names the instance holding the socket (TTL 90 s,
+refreshed on every heartbeat, cleared compare-and-set so a late disconnect from the old instance does
+not erase the new one). `GET /health` answers `{"status":"UP","instance":"api-a"}`.
+
+Two port traps, paid for here: the Schema Registry already holds host **8082** and Kafka **9092**, so
+the second instance uses **8092/8093** and its scrapes **9192/9193**. The script frees both ports
+before starting and kills only the instances it started (the 8080 API is untouched).
 
 ## Typical flow
 

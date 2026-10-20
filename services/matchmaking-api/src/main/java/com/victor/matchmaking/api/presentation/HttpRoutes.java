@@ -80,28 +80,28 @@ public final class HttpRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
-        return createRouter(vertx, jwtAuth, repository, new WsHub(null), null);
+        return createRouter(vertx, jwtAuth, repository, new ConnectionRegistry(null), null);
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, RedisPublisher publisher) {
-        return createRouter(vertx, jwtAuth, repository, new WsHub(publisher), null);
+        return createRouter(vertx, jwtAuth, repository, new ConnectionRegistry(publisher), null);
     }
 
-    /** Full injection used by main: caller keeps the WsHub to route Pub/Sub notifications. */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub) {
-        return createRouter(vertx, jwtAuth, repository, wsHub, null);
+    /** Full injection used by main: caller keeps the ConnectionRegistry to route Pub/Sub notifications. */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, null);
     }
 
     /** Full injection used by main when history is backed by PostgreSQL. */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository) {
-        return devRouter(vertx, jwtAuth, repository, wsHub, matchRepository);
+        return devRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository);
     }
 
     /** Full injection with the real skill provider and party store (main wiring). */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore) {
-        return createRouter(vertx, jwtAuth, repository, wsHub, matchRepository, skillProvider, partyStore,
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
                 new SimpleMeterRegistry());
     }
 
@@ -111,10 +111,10 @@ public final class HttpRoutes {
      * arrival, including the ones the queue never pairs); deeper numbers come from the
      * state itself in the engine.
      */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
             MeterRegistry registry) {
-        return createRouter(vertx, jwtAuth, repository, wsHub, matchRepository, skillProvider, partyStore,
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
                 registry, null);
     }
 
@@ -123,10 +123,10 @@ public final class HttpRoutes {
      * the in-memory wiring use). The limiter is mandatory in the real service: it is the only
      * thing between one authenticated caller and a queue nobody can drain (ADR 0023).
      */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
             MeterRegistry registry, RateLimiter rateLimiter) {
-        return createRouter(vertx, jwtAuth, repository, wsHub, matchRepository, skillProvider, partyStore,
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
                 registry, rateLimiter, Readiness.none());
     }
 
@@ -135,13 +135,13 @@ public final class HttpRoutes {
      * {@link Readiness#none()} means "nothing to probe" (tests and the in-memory wiring), which is
      * an instance that is ready by definition.
      */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
             MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness) {
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
+                new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
                 new PartyUseCases(partyStore, repository, skillProvider), registry, rateLimiter, readiness);
     }
 
@@ -150,20 +150,20 @@ public final class HttpRoutes {
      * party store, so a party enqueued through one route is visible to the others
      * (a party enqueue must reach the same party the create route stored).
      */
-    private static Router devRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    private static Router devRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository) {
         PartyStore partyStore = new InMemoryPartyStore();
         SkillProvider skillProvider = new DeterministicSkillProvider();
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
+                new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
                 new PartyUseCases(partyStore, repository, skillProvider), new SimpleMeterRegistry(), null,
                 Readiness.none());
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
-            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub,
+            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, PartyUseCases partyUseCases, MeterRegistry registry,
             RateLimiter rateLimiter, Readiness readiness) {
 
@@ -180,9 +180,13 @@ public final class HttpRoutes {
         });
         router.route().handler(BodyHandler.create());
 
+        // Liveness, plus the name of the instance answering (W19, ADR 0026). With more than one
+        // instance, "it is UP" is not actionable until it can say *which* one said so - the probe
+        // that follows a socket to whatever instance holds it has to be able to tell them apart.
         router.get("/health").handler(ctx -> ctx.response()
                 .putHeader("content-type", "application/json")
-                .end("{\"status\":\"UP\"}"));
+                .end(new JsonObject().put("status", "UP")
+                        .put("instance", connectionRegistry.instanceId()).encode()));
 
         // Readiness, not liveness (W18, ADR 0024): whether the dependencies this instance needs
         // are answering. Measured in W18: with Redis stopped, /health said UP while every enqueue
@@ -208,10 +212,10 @@ public final class HttpRoutes {
                         ctx.request().toWebSocket()
                             .onSuccess(ws -> {
                                 String playerId = user.subject();
-                                wsHub.register(playerId, ws);
-                                ws.textMessageHandler(text -> wsHub.handleClientMessage(playerId, ws, text));
-                                ws.closeHandler(v -> wsHub.unregister(playerId, ws));
-                                ws.exceptionHandler(err -> wsHub.unregister(playerId, ws));
+                                connectionRegistry.register(playerId, ws);
+                                ws.textMessageHandler(text -> connectionRegistry.handleClientMessage(playerId, ws, text));
+                                ws.closeHandler(v -> connectionRegistry.unregister(playerId, ws));
+                                ws.exceptionHandler(err -> connectionRegistry.unregister(playerId, ws));
                             })
                             .onFailure(err -> ctx.fail(400));
                     })

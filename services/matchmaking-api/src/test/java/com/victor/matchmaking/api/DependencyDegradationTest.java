@@ -27,7 +27,7 @@ import com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider;
 import com.victor.matchmaking.api.infrastructure.InMemoryPartyStore;
 import com.victor.matchmaking.api.presentation.HttpRoutes;
 import com.victor.matchmaking.api.presentation.Readiness;
-import com.victor.matchmaking.api.presentation.WsHub;
+import com.victor.matchmaking.api.presentation.ConnectionRegistry;
 import com.victor.matchmaking.domain.ticket.MatchmakingTicket;
 import com.victor.matchmaking.metrics.MetricNames;
 import com.victor.matchmaking.redis.TicketRepository;
@@ -93,7 +93,7 @@ class DependencyDegradationTest {
         Readiness readiness = new Readiness(List.of(
                 new Readiness.Check("redis", () -> probe(HOT_STATE_FAILURE)),
                 new Readiness.Check("postgres", () -> probe(SOURCE_OF_TRUTH_FAILURE))));
-        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, new WsHub(null), null,
+        Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, new ConnectionRegistry(null), null,
                 new DeterministicSkillProvider(), new InMemoryPartyStore(), registry, null, readiness);
         HttpServer server = vertx.createHttpServer();
         server.requestHandler(router);

@@ -482,6 +482,13 @@ public final class MatchmakingEngineApplication {
                     // then died on its timeout (measured in W16: a whole load run dissolving 141
                     // matches, every one of them a client that was too fast for the engine).
                     List<Future<Void>> confirming = new ArrayList<>();
+                    // The reverse index a reconnecting client needs (W19, ADR 0026): player →
+                    // match, written alongside the tickets that are now CONFIRMING. A beat later
+                    // and a heartbeat in between would find the tickets confirming but no match
+                    // to re-present; the index is part of "the match exists now", not a follow-up.
+                    confirming.add(pending.indexPlayers(pm)
+                            .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                    "engine.error stage=indexPlayers matchId=" + matchId, err)));
                     for (MatchmakingTicket candidate : candidates) {
                         confirming.add(tickets.save(null, transition(candidate, TicketState.CONFIRMING))
                                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,
@@ -755,6 +762,8 @@ public final class MatchmakingEngineApplication {
                         }
                         pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                                 "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
+                        pending.clearPlayerIndex(pm).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                                "engine.error stage=clearPlayerIndex matchId=" + pm.matchId(), err));
                         for (PendingMatch.PendingPlayer player : pm.players()) {
                             notifier.notifyPlayer(player.playerId(), Envelope.of("MATCH_CONFIRMED",
                                     new Payloads.MatchConfirmed(pm.matchId())), Payloads.MatchConfirmed::toJson)
@@ -788,6 +797,8 @@ public final class MatchmakingEngineApplication {
         }
         pending.delete(pm.matchId()).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
                 "engine.error stage=deletePendingMatch matchId=" + pm.matchId(), err));
+        pending.clearPlayerIndex(pm).onFailure(err -> LOG.log(System.Logger.Level.ERROR,
+                "engine.error stage=clearPlayerIndex matchId=" + pm.matchId(), err));
         redis.send(Request.cmd(Command.DEL).arg(RedisKeys.matchConfirmedKey(pm.matchId()))
                         .arg(RedisKeys.matchConfirmedClaimKey(pm.matchId())))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR,

@@ -84,6 +84,8 @@ public final class MetricNames {
     public static final String TAG_REGION = "region";
     public static final String TAG_STATUS = "status";
     public static final String TAG_REASON = "reason";
+    /** The outcome of an operation the caller can act on (e.g. a delivery: delivered or missed). */
+    public static final String TAG_RESULT = "result";
 
     // ── Tag values that are not an enum constant ────────────────────────────────────
 
@@ -109,6 +111,44 @@ public final class MetricNames {
     public static final String TAG_DEPENDENCY_POSTGRES = "postgres";
 
     public static final String TAG_DEPENDENCY = "dependency";
+
+    // ── The socket layer: who is connected, and did the notification land? (W19, ADR 0026) ──
+
+    /**
+     * WebSocket connections open on this instance right now, tagged by {@link #TAG_INSTANCE_ID}.
+     * Per instance on purpose: the total across instances is the interesting number, and it is the
+     * only one that can be summed from series that each say where they came from.
+     */
+    public static final String WS_CONNECTIONS = "matchmaking.ws.connections";
+    /**
+     * A player opened a new socket while this instance still held an older one for them (the older
+     * one is closed). A number that climbs says clients are reconnecting before the previous
+     * connection is torn down - the ordinary shape of a reconnect, made visible.
+     */
+    public static final String WS_CONNECTIONS_REPLACED = "matchmaking.ws.connections.replaced";
+    /**
+     * Notifications this instance tried to deliver, tagged by {@link #TAG_RESULT}. The two results
+     * are the whole question of W19: {@link #RESULT_DELIVERED} is a message that found a socket
+     * here, and {@link #RESULT_NO_LOCAL_CONNECTION} is one that did not - the player is on another
+     * instance, or on none. Nothing else can tell those two apart, and it is why a lost
+     * notification used to be indistinguishable from one that was never sent.
+     */
+    public static final String WS_NOTIFICATIONS = "matchmaking.ws.notifications";
+    public static final String RESULT_DELIVERED = "delivered";
+    public static final String RESULT_NO_LOCAL_CONNECTION = "no_local_connection";
+    /**
+     * Heartbeats that re-sent a pending confirmation because the player still had one to answer
+     * (W19, ADR 0026). Each one is a notification the pub/sub path did not deliver - the client
+     * missed it and asked again - which is the repair path doing its job, not an error.
+     */
+    public static final String WS_REPRESENTED = "matchmaking.ws.represented";
+
+    /**
+     * Which instance answered. Not named {@code instance}: Prometheus adds an {@code instance}
+     * label of its own at scrape time, and a metric that already has one is renamed rather than
+     * merged - the series would read {@code exported_instance} and answer a different question.
+     */
+    public static final String TAG_INSTANCE_ID = "instance_id";
 
     private MetricNames() {
     }

@@ -74,4 +74,26 @@ public final class RedisKeys {
     public static String partyKey(String partyId) {
         return "party:" + partyId;
     }
+
+    /**
+     * The instance that holds a player's socket (W19, ADR 0026). Written by the API on connect and
+     * refreshed on every heartbeat, removed on disconnect; the value is the instance id. It is how
+     * "which instance is this player on" stops being a guess: with N instances, the key names the
+     * one holding the socket, and a nameless entry (or none) says the player is not connected.
+     */
+    public static String presenceKey(String playerId) {
+        return "presence:" + playerId;
+    }
+
+    /**
+     * The match a player is being asked to confirm (W19, ADR 0026). The engine writes it for every
+     * member of a formed match and removes it when the match is confirmed or dissolved; the API
+     * reads it on a heartbeat to re-present a {@code MATCH_PENDING_CONFIRMATION} the player may
+     * have missed (a notification published while their socket was reconnecting). It is a reverse
+     * index over {@code match-pending:{matchId}}, which is keyed the other way round and cannot be
+     * searched by player.
+     */
+    public static String playerPendingKey(String playerId) {
+        return "player-pending:" + playerId;
+    }
 }
