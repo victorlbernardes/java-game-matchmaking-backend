@@ -67,7 +67,11 @@ public final class RemoveMemberUseCase {
     private Future<Void> cancelTicket(String ticketId) {
         return ticketRepository.findById(ticketId)
                 .flatMap(ticket -> {
-                    if (ticket == null) {
+                    // Already cancelled: a second cancellation is a no-op, not a state transition
+                    // error. It is reachable by a normal client — a member cancels their ticket
+                    // (which cancels the party) and the leader then dissolves the party — and
+                    // CANCELLED -> CANCELLED used to throw out of a future nobody waited for.
+                    if (ticket == null || ticket.status() == TicketState.CANCELLED) {
                         return Future.succeededFuture();
                     }
                     MatchmakingTicket cancelled = new MatchmakingTicket(
