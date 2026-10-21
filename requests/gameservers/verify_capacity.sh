@@ -6,7 +6,10 @@
 # What it proves:
 #   1. with **no pool registered**, nothing constrains matching - the behaviour of W1-W21 survives
 #      the sprint (a deployment that never registered a game server is not a deployment that
-#      refuses to match anybody);
+#      refuses to match anybody). This phase runs in **SA**, and that is not decoration: the match
+#      it leaves confirmed-and-waiting is exactly what W23's retry would spend the first slot of
+#      the NA pool on, so the wait it asserts lives in a region the rest of the scenario never
+#      fills - a region per question, instead of one region answering two;
 #   2. with a pool that has **no room**, the engine forms nothing and the queue waits: the tickets
 #      stay SEARCHING, no match is announced, and `matchmaking_pairing_suspended_total` says why;
 #   3. a slot appears -> **exactly one** match forms, and once its players confirm the orchestrator
@@ -41,10 +44,20 @@ ENGINE_METRICS="http://localhost:${ENGINE_METRICS_PORT:-9101}/metrics"
 ORCHESTRATOR="http://localhost:${ORCHESTRATOR_PORT:-8086}"
 ORCH_METRICS="http://localhost:${ORCH_METRICS_PORT:-9094}/metrics"
 ORCH_TOKEN="${ORCH_TOKEN:-w22-game-server-token}"
-SERVER_TTL="${SERVER_TTL:-10}"
+# The TTL has to outlive a phase: since W23 a match on a server whose heartbeat stopped is
+# rejected (`server_failed`) and its players are requeued, so a TTL shorter than a phase would
+# dissolve the matches this scenario is watching. Phase 8 backdates `last_seen` instead of waiting
+# the TTL out - the same technique W23's own scenario uses.
+SERVER_TTL="${SERVER_TTL:-120}"
+# W23 gave a confirmed match two deadlines (a server within ALLOCATION_TIMEOUT, a start within
+# START_TIMEOUT). This scenario tests W22's properties - a match that waits for a slot, one that
+# holds the slot while it runs - so both are set long: a phase has to outlive the other sprint's
+# timers, not be rewritten by them. W23's own scenario runs them short and covers the deadlines.
+ALLOCATION_TIMEOUT="${ALLOCATION_TIMEOUT:-600}"
+START_TIMEOUT="${START_TIMEOUT:-600}"
 REDIS_CONTAINER="${REDIS_CONTAINER:-game-matchmaking-backend-redis-1}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-game-matchmaking-backend-postgres-1}"
-PROBE="requests/gameservers/capacity_probe.py"
+MM="$REPO_ROOT/requests/mm.sh"
 OUT="/tmp/w22-out.json"
 API_LOG="${API_LOG:-/tmp/w22-api.log}"
 ENGINE_LOG="${ENGINE_LOG:-/tmp/w22-engine.log}"
@@ -56,21 +69,14 @@ ok()   { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 step() { printf '\n== %s\n' "$1"; }
 note() { printf '        %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
-gt()   { python3 -c "import sys; sys.exit(0 if float('$1') > float('$2') else 1)"; }
-eq()   { python3 -c "import sys; sys.exit(0 if float('$1') == float('$2') else 1)"; }
+gt()   { "$MM" gt "$1" "$2"; }
+eq()   { "$MM" eq "$1" "$2"; }
 
 redis()  { docker exec "$REDIS_CONTAINER" redis-cli "$@" 2>/dev/null; }
 psql()   { docker exec -i "$POSTGRES_CONTAINER" psql -U matchmaking -d matchmaking -tAc "$1" 2>/dev/null; }
 
 metric() { # <scrape-url> <series prefix, without the closing brace> -> value
-  curl -fsS "$1" 2>/dev/null | python3 -c '
-import sys
-prefix = sys.argv[1]
-for line in sys.stdin:
-    if line.startswith(prefix):
-        print(line.split()[-1])
-        break
-' "$2"
+  "$MM" metric "$1" "$2"
 }
 
 metric_or_zero() { local value; value="$(metric "$1" "$2")"; printf '%s' "${value:-0}"; }
@@ -143,6 +149,7 @@ start_orchestrator() {
     cd "$REPO_ROOT" || exit 1
     ORCHESTRATOR_PORT=8086 METRICS_PORT=9094 GAME_SERVER_TOKEN="$ORCH_TOKEN" \
       SERVER_TTL_SECONDS="$SERVER_TTL" \
+      ALLOCATION_TIMEOUT_SECONDS="$ALLOCATION_TIMEOUT" START_TIMEOUT_SECONDS="$START_TIMEOUT" \
       mvn -o -q -pl services/match-orchestrator exec:java \
         -Dexec.mainClass=com.victor.matchmaking.orchestrator.MatchOrchestratorApplication \
         </dev/null >"$ORCH_LOG" 2>&1 &
@@ -154,13 +161,13 @@ start_orchestrator() {
 login() { # <playerId> -> token
   curl -fsS -X POST "$AUTH/v1/auth/login" -H 'content-type: application/json' \
     -d "{\"playerId\":\"$1\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
+    | "$MM" json - token
 }
 
-probe_to() { # <out-file> <json-args...>
+probe_to() { # <out-file> <queue-subcommand and flags...>
   local out="$1"
   shift
-  ( cd "$REPO_ROOT" && python3 "$PROBE" "$@" ) >"$out" 2>/tmp/w22-probe.err
+  "$MM" queue "$@" >"$out" 2>/tmp/w22-probe.err
   local code=$?
   if [ $code -ne 0 ]; then
     printf '        probe error: %s\n' "$(tail -3 /tmp/w22-probe.err)"
@@ -172,10 +179,12 @@ probe() { # <json-args...> -> writes $OUT
   probe_to "$OUT" "$@"
 }
 
-field() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print("" if v is None else v)' "$OUT" "$1"; }
+field() { # <key> -> the value from $OUT
+  "$MM" json "$OUT" "$1"
+}
 
 field_of() { # <file> <key>
-  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print("" if v is None else v)' "$1" "$2"
+  "$MM" json "$1" "$2"
 }
 
 orchestrator_call() { # <method> <path> [json] -> status in $STATUS, body in $OUT
@@ -205,16 +214,7 @@ pending_matches() { # every match waiting for a confirmation, newest key order
 }
 
 match_players() { # <matchId> -> the roster's player ids, one per line
-  redis get "match-pending:$1" | python3 -c '
-import json, sys
-raw = sys.stdin.read().strip()
-try:
-    pending = json.loads(raw)
-except json.JSONDecodeError:
-    sys.exit(0)
-for player in pending.get("players") or []:
-    print(player.get("playerId") or "")
-'
+  redis get "match-pending:$1" | "$MM" json-array - players playerId | tr ' ' '\n'
 }
 
 wait_pending() { # <count> <seconds>
@@ -233,6 +233,17 @@ queue_depth() { # players waiting in the 1v1 NA queue (all partitions)
 }
 
 allocation_status() { psql "SELECT status FROM match_allocations WHERE match_id = '$1'"; }
+
+forget_match() { # <matchId>
+  # A confirmed match that never got a server now retries until its deadline (W23), which means it
+  # takes the next free slot the pool offers - including the ones later phases create. Where this
+  # scenario abandons such a match on purpose, the retry has to stop with it: the row (the roster
+  # cascades) and the keys that name it go together.
+  psql "DELETE FROM match_allocations WHERE match_id = '$1'" >/dev/null
+  redis del "match-pending:$1" >/dev/null
+  redis del "match-confirmed:$1" >/dev/null
+  redis del "match-confirmed-claim:$1" >/dev/null
+}
 allocation_server() { psql "SELECT COALESCE(server_id, '') FROM match_allocations WHERE match_id = '$1'"; }
 server_allocated() { psql "SELECT allocated FROM game_servers WHERE server_id = '$1'"; }
 
@@ -262,31 +273,39 @@ clean_state() {
   redis eval "for _, k in ipairs(redis.call('keys', 'queue:*')) do redis.call('del', k) end return 1" 0 >/dev/null
   redis eval "for _, k in ipairs(redis.call('keys', 'ticket:*')) do redis.call('del', k) end return 1" 0 >/dev/null
   redis eval "for _, k in ipairs(redis.call('keys', 'match-pending:*')) do redis.call('del', k) end return 1" 0 >/dev/null
+  # A match confirmed with no pool is an allocation row with server_id NULL, which the server
+  # prefix does not reach: W23's roster is what names the scenario's own matches (and the roster
+  # itself is ON DELETE CASCADE, so deleting the allocation is enough).
+  psql "DELETE FROM match_allocations WHERE match_id IN (SELECT match_id FROM match_roster WHERE player_id LIKE 'w22-%')" >/dev/null
   psql "DELETE FROM match_allocations WHERE server_id LIKE 'gs-w22-%'" >/dev/null
   psql "DELETE FROM game_servers WHERE server_id LIKE 'gs-w22-%'" >/dev/null
 }
 
-enqueue_pair() { # <player-a> <player-b> <wait-seconds> -> /tmp/w22-a.json, /tmp/w22-b.json
-  local token_a token_b
+queue_region() { printf '%s' "${1:-NA}"; }
+
+enqueue_pair() { # <player-a> <player-b> <wait-seconds> [region] -> /tmp/w22-a.json, /tmp/w22-b.json
+  local token_a token_b region
+  region="$(queue_region "${4:-NA}")"
   token_a="$(login "$1")"
   token_b="$(login "$2")"
-  probe_to /tmp/w22-a.json enqueue --api "$API" --token "$token_a" --player "$1" --region NA \
+  probe_to /tmp/w22-a.json enqueue --api "$API" --token "$token_a" --player "$1" --region "$region" \
     --redis-port 6379 --wait "$3" &
   local pid_a=$!
-  probe_to /tmp/w22-b.json enqueue --api "$API" --token "$token_b" --player "$2" --region NA \
+  probe_to /tmp/w22-b.json enqueue --api "$API" --token "$token_b" --player "$2" --region "$region" \
     --redis-port 6379 --wait "$3" &
   local pid_b=$!
   wait "$pid_a"
   wait "$pid_b"
 }
 
-play_pair() { # <player-a> <player-b> -> /tmp/w22-a.json, /tmp/w22-b.json (both confirmed)
-  local token_a token_b
+play_pair() { # <player-a> <player-b> [region] -> /tmp/w22-a.json, /tmp/w22-b.json (both confirmed)
+  local token_a token_b region
+  region="$(queue_region "${3:-NA}")"
   token_a="$(login "$1")"
   token_b="$(login "$2")"
-  probe_to /tmp/w22-a.json play --api "$API" --token "$token_a" --player "$1" --region NA --redis-port 6379 &
+  probe_to /tmp/w22-a.json play --api "$API" --token "$token_a" --player "$1" --region "$region" --redis-port 6379 &
   local pid_a=$!
-  probe_to /tmp/w22-b.json play --api "$API" --token "$token_b" --player "$2" --region NA --redis-port 6379 &
+  probe_to /tmp/w22-b.json play --api "$API" --token "$token_b" --player "$2" --region "$region" --redis-port 6379 &
   local pid_b=$!
   wait "$pid_a"
   wait "$pid_b"
@@ -354,12 +373,12 @@ if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
 
-PLAYERS_JSON="$(cd "$REPO_ROOT" && python3 "$PROBE" players --count 14 --prefix w22-)"
-PLAYERS=($(python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])["players"]))' "$PLAYERS_JSON"))
+PLAYERS_JSON="$("$MM" queue players --count 14 --prefix w22-)"
+PLAYERS=($(printf '%s' "$PLAYERS_JSON" | "$MM" json-array - players))
 note "14 players share one skill: ${PLAYERS[*]:0:3} ..."
 
 # ---------------------------------------------------------------------------
-step "2. no pool registered: nothing constrains matching (the W1-W21 default)"
+step "2. no pool registered: nothing constrains matching (the W1-W21 default, in SA)"
 # ---------------------------------------------------------------------------
 STATUS="$(curl -sS -o "$OUT" -w '%{http_code}' "$ORCHESTRATOR/v1/capacity?gameMode=1v1&region=NA")"
 if [ "$STATUS" = "401" ]; then
@@ -376,7 +395,7 @@ else
 fi
 
 BEFORE_NO_CAPACITY="$(metric_or_zero "$ORCH_METRICS" 'matchmaking_allocations_total{result="no_capacity"')"
-play_pair "${PLAYERS[0]}" "${PLAYERS[1]}"
+play_pair "${PLAYERS[0]}" "${PLAYERS[1]}" SA
 MATCH_A="$(field_of /tmp/w22-a.json matchId)"
 CONFIRMED_A="$(field_of /tmp/w22-a.json confirmed)"
 if [ -n "$MATCH_A" ] && [ "$CONFIRMED_A" = "True" ]; then
@@ -385,7 +404,7 @@ else
   fail "an empty pool must not stop matching (see /tmp/w22-a.json: $(cat /tmp/w22-a.json))"
 fi
 if wait_allocation "$MATCH_A" PENDING_ALLOCATION 10; then
-  ok "and the confirmed match is PENDING_ALLOCATION: no server took it (W23 gives it a deadline)"
+  ok "and the confirmed match is PENDING_ALLOCATION: no server took it (W23's retry looks in SA, and SA has no pool)"
 else
   fail "expected the match to stay PENDING_ALLOCATION, found '$(allocation_status "$MATCH_A")'"
 fi
@@ -524,7 +543,7 @@ else
   fail "release answered $STATUS ($(cat "$OUT"))"
 fi
 orchestrator_call POST "/v1/game-servers/gs-w22-one/allocations/$MATCH_WAITING/release"
-if [ "$STATUS" = "404" ] && python3 -c 'import json,sys; sys.exit(0 if json.load(open("/tmp/w22-out.json")).get("error") == "allocation_not_found" else 1)'; then
+if [ "$STATUS" = "404" ] && [ "$("$MM" json /tmp/w22-out.json error)" = "allocation_not_found" ]; then
   ok "a repeated release finds nothing to flip (404 allocation_not_found)"
 else
   fail "the second release answered $STATUS ($(cat "$OUT"))"
@@ -601,6 +620,15 @@ if [ "$(server_allocated gs-w22-two)" = "1" ]; then
 else
   fail "gs-w22-two allocated is '$(server_allocated gs-w22-two)'"
 fi
+# The loser stays PENDING_ALLOCATION for as long as this scenario runs (the deadline is long on
+# purpose), so its retry would take the first slot phase 8 frees. It is abandoned here, which is
+# exactly the state the assertion above described.
+for match in "${MATCHES[@]}"; do
+  if [ "$(allocation_status "$match")" = "PENDING_ALLOCATION" ]; then
+    forget_match "$match"
+    note "abandoned on purpose: $match (its retry would take the next free slot)"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 step "8. a server that stops heartbeating leaves the pool by TTL (no sweep runs)"
@@ -616,8 +644,11 @@ if [ "$(field free)" = "1" ]; then
 else
   fail "expected free 1 after registering gs-w22-ttl, got $(cat "$OUT")"
 fi
-note "waiting $((SERVER_TTL + 2))s without a heartbeat (SERVER_TTL_SECONDS=$SERVER_TTL)"
-sleep "$((SERVER_TTL + 2))"
+# Backdate instead of waiting: what is under test is the pool's reading of `last_seen`, not the
+# passage of time, and waiting $SERVER_TTL out would turn a 2 s check into two minutes.
+psql "UPDATE game_servers SET last_seen = last_seen - interval '$((SERVER_TTL * 6)) seconds' WHERE server_id = 'gs-w22-ttl'" >/dev/null
+note "gs-w22-ttl last_seen backdated by $((SERVER_TTL * 6))s (SERVER_TTL_SECONDS=$SERVER_TTL)"
+sleep 1
 capacity_of 1v1 NA
 if [ "$(field free)" = "0" ]; then
   ok "the silent server is out of the pool: free dropped to 0 with nothing running a sweep"
@@ -625,7 +656,7 @@ else
   fail "expected free 0 after the TTL, got $(cat "$OUT")"
 fi
 orchestrator_call GET /v1/game-servers
-if python3 -c 'import json,sys; servers = json.load(open("/tmp/w22-out.json"))["servers"]; sys.exit(0 if any(s["serverId"] == "gs-w22-ttl" and s["state"] == "STALE" for s in servers) else 1)'; then
+if [ "$("$MM" json-element /tmp/w22-out.json servers serverId gs-w22-ttl state)" = "STALE" ]; then
   ok "and the listing derives STALE for it (the state is computed, never stored)"
 else
   fail "expected gs-w22-ttl to be listed as STALE ($(cat "$OUT"))"
@@ -663,7 +694,7 @@ step "9. shrinking below what is allocated is refused"
 # ---------------------------------------------------------------------------
 orchestrator_call PUT /v1/game-servers/gs-w22-two \
   '{"region":"NA","gameModes":["1v1"],"capacity":0,"endpoint":"10.0.0.7:7777"}'
-if [ "$STATUS" = "409" ] && python3 -c 'import json,sys; sys.exit(0 if json.load(open("/tmp/w22-out.json")).get("error") == "capacity_below_allocated" else 1)'; then
+if [ "$STATUS" = "409" ] && [ "$("$MM" json /tmp/w22-out.json error)" = "capacity_below_allocated" ]; then
   ok "a server running a match cannot be shrunk to 0 (409 capacity_below_allocated)"
 else
   fail "expected 409 capacity_below_allocated, got $STATUS ($(cat "$OUT"))"
@@ -752,7 +783,7 @@ else
   fail "expected the released match to be RELEASED, found $RELEASED"
 fi
 orchestrator_call GET /v1/game-servers
-if python3 -c 'import json,sys; sys.exit(0 if len(json.load(open("/tmp/w22-out.json"))["servers"]) >= 3 else 1)'; then
+if gt "$("$MM" json-length /tmp/w22-out.json servers)" 2; then
   ok "the pool lists every server the scenario registered"
 else
   fail "the listing does not hold the servers ($(cat "$OUT"))"

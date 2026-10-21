@@ -25,6 +25,7 @@ matchmaking/
 ├── partitioning-w20/      # queue partitions: enqueue, per-partition depth, hotspot (W20)
 ├── multiregion-w21/       # regions: the directory, the ping/pong probe, the two refusals (W21)
 ├── gameservers-w22/       # the pool, the atomic allocation and the capacity gate (W22)
+├── lifecycle-w23/         # allocation deadlines, requeue and the connection token (W23)
 └── infra/
     └── schema-registry/   # GET /config, /subjects, /schemas/types (W12)
 ```
@@ -33,10 +34,8 @@ Scripts next to the collection (same folder, runnable by hand):
 
 ```text
 requests/
-├── e2e/run_e2e.py                     # 11 scenarios, 52 checks over HTTP + Redis + Kafka + Postgres
-├── e2e/check_confirmation_sweep.py    # focused confirmation-timeout timeline
+├── mm.sh                              # the scenario harness: one command per question a script asks
 ├── engine/verify_queue_reaper.sh      # queue: a ghost member must not stall the mode/region (W16)
-├── load/run_load.py                   # load: the ceiling and the behaviour at it (W16)
 ├── load/results-*.json                # one file per measured run (before/after, 400/2000/4000 players)
 ├── kafka/check_kafka.sh               # infrastructure: containers, registry, log round-trip
 ├── kafka/check_contract_gate.sh       # contract: is this change compatible with its base?
@@ -47,37 +46,43 @@ requests/
 ├── kafka/verify_outbox.sh             # producer: an event survives its publisher being absent (W14)
 ├── observability/
 │   ├── check_metrics.sh               # KPIs: exposition, the numbers moving, Prometheus + Grafana (W15)
-│   ├── pending_match.py               # helper: the pending match of two given players
-│   ├── check_slos.sh                  # SLOs: rules loaded, ratios agree with a hand count, alerts alive (W16)
-│   └── slo_ratios.py                  # helper: the counters of a scrape, and the ratios of a window
-├── backpressure/
-│   ├── verify_load_shedding.sh        # the three refusals: 429, 503, and waiting on the database (W17)
-│   ├── fill_queue.py                  # helper: arrivals until the API refuses, and what it said
-│   └── db_backpressure.py             # helper: a confirmation burst against a deliberately slow Postgres
-├── resilience/
-│   ├── verify_degradation.sh          # the degradation matrix, one dependency at a time (W18)
-│   └── degradation_probe.py           # helper: enqueue/drive a match, read the state a failure left
-├── routing/
-│   ├── verify_routing.sh              # two instances: routing, kill, re-presentation (W19)
-│   └── routing_probe.py               # helper: two WebSocket clients, the kill, the heartbeats
-├── multiregion/
-│   ├── verify_multiregion.sh          # two regions, two Redises, placement and failover (W21)
-│   ├── multiregion_probe.py           # helper: login, probe, ticket, play a full match
-│   └── delay_proxy.py                 # helper: a TCP proxy that adds latency (the "far" region)
-└── gameservers/
-    ├── verify_capacity.sh             # the pool, the allocation, the gate and the TTL (W22)
-    └── capacity_probe.py              # helper: enqueue (without confirming) and confirm a match
+│   └── check_slos.sh                  # SLOs: rules loaded, ratios agree with a hand count, alerts alive (W16)
+├── backpressure/verify_load_shedding.sh  # the three refusals: 429, 503, and waiting on the database (W17)
+├── resilience/verify_degradation.sh   # the degradation matrix, one dependency at a time (W18)
+├── routing/verify_routing.sh          # two instances: routing, kill, re-presentation (W19)
+├── partitioning/verify_partitioning.sh # queue: one key vs 8, the hotspot, cross-partition pairing (W20)
+├── multiregion/verify_multiregion.sh  # two regions, two Redises, placement and failover (W21)
+├── gameservers/verify_capacity.sh     # the pool, the allocation, the gate and the TTL (W22)
+├── lifecycle/verify_lifecycle.sh      # deadlines, requeue, connection token, no-show (W23)
+├── load/run_load.py                   # load: the ceiling and the behaviour at it (W16)
+└── (the E2E and the multiregion probe are harness subcommands: `mm.sh e2e`, `mm.sh multiregion`)
 ```
 
-```text
-requests/partitioning/
-├── verify_partitioning.sh             # queue: one key vs 8, the hotspot, cross-partition pairing (W20)
-└── partition_probe.py                 # helper: arrivals per partition, the scrape, the cross pairing
+### The harness is Java
 
-requests/gameservers/
-├── verify_capacity.sh                 # pool: register, wait, allocate, release, over-commit (W22)
-└── capacity_probe.py                  # helper: enqueue/confirm separately (capacity sits between them)
+The probes the scripts call are a Java module, `tools/scenarios`, reached through
+`requests/mm.sh`. It is not a deployable and no service depends on it; it exists so a
+scenario can ask its question using the product's own vocabulary — the same
+`DeterministicSkill` the engine pairs with, the same `QueuePartitions` the API writes,
+the same `GameMode` and `Region`. A second implementation of any of those would let a
+harness bug look like a product bug.
+
+```bash
+requests/mm.sh queue players --count 16 --prefix w23-   # ids that share one skill
+requests/mm.sh json /tmp/probe.json hotspot             # one field of a probe's answer
+requests/mm.sh le 1.092 1.15                            # a comparison, by exit code
 ```
+
+`mm.sh` rebuilds the jar when a `.java` under `common/` or `tools/` is newer than it, so a
+script never runs against a stale probe (the same trap as starting a service before
+`mvn install`). Bash keeps the orchestration — `curl`, `docker`, `psql`, `redis-cli`, killing
+and starting services — because that is what a scenario *does*; the logic that reads an
+answer moved to Java.
+
+Still Python, pending migration: the load harness (`load/run_load.py`) and the helpers the
+Kafka scripts generate at runtime (`compat.py` in the contract gate, `mutate.py` in the proto
+evolution check, the two parsers in `verify_dlq.sh`, the log reader in
+`verify_match_confirmed.sh`). `11 - Progresso.md` (vault) tracks the phases and what is left.
 
 ## Party flow (W11)
 
@@ -141,7 +146,7 @@ the same reason.
 
 ## Automated E2E (W9/W10/W11/W12/W13)
 
-`requests/e2e/run_e2e.py` drives the running services over HTTP and asserts the
+`requests/mm.sh e2e` drives the running services over HTTP and asserts the
 engine state through Redis, the published event through Kafka and the orchestrator's
 projection through Postgres (11 scenarios, 52 checks): 1v1 and 5v5 pairing, party
 fill, party never split, party not fillable, atomic cancel / remove / dissolve,
@@ -151,8 +156,8 @@ teams and skill snapshot included) — and S11, where the orchestrator projects 
 match exactly once.
 
 ```bash
-python3 requests/e2e/run_e2e.py            # exits non-zero if any check fails
-python3 requests/e2e/check_confirmation_sweep.py   # focused sweep timeline
+requests/mm.sh e2e            # exits non-zero if any check fails
+requests/mm.sh e2e sweep                             # focused sweep timeline
 ```
 
 S10 confirms both players by publishing on the `match_confirmations` channel — the
@@ -612,7 +617,7 @@ The scenario proves each refusal against the running stack:
    its ticket while the queue is full. Then the queue is cleaned up, the engine restarted and a new
    arrival admitted — the refusal was temporary, not a closed door.
 3. **Database** — Postgres is made genuinely slow with a `BEFORE INSERT ON matches` trigger that
-   sleeps 3 s, and `db_backpressure.py` drives a real burst: 24 players → 12 matches → 24
+   sleeps 3 s, and `mm.sh backpressure db` drives a real burst: 24 players → 12 matches → 24
    confirmations published at once. It samples `pg_stat_activity` for the sessions actually running
    the insert (the ground truth, not the engine's opinion) and the `matchmaking_db_writes_in_flight`
    gauge. Result: **12/12 written, 0 lost**; Postgres never ran more than a handful of inserts at a

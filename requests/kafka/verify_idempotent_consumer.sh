@@ -13,7 +13,7 @@
 #   docker compose up -d            (kafka + postgres healthy)
 #   mvn -B install -DskipTests      (the services resolve their modules from ~/.m2)
 #   the orchestrator running, and at least one MATCH_CONFIRMED on the topic
-#   (python3 requests/e2e/run_e2e.py creates one - scenario S11)
+#   (requests/mm.sh e2e creates one - scenario S11)
 #
 # This script stops the running orchestrator (pkill), rewinds the offsets, starts it
 # again and leaves it running. Usage:
@@ -89,7 +89,7 @@ fi
 if [ "${topic_records:-0}" -gt 0 ] 2>/dev/null; then
   ok "topic $TOPIC holds $topic_records record(s) to replay"
 else
-  bad "topic $TOPIC is empty - create a confirmed match first (python3 requests/e2e/run_e2e.py)"
+  bad "topic $TOPIC is empty - create a confirmed match first (requests/mm.sh e2e)"
 fi
 
 if [ "$allocations_before" -gt 0 ] 2>/dev/null; then

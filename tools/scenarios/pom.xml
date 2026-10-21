@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.victor.matchmaking</groupId>
+        <artifactId>game-matchmaking-backend</artifactId>
+        <version>0.2.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>matchmaking-scenarios</artifactId>
+    <packaging>jar</packaging>
+    <name>matchmaking-scenarios (test harness)</name>
+    <description>
+        The scenario harness: the clients that drive the request scripts (players, game servers,
+        load, probes). It is not a deployable and no service depends on it. Java rather than
+        Python so the checks that describe the product can use the product's own types
+        (DeterministicSkill, QueuePartitions, GameMode, Region) instead of reimplementing them.
+    </description>
+
+    <dependencies>
+        <!-- The harness describes the product, so it reads the product's vocabulary. Nothing here
+             is a runtime dependency of a service: the arrow points one way (tools → common). -->
+        <dependency>
+            <groupId>com.victor.matchmaking</groupId>
+            <artifactId>common-domain</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- QueuePartitions: the partition index the probe checks is the product's own function,
+             not a second implementation that could disagree in silence. -->
+        <dependency>
+            <groupId>com.victor.matchmaking</groupId>
+            <artifactId>common-redis</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- The backpressure probe reads what Postgres is doing (pg_stat_activity) and what it
+             kept (the rows it wrote): the measurement is of the database, so the probe asks it
+             directly instead of asking a container. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgres.version}</version>
+        </dependency>
+        <!-- JSON at the boundary only: this module is a client of the HTTP API and of Redis, which
+             speak JSON. The services themselves keep to records (AGENTS.md rule 11). -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- One jar, no version in the name: requests/mm.sh points at this path. -->
+        <finalName>matchmaking-scenarios</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <!-- A jar, not a second pom to maintain. -->
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.victor.matchmaking.scenarios.ScenarioCli</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

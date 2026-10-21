@@ -30,6 +30,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
 AUTH_PORT="${AUTH_PORT:-8091}"
 AUTH="http://localhost:${AUTH_PORT}"
 NA_API="http://localhost:${NA_API_PORT:-8096}"
@@ -45,8 +46,6 @@ NA_REDIS_CONTAINER="w21-redis-na"
 EU_REDIS_CONTAINER="w21-redis-eu"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-game-matchmaking-backend-postgres-1}"
-PROBE="requests/multiregion/multiregion_probe.py"
-PROXY_SCRIPT="requests/multiregion/delay_proxy.py"
 DELAY_MS="${DELAY_MS:-40}"
 # EU is 120 ms from NA in the operator's model (the scenario's world); SA is out of the picture.
 RTT_MATRIX="EU-EU=20,NA-NA=25,SA-SA=110,EU-NA=120,EU-SA=180,NA-SA=140"
@@ -75,20 +74,17 @@ redis_count() { # <container> <pattern> -> number of matching keys, counted insi
 }
 
 # A dotted key out of the probe's JSON answer ("" when absent).
-jpath() { # <file> <dotted.key>
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-with open(sys.argv[1]) as handle:
-    value = json.load(handle)
-for part in sys.argv[2].split("."):
-    if isinstance(value, dict):
-        value = value.get(part)
-    elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
-        value = value[int(part)]
-    else:
-        value = None
-print("" if value is None else value)
-PY
+jpath() { # <file> <dotted.key> -> the value ("" when absent or null)
+  "$MM" json "$1" "$2"
+}
+
+# <region> <field> -> that field of the entry of body.regions whose region is <region>.
+jpath_element() {
+  "$MM" json-element "$OUT" body.regions region "$1" "$2"
+}
+
+jpath_array() { # <array field> -> its values, joined by a space
+  "$MM" json-array "$OUT" "$1"
 }
 
 stop_services() {
@@ -193,12 +189,12 @@ start_engine() { # <served-region> <metrics-port> <redis-port> <log>
 login() { # <player> <home-region> -> token
   curl -fsS -X POST "$AUTH/v1/auth/login" -H 'content-type: application/json' \
     -d "{\"playerId\":\"$1\",\"region\":\"$2\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
+    | "$MM" json - token
 }
 
 probe() { # <out-file> <args...>
   local out="$1"; shift
-  ( cd "$REPO_ROOT" && python3 "$PROBE" "$@" ) >"$out" 2>"/tmp/w21-probe.err"
+  "$MM" multiregion "$@" >"$out" 2>"/tmp/w21-probe.err"
   local code=$?
   if [ $code -ne 0 ]; then
     printf '        probe error: %s\n' "$(tail -3 /tmp/w21-probe.err)"
@@ -305,8 +301,11 @@ fi
 
 # The distance: a one-way delay in front of NA, so "distant" is a real 80 ms round trip.
 free_port 8099
-( cd "$REPO_ROOT" && python3 "$PROXY_SCRIPT" --listen 8099 --upstream 8096 --delay-ms "$DELAY_MS" \
-    >"$PROXY_LOG" 2>&1 & echo $! >/tmp/w21-proxy.pid )
+(
+  # The proxy is the harness too: one JVM, same jar, the JDK's own HTTP server.
+  "$MM" delay-proxy --listen 8099 --upstream 8096 --delay-ms "$DELAY_MS" \
+    >"$PROXY_LOG" 2>&1 & echo $! >/tmp/w21-proxy.pid
+)
 if wait_http "$PROXY/health" 20; then
   ok "a delay proxy sits in front of NA on $PROXY (+$DELAY_MS ms each way)"
 else
@@ -319,7 +318,7 @@ step "2. the directory: what a client can know before it asks for a region"
 probe "$OUT" players --count 8 --prefix "mr-$RUN_TAG-eu-"
 EU_PLAYER="$(jpath "$OUT" players.0)"
 EU_TOKEN="$(login "$EU_PLAYER" EU)"
-note "EU player $EU_PLAYER (skill $(python3 -c 'import json,sys; print(json.load(open("/tmp/w21-probe.json"))["skill"])'))"
+note "EU player $EU_PLAYER (skill $(jpath "$OUT" skill))"
 
 if probe "$OUT" directory --api "$NA_API" --token "$EU_TOKEN"; then
   if [ "$(jpath "$OUT" body.playerRegion)" = "EU" ]; then
@@ -327,20 +326,20 @@ if probe "$OUT" directory --api "$NA_API" --token "$EU_TOKEN"; then
   else
     fail "expected playerRegion EU, got $(jpath "$OUT" body.playerRegion)"
   fi
-  if [ "$(jpath "$OUT" body.served)" = "['NA']" ]; then
+  if [ "$(jpath "$OUT" body.served)" = '["NA"]' ]; then
     ok "NA says it serves NA and only NA: $(jpath "$OUT" body.served)"
   else
-    fail "expected served ['NA'], got $(jpath "$OUT" body.served)"
+    fail "expected served [\"NA\"], got $(jpath "$OUT" body.served)"
   fi
-  na_declared="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["declaredRttMs"] for r in d if r["region"]=="NA"][0])')"
-  na_measured="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["measuredRttMs"] for r in d if r["region"]=="NA"][0])')"
-  eu_declared="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["declaredRttMs"] for r in d if r["region"]=="EU"][0])')"
+  na_declared="$(jpath_element NA declaredRttMs)"
+  na_measured="$(jpath_element NA measuredRttMs)"
+  eu_declared="$(jpath_element EU declaredRttMs)"
   if [ "$na_declared" = "120" ] && [ "$eu_declared" = "20" ]; then
     ok "the declared matrix reads EU->NA as 120 ms and EU->EU as 20 ms"
   else
     fail "unexpected declared distances: NA=$na_declared EU=$eu_declared"
   fi
-  if [ "$na_measured" = "None" ]; then
+  if [ -z "$na_measured" ]; then
     ok "before probing, the directory has no measurement to show (it does not invent one)"
   else
     fail "expected measuredRttMs null before the probe, got $na_measured"
@@ -381,15 +380,15 @@ else
 fi
 
 if probe "$OUT" directory --api "$NA_API" --token "$EU_TOKEN"; then
-  na_measured="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["measuredRttMs"] for r in d if r["region"]=="NA"][0])')"
-  na_rtt="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["rttMs"] for r in d if r["region"]=="NA"][0])')"
+  na_measured="$(jpath_element NA measuredRttMs)"
+  na_rtt="$(jpath_element NA rttMs)"
   if [ "$na_measured" = "$far" ] && [ "$na_rtt" = "120" ]; then
     ok "the directory now shows the measurement ($na_measured ms) and the placement number is max(120,$far)=$na_rtt"
   else
     fail "directory after probing: measured=$na_measured rtt=$na_rtt (expected $far and 120)"
   fi
-  eu_measured="$(python3 -c 'import json; d=json.load(open("/tmp/w21-probe.json"))["body"]["regions"]; print([r["measuredRttMs"] for r in d if r["region"]=="EU"][0])')"
-  if [ "$eu_measured" = "None" ]; then
+  eu_measured="$(jpath_element EU measuredRttMs)"
+  if [ -z "$eu_measured" ]; then
     ok "NA cannot show the EU measurement: a region's measurements live in that region"
   else
     fail "NA answered with an EU measurement it cannot have: $eu_measured"
@@ -432,7 +431,7 @@ if [ "$(jpath "$OUT" status)" = "422" ] && [ "$(jpath "$OUT" body.error)" = "reg
 else
   fail "expected 422 region_unsupported, got $(jpath "$OUT" status) $(jpath "$OUT" body.error)"
 fi
-if [ "$(jpath "$OUT" body.served)" = "['NA']" ]; then
+if [ "$(jpath "$OUT" body.served)" = '["NA"]' ]; then
   ok "the refusal names the regions this endpoint accepts"
 else
   fail "the refusal does not list the served regions: $(cat "$OUT")"
@@ -455,7 +454,7 @@ step "5. inside the region: a match forms and is confirmed"
 # ---------------------------------------------------------------------------
 # A fresh block of ids that share one skill, so the pairing policy can pair them at once.
 probe "$OUT" players --count 6 --prefix "mr-$RUN_TAG-pair-"
-pair_players="$(python3 -c 'import json; print(" ".join(json.load(open("/tmp/w21-probe.json"))["players"]))')"
+pair_players="$(jpath_array players)"
 set -- $pair_players
 EU_A="$1"; EU_B="$2"; EU_C="$3"; EU_D="$4"; EU_E="$5"; EU_F="$6"
 TOKEN_A="$(login "$EU_A" EU)"; TOKEN_B="$(login "$EU_B" EU)"
@@ -555,7 +554,7 @@ else
 fi
 
 probe "$OUT" players --count 2 --prefix "mr-$RUN_TAG-na-iso-"
-na_players="$(python3 -c 'import json; print(" ".join(json.load(open("/tmp/w21-probe.json"))["players"]))')"
+na_players="$(jpath_array players)"
 set -- $na_players
 N1="$1"; N2="$2"
 T1="$(login "$N1" NA)"; T2="$(login "$N2" NA)"
@@ -575,7 +574,7 @@ fi
 step "9. the player fails over, and coming back does not match twice"
 # ---------------------------------------------------------------------------
 probe "$OUT" players --count 2 --prefix "mr-$RUN_TAG-failover-"
-failover_players="$(python3 -c 'import json; print(" ".join(json.load(open("/tmp/w21-probe.json"))["players"]))')"
+failover_players="$(jpath_array players)"
 set -- $failover_players
 FAIL_PLAYER="$1"
 FAIL_PARTNER="$2"

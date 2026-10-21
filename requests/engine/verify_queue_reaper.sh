@@ -23,6 +23,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
 API="http://localhost:8080"
 AUTH="http://localhost:8081"
 ENGINE_METRICS="http://localhost:${ENGINE_METRICS_PORT:-9091}/metrics"
@@ -40,24 +41,8 @@ fail() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
 redis() { docker exec "$REDIS_CONTAINER" redis-cli "$@" 2>/dev/null; }
 
-metric_sum() { # <url> <metric> <label-fragment>
-  curl -fsS "$1" 2>/dev/null | python3 -c '
-import sys
-name, label_filter = sys.argv[1], sys.argv[2]
-total, seen = 0.0, False
-for line in sys.stdin:
-    if line.startswith("#") or not line.startswith(name):
-        continue
-    head, _, value = line.rpartition(" ")
-    if label_filter and label_filter not in head:
-        continue
-    try:
-        total += float(value)
-        seen = True
-    except ValueError:
-        pass
-print(total if seen else "ABSENT")
-' "$2" "$3"
+metric_sum() { # <url> <metric> <label-fragment> -> the sum, or ABSENT when the series is absent
+  "$MM" metric-sum "$1" "$2" "$3"
 }
 
 metric_contains() { curl -fsS "$1" 2>/dev/null | grep -q "^$2"; }
@@ -89,26 +74,9 @@ fi
 step "1. an expired ticket leaves a ghost behind"
 # ---------------------------------------------------------------------------
 # Player A waits alone (a skill nobody in the queue shares), so the queue cannot move.
-players="$(python3 -c "
-import sys, time
-sys.path.insert(0, '$REPO_ROOT/requests/e2e')
-import run_e2e
-base = 'reaper%d' % time.time()
-groups, pair, i = {}, None, 0
-while pair is None:
-    pid = '%s-%d' % (base, i)
-    s = run_e2e.skill(pid)
-    groups.setdefault(s, []).append(pid)
-    if len(groups[s]) >= 2:
-        pair = groups[s][:2]
-    i += 1
-while True:
-    ghost = '%s-%d' % (base, i)
-    if run_e2e.skill(ghost) != run_e2e.skill(pair[0]):
-        break
-    i += 1
-print(' '.join(pair + [ghost]))
-")"
+# Two players the engine can pair plus one it never considers compatible: the ghost must be a
+# player the matching cannot use, or "the ghost does not block" would pass by pairing the ghost.
+players="$("$MM" pairing three --prefix "reaper$(date +%s)-")"
 player_a="$(echo "$players" | cut -d' ' -f1)"
 player_b="$(echo "$players" | cut -d' ' -f2)"
 player_ghost="$(echo "$players" | cut -d' ' -f3)"
@@ -116,12 +84,12 @@ player_ghost="$(echo "$players" | cut -d' ' -f3)"
 token() {
   curl -fsS -X POST "$AUTH/v1/auth/login" -H 'Content-Type: application/json' \
     -d "{\"playerId\":\"$1\",\"displayName\":\"$1\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null
+    | "$MM" json - token 2>/dev/null
 }
 enqueue() { # <token> -> ticket id
   curl -fsS -X POST "$API/v1/matchmaking/tickets" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -d '{"gameMode":"1v1","region":"NA","maxLatencyMs":80}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ticketId", ""))' 2>/dev/null
+    | "$MM" json - ticketId 2>/dev/null
 }
 
 # A known starting point: the queue of the local stack is cleared (the E2E scenarios do the same).
@@ -185,7 +153,7 @@ else
 fi
 
 depth="$(metric_sum "$ENGINE_METRICS" matchmaking_queue_depth 'mode="1v1",region="NA"')"
-if python3 -c "import sys; sys.exit(0 if '$depth' != 'ABSENT' and float('$depth') == 0 else 1)"; then
+if [ "$depth" != "ABSENT" ] && "$MM" eq "$depth" 0; then
   ok "the queue depth KPI is back to 0: the number no longer counts a player who left"
 else
   note "the KPI reads $depth until the next poll (2 s)"
@@ -200,7 +168,7 @@ step "3. a ghost at the head no longer blocks the pairing"
 token_a="$(token "$player_a")"
 token_b="$(token "$player_b")"
 ghost_again="ticket-ghost-$(date +%s)"
-redis zadd "$QUEUE_KEY" "$(python3 -c 'import time; print(int((time.time() - 30) * 1000))')" "$ghost_again" >/dev/null
+redis zadd "$QUEUE_KEY" "$(($("$MM" now-millis) - 30000))" "$ghost_again" >/dev/null
 ticket_a="$(enqueue "$token_a")"
 ticket_b="$(enqueue "$token_b")"
 if [ -n "$ticket_a" ] && [ -n "$ticket_b" ]; then
@@ -212,8 +180,8 @@ fi
 match_id=""
 waited=0
 while [ -z "$match_id" ] && [ "$waited" -lt "$WAIT_TIMEOUT_S" ]; do
-  match_id="$(python3 "$REPO_ROOT/requests/observability/pending_match.py" \
-      "$player_a" "$player_b" "$REDIS_CONTAINER" 2>/dev/null)"
+  match_id="$("$MM" observability pending-match "$player_a" "$player_b" \
+      --redis-port "${REDIS_PORT:-6379}" 2>/dev/null)"
   [ -z "$match_id" ] && sleep 1 && waited=$((waited + 1))
 done
 if [ -n "$match_id" ]; then

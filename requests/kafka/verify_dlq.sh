@@ -26,7 +26,7 @@
 #   docker compose up -d            (kafka + schema-registry + postgres healthy)
 #   mvn -B install -DskipTests      (the services resolve their modules from ~/.m2)
 #   the orchestrator running, with at least one event already projected
-#   (python3 requests/e2e/run_e2e.py projects one in scenario S11)
+#   (requests/mm.sh e2e projects one in scenario S11)
 #
 # The dead letter topic is created here if it is missing: a service is not allowed to
 # invent topics (partition count and retention are deliberate operational choices), so
@@ -282,7 +282,7 @@ fi
 if [ "${allocations_before:-0}" -gt 0 ] 2>/dev/null; then
   ok "there is a projected match for the conflicting effect of phase 2"
 else
-  bad "nothing projected yet - run the E2E first (python3 requests/e2e/run_e2e.py)"
+  bad "nothing projected yet - run the E2E first (requests/mm.sh e2e)"
 fi
 
 # The dead letter topic must exist BEFORE a record fails: an undeliverable dead letter

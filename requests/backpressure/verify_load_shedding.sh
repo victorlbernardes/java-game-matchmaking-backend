@@ -29,6 +29,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
 API="${API:-http://localhost:8080}"
 AUTH="${AUTH:-http://localhost:8081}"
 API_METRICS="${API_METRICS:-http://localhost:9090/metrics}"
@@ -55,33 +56,17 @@ fail() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 redis() { docker exec "$REDIS_CONTAINER" redis-cli "$@" 2>/dev/null; }
 psql_() { docker exec "$POSTGRES_CONTAINER" psql -U matchmaking -d matchmaking -At -c "$1" 2>/dev/null; }
 
-metric_sum() { # <url> <metric> <label-fragment>
-  curl -fsS --max-time 5 "$1" 2>/dev/null | python3 -c '
-import sys
-name, label_filter = sys.argv[1], sys.argv[2]
-total, seen = 0.0, False
-for line in sys.stdin:
-    if line.startswith("#") or not line.startswith(name):
-        continue
-    head, _, value = line.rpartition(" ")
-    if label_filter and label_filter not in head:
-        continue
-    try:
-        total += float(value)
-        seen = True
-    except ValueError:
-        pass
-print(total if seen else "ABSENT")
-' "$2" "$3"
+metric_sum() { # <url> <metric> <label-fragment> -> the sum, or ABSENT when the series is absent
+  "$MM" metric-sum "$1" "$2" "$3"
 }
 
 token() {
   curl -fsS --max-time 10 -X POST "$AUTH/v1/auth/login" -H 'Content-Type: application/json' \
     -d "{\"playerId\":\"$1\",\"displayName\":\"$1\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null
+    | "$MM" json - token 2>/dev/null
 }
 
-json_field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+json_field() { "$MM" json - "$1" 2>/dev/null; }
 
 cleanup_trigger() {
   psql_ "DROP TRIGGER IF EXISTS w17_slow_matches ON matches;" >/dev/null
@@ -142,7 +127,7 @@ server_5xx=0
 limit_advertised=""
 missing_retry_after=0
 remaining_on_refusal="missing-refusal"
-started="$(python3 -c 'import time; print(time.time())')"
+started="$("$MM" now)"
 for _ in $(seq 1 "$REQUEST_COUNT"); do
   headers="$(curl -sS --max-time 20 -D - -o /tmp/w17-rl-body -X POST "$API/v1/matchmaking/tickets" \
     -H "Authorization: Bearer $token_player" -H 'Content-Type: application/json' \
@@ -166,7 +151,7 @@ for _ in $(seq 1 "$REQUEST_COUNT"); do
     *) : ;;
   esac
 done
-elapsed="$(python3 -c "import time; print(round(time.time() - $started, 3))")"
+elapsed="$("$MM" elapsed "$started")"
 
 if [ -n "$limit_advertised" ]; then
   ok "the API advertises its burst: X-RateLimit-Limit=$limit_advertised"
@@ -187,15 +172,14 @@ fi
 # The bound: the burst plus whatever the refill earned during the loop. The window is a fraction
 # of a second, so this is a tight check and not a formality.
 if [ -n "$limit_advertised" ]; then
-  bound_ok="$(python3 -c "
-import math, sys
-limit, refill, elapsed, allowed = int($limit_advertised), float($RATE_LIMIT_REFILL_PER_SECOND), float($elapsed), int($allowed)
-budget = limit + math.ceil(elapsed * refill) + 1
-print('yes' if allowed <= budget else 'no:%d>%d' % (allowed, budget))")"
-  case "$bound_ok" in
-    yes) ok "admitted $allowed <= burst $limit_advertised + refill over ${elapsed}s (a limit, not a hope)" ;;
-    *)   fail "admitted ${bound_ok#no:} requests while the configured budget was the bound (the bucket leaked)" ;;
-  esac
+  # The bound: the burst plus whatever the refill earned during the loop (+1 for the edge).
+  refilled="$("$MM" ceil "$("$MM" mul "$elapsed" "$RATE_LIMIT_REFILL_PER_SECOND" 3)")"
+  budget=$((limit_advertised + refilled + 1))
+  if [ "$allowed" -le "$budget" ]; then
+    ok "admitted $allowed <= burst $limit_advertised + refill over ${elapsed}s (a limit, not a hope)"
+  else
+    fail "admitted $allowed requests while the configured budget was $budget (the bucket leaked)"
+  fi
 fi
 if [ "$missing_retry_after" -eq 0 ] && [ "$rejected" -ge 1 ]; then
   ok "every 429 carried Retry-After (a refusal that does not say when to come back is a hang)"
@@ -214,7 +198,7 @@ else
 fi
 
 rate_limited_kpi="$(metric_sum "$API_METRICS" matchmaking_tickets_rejected_total 'reason="rate_limited"')"
-if [ "$rate_limited_kpi" != "ABSENT" ] && python3 -c "import sys; sys.exit(0 if float('$rate_limited_kpi') >= $rejected else 1)"; then
+if [ "$rate_limited_kpi" != "ABSENT" ] && "$MM" ge "$rate_limited_kpi" "$rejected"; then
   ok "the API counts them: matchmaking_tickets_rejected_total{reason=\"rate_limited\"}=$rate_limited_kpi"
 else
   fail "the rate_limited rejection counter reads $rate_limited_kpi after $rejected refusals"
@@ -246,9 +230,10 @@ else
   fail "the trigger was not installed; the run would measure nothing"
 fi
 
-burst_json="$(python3 "$REPO_ROOT/requests/backpressure/db_backpressure.py" \
+burst_json="$("$MM" backpressure db \
   --players "${BACKPRESSURE_PLAYERS:-24}" --min-matches "${BACKPRESSURE_MATCHES:-12}" \
-  --timeout "${BACKPRESSURE_TIMEOUT_S:-120}" 2>/tmp/w17-db-backpressure.err)"
+  --timeout "${BACKPRESSURE_TIMEOUT_S:-120}" \
+  --metrics "$ENGINE_METRICS" --redis-port "${REDIS_PORT:-6379}" 2>/tmp/w17-db-backpressure.err)"
 burst_rc=$?
 sed 's/^/        /' /tmp/w17-db-backpressure.err
 field() { printf '%s' "$burst_json" | json_field "$1"; }
@@ -285,8 +270,7 @@ if [ "${deferred_delta:-0}" -ge 1 ]; then
 else
   fail "no confirmation was ever deferred: the gate was never the constraint, so it proved nothing"
 fi
-slow_enough="$(python3 -c "print('yes' if float('${burst_seconds:-0}') >= float($PG_SLEEP_SECONDS) else 'no')")"
-if [ "$slow_enough" = "yes" ]; then
+if "$MM" ge "${burst_seconds:-0}" "$PG_SLEEP_SECONDS"; then
   ok "the burst took ${burst_seconds}s: at least one ${PG_SLEEP_SECONDS}s wait really happened in the database"
 else
   fail "the burst took only ${burst_seconds}s, less than one database wait: the trigger did not slow the writes"
@@ -330,7 +314,8 @@ redis flushall >/dev/null
 note "redis flushed: the queue starts empty"
 
 arrivals="${ARRIVALS:-$((QUEUE_MAX_DEPTH + 100))}"
-fill_json="$(python3 "$REPO_ROOT/requests/backpressure/fill_queue.py" --players "$arrivals" --concurrency 32 2>/tmp/w17-fill.err)"
+fill_json="$("$MM" backpressure fill --api "$API" --auth "$AUTH" --players "$arrivals" --concurrency 32 \
+  --label cap 2>/tmp/w17-fill.err)"
 fill_rc=$?
 sed 's/^/        /' /tmp/w17-fill.err
 ff() { printf '%s' "$fill_json" | json_field "$1"; }
@@ -385,7 +370,7 @@ else
   fail "redis holds $queued members against a capacity of $capacity"
 fi
 queue_full_kpi="$(metric_sum "$API_METRICS" matchmaking_tickets_rejected_total 'reason="queue_full"')"
-if [ "$queue_full_kpi" != "ABSENT" ] && python3 -c "import sys; sys.exit(0 if float('$queue_full_kpi') >= $shed else 1)"; then
+if [ "$queue_full_kpi" != "ABSENT" ] && "$MM" ge "$queue_full_kpi" "$shed"; then
   ok "the API counts them: matchmaking_tickets_rejected_total{reason=\"queue_full\"}=$queue_full_kpi"
 else
   fail "the queue_full rejection counter reads $queue_full_kpi after $shed refusals"

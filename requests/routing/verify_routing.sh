@@ -29,6 +29,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
 AUTH="http://localhost:8081"
 API_A="http://localhost:${API_A_PORT:-8092}"
 API_B="http://localhost:${API_B_PORT:-8093}"
@@ -163,7 +164,7 @@ note "api-a pid=$API_A_PID; the probe kills it hard once the match is pending"
 API_A="$API_A" API_B="$API_B" AUTH="$AUTH" \
   METRICS_A="$METRICS_A" METRICS_B="$METRICS_B" ENGINE_METRICS="$ENGINE_METRICS" \
   REDIS_CONTAINER="$REDIS_CONTAINER" API_A_PID="$API_A_PID" \
-  python3 "$REPO_ROOT/requests/routing/routing_probe.py" 2>&1 | tee "$PROBE_LOG"
+  "$MM" routing 2>&1 | tee "$PROBE_LOG"
 probe_rc=${PIPESTATUS[0]}
 
 probe_pass="$(grep -c '^  \[PASS\]' "$PROBE_LOG" || true)"

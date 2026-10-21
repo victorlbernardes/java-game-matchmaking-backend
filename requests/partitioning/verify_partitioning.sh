@@ -33,7 +33,7 @@ API_METRICS="http://localhost:${API_METRICS_PORT:-9195}/metrics"
 ENGINE_METRICS="http://localhost:${ENGINE_METRICS_PORT:-9194}/metrics"
 REDIS_CONTAINER="${REDIS_CONTAINER:-game-matchmaking-backend-redis-1}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-game-matchmaking-backend-postgres-1}"
-PROBE="requests/partitioning/partition_probe.py"
+MM="$REPO_ROOT/requests/mm.sh"
 PLAYERS="${PLAYERS:-2000}"
 PARTITIONS="${PARTITIONS:-8}"
 CAP="${CAP:-100}"
@@ -50,7 +50,9 @@ fail() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
 redis() { docker exec "$REDIS_CONTAINER" redis-cli "$@" 2>/dev/null; }
 
-field() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print("" if v is None else v)' "$OUT" "$1"; }
+field() { # <key> -> the value from $OUT
+  "$MM" json "$OUT" "$1"
+}
 
 stop_services() {
   for pid_file in /tmp/w20-api.pid /tmp/w20-engine.pid; do
@@ -120,8 +122,8 @@ start_engine() { # <partitions>
   return 1
 }
 
-probe() { # <args...>
-  ( cd "$REPO_ROOT" && python3 "$PROBE" "$@" ) >"$OUT" 2>/tmp/w20-probe.err
+probe() { # <partitions-subcommand and flags...>
+  "$MM" partitions "$@" >"$OUT" 2>/tmp/w20-probe.err
   local code=$?
   if [ $code -ne 0 ]; then
     printf '        probe error: %s\n' "$(cat /tmp/w20-probe.err | tail -3)"
@@ -176,9 +178,9 @@ if probe dist --api "$API" --partitions 1 --players "$PLAYERS" --prefix w20-dist
   else
     fail "expected one key, found $before_keys"
   fi
-  before_ratio="$(python3 -c "print(round(float('$before_share') * $PARTITIONS / 100, 2))")"
+  before_ratio="$("$MM" ratio "$("$MM" mul "$before_share" "$PARTITIONS")" 100 2)"
   note "max share of the load: ${before_share}% of the queue on one key; against a $PARTITIONS-way target that is a hotspot ratio of $before_ratio"
-  if python3 -c "import sys; sys.exit(0 if float('$before_share') == 100.0 else 1)"; then
+  if "$MM" eq "$before_share" 100; then
     ok "the deepest key holds 100% of the queue (ratio $before_ratio against $PARTITIONS partitions)"
   else
     fail "expected 100% on one key, got ${before_share}%"
@@ -213,17 +215,17 @@ if probe dist --api "$API" --partitions "$PARTITIONS" --players "$PLAYERS" --pre
   else
     fail "expected $PARTITIONS partitions in use, found $after_keys"
   fi
-  if python3 -c "import sys; sys.exit(0 if float('$after_hotspot') <= 1.15 else 1)"; then
+  if "$MM" le "$after_hotspot" 1.15; then
     ok "the deepest partition is within 15% of the mean (hotspot $after_hotspot)"
   else
     fail "hotspot $after_hotspot is above 1.15: the hash is not spreading the queue"
   fi
-  if python3 -c "import sys; sys.exit(0 if float('$after_share') <= 14.0 else 1)"; then
+  if "$MM" le "$after_share" 14; then
     ok "no partition holds more than 14% of the queue (${after_share}%)"
   else
     fail "one partition holds ${after_share}% of the queue"
   fi
-  if python3 -c "import sys; sys.exit(0 if float('$after_hotspot') < float('$before_ratio') else 1)"; then
+  if "$MM" gt "$before_ratio" "$after_hotspot"; then
     ok "the hotspot fell from $before_ratio (one key) to $after_hotspot ($PARTITIONS keys)"
   else
     fail "the partitioned layout ($after_hotspot) is not better than the single key ($before_ratio)"
@@ -253,22 +255,22 @@ if probe metrics --metrics "$ENGINE_METRICS" --mode 5v5 --partitions "$PARTITION
   gauge_hotspot="$(field hotspot)"
   gauge_expected="$(field expected_hotspot)"
   note "partition_depth=$series depth=$gauge_depth hotspot=$gauge_hotspot expected=$gauge_expected"
-  if python3 -c "import json,sys; d=json.load(open('$OUT'))['partition_depth']; sys.exit(0 if len(d)==$PARTITIONS else 1)"; then
+  if "$MM" eq "$("$MM" json-length "$OUT" partition_depth)" "$PARTITIONS"; then
     ok "the scrape publishes one series per partition ($PARTITIONS)"
   else
     fail "expected $PARTITIONS partition series, got $series"
   fi
-  if python3 -c "import sys; sys.exit(0 if float('$gauge_depth') == 3.0 else 1)"; then
+  if "$MM" eq "$gauge_depth" 3; then
     ok "queue_depth is the sum over partitions (3 players waiting)"
   else
     fail "expected queue_depth 3, got $gauge_depth"
   fi
-  if python3 -c "import json,sys; d=json.load(open('$OUT')); sys.exit(0 if abs(float(d['hotspot'])-float(d['expected_hotspot']))<=0.01 else 1)"; then
+  if "$MM" approx "$gauge_hotspot" "$gauge_expected" 0.01; then
     ok "the hotspot ratio is max/mean of the partition depths ($gauge_hotspot)"
   else
     fail "the hotspot ($gauge_hotspot) does not match the partition depths ($gauge_expected)"
   fi
-  if python3 -c "import json,sys; d=json.load(open('$OUT')); sys.exit(0 if abs(sum(d['partition_depth'].values())-float(d['depth']))<=0.001 else 1)"; then
+  if "$MM" approx "$("$MM" json-sum "$OUT" partition_depth)" "$gauge_depth" 0.001; then
     ok "the per-partition series add up to the queue depth"
   else
     fail "the partition series do not add up to the queue depth"
@@ -306,7 +308,7 @@ if probe cross --api "$API" --partitions "$PARTITIONS" --mode 1v1 --timeout 10; 
   else
     fail "unexpected ticket states: $states"
   fi
-  if python3 -c "import sys; sys.exit(0 if float('$waited') <= 5.0 else 1)"; then
+  if "$MM" le "$waited" 5; then
     ok "the match formed in ${waited}s (the engine does not wait for a partition to fill)"
   else
     fail "the match took ${waited}s: the partitions are acting as a boundary"

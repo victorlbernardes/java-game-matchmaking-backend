@@ -27,6 +27,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
+REDIS_PORT="${REDIS_PORT:-6379}"
 API="http://localhost:8080"
 AUTH="http://localhost:8081"
 ENGINE_METRICS="http://localhost:${ENGINE_METRICS_PORT:-9091}/metrics"
@@ -51,40 +53,20 @@ redis() { docker exec "$REDIS_CONTAINER" redis-cli "$@" 2>/dev/null; }
 
 # The numeric value of an expression, or NO SERIES when it has no result (both "no data" and
 # "condition false" look like that here, so a caller that needs to tell them apart counts series).
-promql() {
-  curl -fsS --get "$PROMETHEUS/api/v1/query" --data-urlencode "query=$1" 2>/dev/null | python3 -c '
-import json, sys
-try:
-    result = json.load(sys.stdin)["data"]["result"]
-except Exception:
-    print("NO SERIES")
-    raise SystemExit
-print(result[0]["value"][1] if result else "NO SERIES")
-'
+promql() { # <expr> -> the value, or NO SERIES when the expression answers nothing
+  "$MM" observability prometheus-query "$PROMETHEUS" "$1" 2>/dev/null
 }
 
 # How many series an expression answers with. 0 means the expression is empty at this threshold.
-promql_series() {
-  curl -fsS --get "$PROMETHEUS/api/v1/query" --data-urlencode "query=$1" 2>/dev/null | python3 -c '
-import json, sys
-try:
-    print(len(json.load(sys.stdin)["data"]["result"]))
-except Exception:
-    print(0)
-'
+promql_series() { # <expr> -> how many series it answers with (0 = the expression is empty)
+  "$MM" observability prometheus-series "$PROMETHEUS" "$1" 2>/dev/null
 }
 
 # A ratio in [0, 1] and not NaN: 0/0 is NaN, and an objective read off an empty window is not a
 # satisfied objective.
-is_ratio() { python3 -c "
-import sys
-raw = '$1'
-try:
-    value = float(raw)
-except ValueError:
-    sys.exit(1)
-sys.exit(0 if 0.0 <= value <= 1.0 else 1)
-"; }
+is_ratio() { # <value> -> 0 when it is a number in [0, 1] (0/0 is NaN, and NaN is not a verdict)
+  "$MM" within "$1" 0 1 2>/dev/null
+}
 
 # ---------------------------------------------------------------------------
 step "0. preconditions"
@@ -109,11 +91,7 @@ fi
 # Every objective is computed from a scrape of a running product, so a product that is down puts
 # every ratio at NaN - and a supporting alert fires, which section 4 would report as a failure
 # without saying why.
-up_values="$(curl -fsS "$PROMETHEUS/api/v1/query?query=up" 2>/dev/null | python3 -c '
-import json, sys
-data = json.load(sys.stdin)["data"]["result"]
-print(",".join(sorted("%s=%s" % (item["metric"].get("job", "?"), item["value"][1]) for item in data)) or "NO TARGETS")
-'  2>/dev/null)"
+up_values="$("$MM" observability prometheus-up "$PROMETHEUS" 2>/dev/null)"
 note "prometheus up: ${up_values:-<no answer>}"
 case "$up_values" in
   *matchmaking-api=1*matchmaking-engine=1*) ok "Prometheus scrapes both jobs (up == 1)" ;;
@@ -129,32 +107,7 @@ fi
 step "1. the objectives are loaded, healthy, and the ones in the repository"
 # ---------------------------------------------------------------------------
 curl -fsS "$PROMETHEUS/api/v1/rules" > "$TMP/rules.json" 2>/dev/null
-rules_summary="$(python3 - "$TMP/rules.json" <<'PY'
-import json, sys
-with open(sys.argv[1]) as handle:
-    groups = json.load(handle)["data"]["groups"]
-if not groups:
-    print("groups=0")
-    raise SystemExit
-recording = [r for g in groups for r in g["rules"] if r["type"] == "recording"]
-alerting = [r for g in groups for r in g["rules"] if r["type"] == "alerting"]
-unhealthy = [r["name"] for g in groups for r in g["rules"] if r.get("health") not in (None, "ok")]
-unevaluated = [g["name"] for g in groups
-               if not g.get("lastEvaluation") or g["lastEvaluation"].startswith("0001-")]
-without = [r["name"] for r in alerting if not r.get("labels", {}).get("severity")
-           or not r.get("labels", {}).get("slo")]
-print("groups=%d" % len(groups))
-print("files=%s" % ",".join(sorted({g["file"] for g in groups})))
-print("groupnames=%s" % ",".join(sorted(g["name"] for g in groups)))
-print("recording=%d" % len(recording))
-print("alerting=%d" % len(alerting))
-print("unhealthy=%s" % (",".join(unhealthy) or "none"))
-print("unevaluated=%s" % (",".join(unevaluated) or "none"))
-print("withoutlabels=%s" % (",".join(without) or "none"))
-print("fastburnfor=%s" % ",".join(
-    "%s:%ss" % (r["name"], r.get("duration", 0)) for r in alerting if "FastBurn" in r["name"]))
-PY
-)"
+rules_summary="$("$MM" observability rules "$TMP/rules.json" 2>/dev/null)"
 field() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
 
 groups="$(field "$rules_summary" groups)"
@@ -211,33 +164,21 @@ step "2. one real match, driven by hand: the ratios are 1.0 and the rules agree"
 # ---------------------------------------------------------------------------
 # Two players with the same deterministic skill (the pairing policy refuses a wider spread than
 # a ticket's search range, so the ids are chosen, not invented); the skill helper is the E2E's.
-players="$(python3 -c "
-import sys, time
-sys.path.insert(0, '$REPO_ROOT/requests/e2e')
-import run_e2e
-base = 'slo%d' % time.time()
-groups, pair, i = {}, None, 0
-while pair is None:
-    pid = '%s-%d' % (base, i)
-    s = run_e2e.skill(pid)
-    groups.setdefault(s, []).append(pid)
-    if len(groups[s]) >= 2:
-        pair = groups[s][:2]
-    i += 1
-print(' '.join(pair))
-")"
+# Two players the policy can pair: the ids come from the harness, which uses the product's own
+# DeterministicSkill instead of importing the E2E's copy of it.
+players="$("$MM" pairing pair --prefix "slo$(date +%s)-")"
 player_a="$(echo "$players" | cut -d' ' -f1)"
 player_b="$(echo "$players" | cut -d' ' -f2)"
 
 token() {
   curl -fsS -X POST "$AUTH/v1/auth/login" -H 'Content-Type: application/json' \
     -d "{\"playerId\":\"$1\",\"displayName\":\"$1\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null
+    | "$MM" json - token 2>/dev/null
 }
 enqueue() {
   curl -fsS -X POST "$API/v1/matchmaking/tickets" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -d '{"gameMode":"1v1","region":"NA","maxLatencyMs":80}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ticketId", ""))' 2>/dev/null
+    | "$MM" json - ticketId 2>/dev/null
 }
 
 token_a="$(token "$player_a")"
@@ -251,7 +192,7 @@ fi
 # A known start: the queue and the pending matches of the local stack are cleared, exactly as
 # the E2E scenarios do. The window is then measured on this run's traffic alone.
 redis flushall >/dev/null
-python3 "$REPO_ROOT/requests/observability/slo_ratios.py" read "$ENGINE_METRICS" > "$TMP/before.json"
+"$MM" observability slo read "$ENGINE_METRICS" > "$TMP/before.json"
 note "redis flushed; before snapshot taken"
 
 enqueue "$token_a" >/dev/null
@@ -259,8 +200,8 @@ enqueue "$token_b" >/dev/null
 match_id=""
 waited=0
 while [ -z "$match_id" ] && [ "$waited" -lt "$WAIT_TIMEOUT_S" ]; do
-  match_id="$(python3 "$REPO_ROOT/requests/observability/pending_match.py" \
-      "$player_a" "$player_b" "$REDIS_CONTAINER" 2>/dev/null)"
+  match_id="$("$MM" observability pending-match "$player_a" "$player_b" \
+      --redis-port "$REDIS_PORT" 2>/dev/null)"
   [ -z "$match_id" ] && sleep 1 && waited=$((waited + 1))
 done
 if [ -n "$match_id" ]; then
@@ -286,8 +227,8 @@ else
   fail "the pending match is still in Redis after the confirmations"
 fi
 
-python3 "$REPO_ROOT/requests/observability/slo_ratios.py" read "$ENGINE_METRICS" > "$TMP/after.json"
-traffic="$(python3 "$REPO_ROOT/requests/observability/slo_ratios.py" window "$TMP/before.json" "$TMP/after.json")"
+"$MM" observability slo read "$ENGINE_METRICS" > "$TMP/after.json"
+traffic="$("$MM" observability slo window "$TMP/before.json" "$TMP/after.json")"
 note "this window: $(field "$traffic" formed) formed, $(field "$traffic" confirmed) confirmed, $(field "$traffic" matched_tickets) matched tickets"
 latency_hand="$(field "$traffic" latency_within_10_ratio)"
 confirm_hand="$(field "$traffic" confirm_ratio)"
@@ -302,7 +243,7 @@ if [ "$confirm_hand" = "1.0" ]; then
 else
   fail "SL-2 hand-computed ratio was $confirm_hand, expected 1.0"
 fi
-if python3 -c "import sys; sys.exit(0 if float('$(field "$traffic" dissolved_timeout)') == 0 else 1)" 2>/dev/null; then
+if "$MM" eq "$(field "$traffic" dissolved_timeout)" 0; then
   ok "no match of this window dissolved on its confirmation deadline"
 else
   fail "$(field "$traffic" dissolved_timeout) matches dissolved on the deadline"
@@ -330,20 +271,17 @@ if is_ratio "$rule_latency" && is_ratio "$rule_confirm"; then
 else
   fail "a recorded ratio is not a number: latency=$rule_latency confirm=$rule_confirm"
 fi
-if python3 -c "import sys; sys.exit(0 if float('${rule_latency:-0}') >= 0.99 else 1)" 2>/dev/null; then
+if "$MM" ge "${rule_latency:-0}" 0.99; then
   ok "SL-1 holds: $rule_latency of matched tickets are inside 10 s (target 0.99)"
 else
   fail "SL-1 is at $rule_latency, below the 0.99 target"
 fi
-if python3 -c "
-import sys
-hand, rule = float('$latency_hand'), float('$rule_latency')
-sys.exit(0 if abs(hand - rule) <= 0.05 else 1)" 2>/dev/null; then
+if "$MM" approx "$latency_hand" "$rule_latency" 0.05; then
   ok "the recorded rule agrees with the hand-computed ratio (|$latency_hand - $rule_latency| <= 0.05)"
 else
   fail "the recorded rule ($rule_latency) disagrees with the hand count ($latency_hand)"
 fi
-if python3 -c "import sys; sys.exit(0 if float('${rule_confirm:-0}') >= 0.99 else 1)" 2>/dev/null; then
+if "$MM" ge "${rule_confirm:-0}" 0.99; then
   ok "SL-2 holds: $rule_confirm of formed matches are confirmed (target 0.99)"
 else
   # This Prometheus holds everything the repository runs, and a chaos/load run spends this budget
@@ -357,9 +295,9 @@ else
   fi
 fi
 
-budget="$(python3 -c "print(round(1 - float('${rule_latency:-0}'), 6))" 2>/dev/null)"
+budget="$("$MM" sub 1 "${rule_latency:-0}" 6)"
 note "SL-1 budget spent in the 5m window: $budget of 0.01"
-if python3 -c "import sys; sys.exit(0 if float('${budget:-1}') <= 0.01 else 1)" 2>/dev/null; then
+if "$MM" le "${budget:-1}" 0.01; then
   ok "the error budget is inside 1% - no spend beyond the objective"
 elif [ "$(promql_series '1 - matchmaking:slo_latency_within_10s:ratio_5m >= (14.4 * 0.01)')" != "0" ]; then
   note "the budget is at $budget: this Prometheus contains a load run whose wait p99 really crossed 10 s"
@@ -390,22 +328,22 @@ while [ "$waited" -lt "$RULE_WAIT_S" ]; do
   oldest="$(promql 'matchmaking:queue:oldest_wait_seconds')"
   # Both must be there: the head's wait is whole seconds, so the first poll after an enqueue can
   # honestly report 0 while the player has been waiting less than a second.
-  if [ "$waiting" = "1" ] \
-     && python3 -c "import sys; v='$oldest'; sys.exit(0 if v not in ('NO SERIES','') and float(v) > 0 else 1)" 2>/dev/null; then
+  if [ "$waiting" = "1" ] && [ -n "$oldest" ] && [ "$oldest" != "NO SERIES" ] \
+     && "$MM" gt "$oldest" 0; then
     break
   fi
   sleep 2
   waited=$((waited + 2))
 done
-depth_now="$(python3 "$REPO_ROOT/requests/observability/slo_ratios.py" read "$ENGINE_METRICS" \
-  | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["queue_depth"]))' 2>/dev/null)"
+depth_now="$("$MM" observability slo read "$ENGINE_METRICS" 2>/dev/null \
+  | "$MM" json-int - queue_depth)"
 
-if [ "$waiting" = "$depth_now" ] && [ "$waiting" != "NO SERIES" ]; then
+if [ "$waiting" != "NO SERIES" ] && "$MM" eq "$waiting" "$depth_now"; then
   ok "matchmaking:queue:waiting_players ($waiting) equals the scrape's own sum of matchmaking_queue_depth ($depth_now)"
 else
   fail "the recorded waiting_players is $waiting, the scrape sums to $depth_now"
 fi
-if python3 -c "import sys; v='$oldest'; sys.exit(0 if v not in ('NO SERIES','') and float(v) > 0 else 1)" 2>/dev/null; then
+if [ -n "$oldest" ] && [ "$oldest" != "NO SERIES" ] && "$MM" gt "$oldest" 0; then
   ok "matchmaking:queue:oldest_wait_seconds follows the head of the queue (${oldest}s)"
 else
   fail "the recorded oldest wait is $oldest while a player is waiting"
@@ -419,28 +357,12 @@ fi
 step "4. the alerts are quiet, and alive"
 # ---------------------------------------------------------------------------
 curl -fsS "$PROMETHEUS/api/v1/rules?type=alert" > "$TMP/alerts.json" 2>/dev/null
-alert_states() {
-  python3 - "$TMP/alerts.json" <<'PY'
-import json, sys
-with open(sys.argv[1]) as handle:
-    groups = json.load(handle)["data"]["groups"]
-states = ["%s=%s" % (r["name"], r.get("state", "?")) for g in groups for r in g["rules"]]
-print(",".join(states) or "NONE")
-PY
+alert_states() { # -> name=state,... for every loaded alert
+  "$MM" observability alert-states "$TMP/alerts.json" 2>/dev/null
 }
 # The query of one loaded alert, as Prometheus itself holds it.
-alert_query() {
-  python3 - "$TMP/alerts.json" "$1" <<'PY'
-import json, sys
-with open(sys.argv[1]) as handle:
-    groups = json.load(handle)["data"]["groups"]
-for group in groups:
-    for rule in group["rules"]:
-        if rule["name"] == sys.argv[2]:
-            print(rule["query"].replace("\n", " "))
-            raise SystemExit
-print("")
-PY
+alert_query() { # <name> -> the expression the loaded alert holds
+  "$MM" observability alert-query "$TMP/alerts.json" "$1" 2>/dev/null
 }
 state_of() { alert_states | tr ',' '\n' | sed -n "s/^$1=//p"; }
 
@@ -507,7 +429,7 @@ else
   fail "the SL-4 head-wait expression returns nothing with a player waiting"
 fi
 head_wait="$(promql 'max(matchmaking_queue_oldest_wait_seconds)')"
-above_head="$(python3 -c "print(float('${head_wait:-0}') + 10)" 2>/dev/null)"
+above_head="$("$MM" sum "${head_wait:-0}" 10)"
 if [ -n "$above_head" ] \
    && [ "$(promql_series "(matchmaking_queue_oldest_wait_seconds > $above_head) and on (mode, region) (matchmaking_queue_depth > 0)")" = "0" ]; then
   ok "the SL-4 expression selects on the threshold (truthy at -1, empty at ${above_head}s, above the head's ${head_wait}s)"
@@ -515,8 +437,8 @@ else
   fail "the SL-4 expression does not discriminate at ${above_head}s (head wait ${head_wait}s)"
 fi
 
-parked="$(python3 "$REPO_ROOT/requests/observability/slo_ratios.py" read "$ENGINE_METRICS" \
-  | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["outbox_parked"]))' 2>/dev/null)"
+parked="$("$MM" observability slo read "$ENGINE_METRICS" 2>/dev/null \
+  | "$MM" json-int - outbox_parked)"
 oldest_pending="$(promql 'matchmaking_outbox_oldest_pending_seconds')"
 note "SL-3: parked rows=$parked, oldest pending event=${oldest_pending}s (line: 0 parked, leader under 5 s)"
 if [ "$parked" = "0" ]; then
@@ -524,7 +446,7 @@ if [ "$parked" = "0" ]; then
 else
   fail "SL-3: $parked parked rows need a human (SELECT last_error FROM outbox_events WHERE status='PARKED')"
 fi
-if python3 -c "import sys; v='$oldest_pending'; sys.exit(0 if v in ('NO SERIES','') or float(v) <= 5 else 1)" 2>/dev/null; then
+if [ -z "$oldest_pending" ] || [ "$oldest_pending" = "NO SERIES" ] || "$MM" le "$oldest_pending" 5; then
   ok "SL-3 holds: the oldest pending event is within the 5 s line"
 else
   fail "SL-3: the oldest pending event is ${oldest_pending}s old, past the 5 s line"

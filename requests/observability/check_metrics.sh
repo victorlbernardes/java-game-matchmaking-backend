@@ -26,6 +26,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MM="$REPO_ROOT/requests/mm.sh"
+REDIS_PORT="${REDIS_PORT:-6379}"
 API="http://localhost:8080"
 AUTH="http://localhost:8081"
 API_METRICS="http://localhost:${API_METRICS_PORT:-9090}/metrics"
@@ -50,29 +52,15 @@ psqlq() { docker exec "$POSTGRES_CONTAINER" psql -U matchmaking -d matchmaking -
 # Sums every series of a metric whose exposition line matches the label fragment. In python,
 # because the exposition is a text format with labels and grep cannot sum; prints ABSENT when
 # no series matched (a counter only appears after its first increment).
-metric_sum() { # <url> <metric-name> <label-fragment>
-  curl -fsS "$1" 2>/dev/null | python3 -c '
-import sys
-name, label_filter = sys.argv[1], sys.argv[2]
-total, seen = 0.0, False
-for line in sys.stdin:
-    if line.startswith("#") or not line.startswith(name):
-        continue
-    head, _, value = line.rpartition(" ")
-    if label_filter and label_filter not in head:
-        continue
-    try:
-        total += float(value)
-        seen = True
-    except ValueError:
-        pass
-print(total if seen else "ABSENT")
-' "$2" "$3"
+metric_sum() { # <url> <metric-name> <label-fragment> -> the sum, or ABSENT when absent
+  "$MM" metric-sum "$1" "$2" "$3"
 }
 
 metric_contains() { curl -fsS "$1" 2>/dev/null | grep -q "^$2"; }
 
-as_number() { python3 -c "print(0.0 if '$1' in ('ABSENT', '') else float('$1'))"; }
+as_number() { # <value> -> the number, with ABSENT and empty read as 0.0
+  "$MM" sum "$1"
+}
 
 # Waits until the metric equals exactly the expected value; echoes the last value read.
 wait_metric() { # <url> <metric> <label-fragment> <expected> <timeout-seconds>
@@ -93,7 +81,7 @@ wait_metric_above() { # <url> <metric> <label-fragment> <floor> <timeout-seconds
   local value="" waited=0
   while [ "$waited" -lt "$5" ]; do
     value="$(metric_sum "$1" "$2" "$3")"
-    python3 -c "import sys; sys.exit(0 if '$value' not in ('ABSENT', '') and float('$value') > $4 else 1)" \
+    [ -n "$value" ] && [ "$value" != "ABSENT" ] && "$MM" gt "$value" "$4" \
       && { echo "$value"; return 0; }
     sleep 1
     waited=$((waited + 1))
@@ -177,26 +165,10 @@ step "2. a match, driven by hand, must move the numbers"
 # run. Player c is a third id, waiting alone, so the queue cannot move under the observation.
 # The skill helper is the E2E's, imported rather than copied (run_e2e.py only defines things at
 # import time).
-players="$(python3 -c "
-import sys, time
-sys.path.insert(0, '$REPO_ROOT/requests/e2e')
-import run_e2e
-base = 'kpi%d' % time.time()
-groups, pair, i = {}, None, 0
-while pair is None:
-    pid = '%s-%d' % (base, i)
-    s = run_e2e.skill(pid)
-    groups.setdefault(s, []).append(pid)
-    if len(groups[s]) >= 2:
-        pair = groups[s][:2]
-    i += 1
-while True:
-    alone = '%s-%d' % (base, i)
-    if run_e2e.skill(alone) != run_e2e.skill(pair[0]):
-        break
-    i += 1
-print(' '.join(pair + [alone]))
-")"
+# Two players who can be paired plus one the engine never considers compatible, so the queue
+# cannot move under the observation. The ids come from the harness, which uses the product's own
+# DeterministicSkill instead of importing the E2E's copy of it.
+players="$("$MM" pairing three --prefix "kpi$(date +%s)-")"
 player_a="$(echo "$players" | cut -d' ' -f1)"
 player_b="$(echo "$players" | cut -d' ' -f2)"
 player_c="$(echo "$players" | cut -d' ' -f3)"
@@ -204,12 +176,12 @@ player_c="$(echo "$players" | cut -d' ' -f3)"
 token() {
   curl -fsS -X POST "$AUTH/v1/auth/login" -H 'Content-Type: application/json' \
     -d "{\"playerId\":\"$1\",\"displayName\":\"$1\"}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null
+    | "$MM" json - token 2>/dev/null
 }
 enqueue() { # <token> -> ticket id
   curl -fsS -X POST "$API/v1/matchmaking/tickets" -H "Authorization: Bearer $1" \
     -H 'Content-Type: application/json' -d '{"gameMode":"1v1","region":"NA","maxLatencyMs":80}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ticketId", ""))' 2>/dev/null
+    | "$MM" json - ticketId 2>/dev/null
 }
 
 token_a="$(token "$player_a")"
@@ -233,7 +205,7 @@ note "redis flushed: the queue and the pending matches start empty"
 enqueued_before="$(as_number "$(metric_sum "$API_METRICS" matchmaking_tickets_enqueued_total 'region="NA"')")"
 ticket_c="$(enqueue "$token_c")"
 arrivals="$(wait_metric "$API_METRICS" matchmaking_tickets_enqueued_total 'region="NA"' \
-  "$(python3 -c "print(float('$enqueued_before') + 1)")" 10)"
+  "$("$MM" sum "$enqueued_before" 1)" 10)"
 if [ "$arrivals" != "ABSENT" ] && [ -n "$arrivals" ]; then
   ok "the arrival counter counted the ticket at the boundary ($enqueued_before -> $arrivals)"
 else
@@ -250,7 +222,7 @@ fi
 note "letting the head of the queue age for 4 s..."
 sleep 4
 oldest="$(as_number "$(metric_sum "$ENGINE_METRICS" matchmaking_queue_oldest_wait_seconds 'mode="1v1",region="NA"')")"
-if python3 -c "import sys; sys.exit(0 if $oldest > 0 else 1)"; then
+if "$MM" gt "$oldest" 0; then
   ok "the head's wait is derived from the queue itself: ${oldest}s"
 else
   fail "matchmaking_queue_oldest_wait_seconds stayed at $oldest while a player waited"
@@ -282,8 +254,8 @@ waited=0
 while [ -z "$match_id" ] && [ "$waited" -lt "$WAIT_TIMEOUT_S" ]; do
   # Only the pending match with *our* two players: a leftover from another run must not be
   # confirmed here (Redis holds the roster as JSON, so the lookup is a python helper).
-  match_id="$(python3 "$REPO_ROOT/requests/observability/pending_match.py" \
-      "$player_a" "$player_b" "$REDIS_CONTAINER" 2>/dev/null)"
+  match_id="$("$MM" observability pending-match "$player_a" "$player_b" \
+      --redis-port "$REDIS_PORT" 2>/dev/null)"
   [ -z "$match_id" ] && sleep 1 && waited=$((waited + 1))
 done
 if [ -n "$match_id" ]; then
@@ -353,22 +325,18 @@ step "3. the derived numbers must agree with the source of truth"
 # ---------------------------------------------------------------------------
 db_pending="$(psqlq "SELECT count(*) FROM outbox_events WHERE status = 'PENDING'")"
 exported_pending="$(as_number "$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PENDING"')")"
-exported_pending="$(python3 -c "print(int($exported_pending))")"
+exported_pending="$("$MM" sum "$exported_pending")"
 note "pending: gauge=$exported_pending db=$db_pending (the gauge is a snapshot: a row the relay just published shows as pending until the next poll)"
 
 # The three gauges come from one poll, so their sum is a consistent snapshot of the table, and
 # the table only grows here - that makes the check deterministic where PENDING alone would race
 # the relay (a row published between the poll and this comparison).
-exported_total="$(python3 -c "
-total = 0.0
-for value in ('$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PENDING"')',
-              '$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PUBLISHED"')',
-              '$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PARKED"')'):
-    total += 0.0 if value == 'ABSENT' else float(value)
-print(int(total))
-")"
+exported_total="$("$MM" sum \
+  "$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PENDING"')" \
+  "$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PUBLISHED"')" \
+  "$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PARKED"')")"
 db_total="$(psqlq "SELECT count(*) FROM outbox_events")"
-if [ "$exported_total" = "$db_total" ]; then
+if "$MM" eq "$exported_total" "$db_total"; then
   ok "the outbox backlog by status adds up to the rows in Postgres: $db_total"
 else
   fail "the backlog adds up to $exported_total, Postgres holds $db_total rows"
@@ -376,7 +344,7 @@ fi
 
 db_parked="$(psqlq "SELECT count(*) FROM outbox_events WHERE status = 'PARKED'")"
 exported_parked="$(as_number "$(metric_sum "$ENGINE_METRICS" matchmaking_outbox_backlog 'status="PARKED"')")"
-if [ "$(python3 -c "print(int($exported_parked))")" = "$db_parked" ]; then
+if "$MM" eq "$exported_parked" "$db_parked"; then
   ok "the parked rows agree with Postgres: $db_parked (each one needs a human)"
 else
   fail "parked says $exported_parked, Postgres says $db_parked"
@@ -393,11 +361,7 @@ else
 fi
 # The gauge carries whole seconds, so it is compared with tolerance: the point is that the
 # number is the same fact as the table's, not that the aggregation keeps the milliseconds.
-if python3 -c "
-import sys
-gauge, table = '$lag', '$db_lag'
-ok = gauge not in ('ABSENT', '') and table not in ('', None) and abs(float(gauge) - float(table)) <= 1.0
-sys.exit(0 if ok else 1)"; then
+if [ -n "$lag" ] && [ "$lag" != "ABSENT" ] && [ -n "$db_lag" ] && "$MM" approx "$lag" "$db_lag" 1.0; then
   ok "the publish lag agrees with the outbox table within a second: ${lag}s"
 else
   fail "the publish lag gauge ($lag) does not match the table ($db_lag)"
@@ -406,40 +370,28 @@ fi
 # ---------------------------------------------------------------------------
 step "4. the pipeline, not just the exposition"
 # ---------------------------------------------------------------------------
-up_values="$(curl -fsS "$PROMETHEUS/api/v1/query?query=up" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)["data"]["result"]
-print(",".join(sorted("%s=%s" % (item["metric"].get("job", "?"), item["value"][1]) for item in data)) or "NO TARGETS")
-' 2>/dev/null)"
+up_values="$("$MM" observability prometheus-up "$PROMETHEUS" 2>/dev/null)"
 note "prometheus up: ${up_values:-<no answer>}"
 case "$up_values" in
   *matchmaking-api=1*matchmaking-engine=1*) ok "Prometheus scrapes both jobs (up == 1)" ;;
   *) fail "Prometheus is not scraping both jobs: ${up_values:-<no answer>}" ;;
 esac
 
-query_value="$(curl -fsS --get "$PROMETHEUS/api/v1/query" --data-urlencode 'query=sum(matchmaking_queue_depth)' | python3 -c '
-import json, sys
-result = json.load(sys.stdin)["data"]["result"]
-print(result[0]["value"][1] if result else "NO SERIES")
-' 2>/dev/null)"
+query_value="$("$MM" observability prometheus-query "$PROMETHEUS" 'sum(matchmaking_queue_depth)' 2>/dev/null)"
 if [ "$query_value" != "NO SERIES" ] && [ -n "$query_value" ]; then
   ok "a KPI is queryable through Prometheus (sum(matchmaking_queue_depth) = $query_value)"
 else
   fail "Prometheus has no matchmaking_queue_depth series"
 fi
 
-health="$(curl -fsS "$GRAFANA/api/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("database", "?"))' 2>/dev/null)"
+health="$("$MM" observability grafana-health "$GRAFANA" 2>/dev/null)"
 if [ "$health" = "ok" ]; then
   ok "Grafana is up and its database is ok"
 else
   fail "Grafana health: ${health:-<no answer>}"
 fi
 
-dashboard="$(curl -fsS "$GRAFANA/api/search?query=Matchmaking" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-print(data[0]["title"] if data else "NONE")
-' 2>/dev/null)"
+dashboard="$("$MM" observability grafana-dashboard "$GRAFANA" Matchmaking 2>/dev/null)"
 if [ "$dashboard" != "NONE" ] && [ -n "$dashboard" ]; then
   ok "the dashboard is provisioned from the repository: $dashboard"
 else
@@ -448,26 +400,7 @@ fi
 
 # The same series, asked the way a panel asks for it: through Grafana's datasource proxy.
 # A dashboard that exists but cannot query is a picture of nothing.
-grafana_value="$(curl -fsS -X POST "$GRAFANA/api/ds/query" -H 'Content-Type: application/json' -d '{
-  "queries": [{
-    "refId": "A",
-    "datasource": { "type": "prometheus", "uid": "prometheus" },
-    "expr": "sum(matchmaking_queue_depth)",
-    "instant": true,
-    "format": "table"
-  }],
-  "from": "now-5m",
-  "to": "now"
-}' | python3 -c '
-import json, sys
-try:
-    results = json.load(sys.stdin)["results"]["A"]
-    frames = results.get("frames", [])
-    values = [value for frame in frames for value in frame.get("data", {}).get("values", [[]])[-1]]
-    print(values[-1] if values else "NO VALUE")
-except Exception:
-    print("NO VALUE")
-' 2>/dev/null)"
+grafana_value="$("$MM" observability grafana-value "$GRAFANA" 'sum(matchmaking_queue_depth)' 2>/dev/null)"
 if [ -n "$grafana_value" ] && [ "$grafana_value" != "NO VALUE" ]; then
   ok "Grafana answers a query over the provisioned datasource: sum(matchmaking_queue_depth) = $grafana_value"
 else
