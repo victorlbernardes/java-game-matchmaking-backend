@@ -2,12 +2,15 @@ package com.victor.matchmaking.auth.presentation;
 
 import java.security.KeyPair;
 
+import com.victor.matchmaking.auth.application.ConnectionTokenIssuer;
 import com.victor.matchmaking.auth.application.SessionTokenIssuer;
+import com.victor.matchmaking.auth.infrastructure.JwtConnectionTokenIssuer;
 import com.victor.matchmaking.auth.infrastructure.JwtSessionTokenIssuer;
 
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.auth.authentication.TokenCredentials;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.handler.BodyHandler;
@@ -21,6 +24,12 @@ public final class AuthRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, KeyPair keyPair) {
+        return createRouter(vertx, jwtAuth, keyPair,
+                new JwtConnectionTokenIssuer(jwtAuth, JwtConnectionTokenIssuer.ttlFromEnv()));
+    }
+
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, KeyPair keyPair,
+            ConnectionTokenIssuer connectionTokens) {
         SessionTokenIssuer issuer = new JwtSessionTokenIssuer(jwtAuth);
         JsonObject publicJwk = com.victor.matchmaking.auth.infrastructure.RsaKeyPairProvider.publicJwkOf(keyPair);
         Router router = Router.router(vertx);
@@ -53,11 +62,55 @@ public final class AuthRoutes {
                     .end(new TokenResponse(token.token(), token.expiresInSeconds()).toJson().encode());
         });
 
+        // Connection token (W23, ADR 0033). Internal: the caller is the matchmaking API, and the
+        // proof it presents is the player's own session token - the issuer signs only for the
+        // subject it can verify, so "issue me a token for player B" is unanswerable.
+        router.post("/v1/auth/connection-tokens").handler(ctx -> {
+            String header = ctx.request().getHeader("Authorization");
+            if (header == null || !header.startsWith("Bearer ")) {
+                fail(ctx, 401, "missing_token", "Authorization: Bearer <player session token> is required");
+                return;
+            }
+            jwtAuth.authenticate(new TokenCredentials(header.substring("Bearer ".length())))
+                    .onSuccess(user -> {
+                        JsonObject body = ctx.body() != null ? ctx.body().asJsonObject() : null;
+                        String matchId = body != null ? body.getString("matchId") : null;
+                        Integer team = body != null ? body.getInteger("team") : null;
+                        if (matchId == null || matchId.isBlank()) {
+                            fail(ctx, 400, "match_id_required", "matchId is required");
+                            return;
+                        }
+                        if (team == null || (team != 1 && team != 2)) {
+                            fail(ctx, 400, "invalid_team", "team must be 1 or 2");
+                            return;
+                        }
+                        ConnectionTokenIssuer.IssuedConnectionToken issued =
+                                connectionTokens.issue(user.subject(), matchId, team);
+                        LOG.log(System.Logger.Level.INFO,
+                                "connection_token.issued playerId={0} matchId={1} team={2} expiresIn={3}",
+                                user.subject(), matchId, team, issued.expiresInSeconds());
+                        ctx.response().putHeader("content-type", "application/json")
+                                .end(new JsonObject()
+                                        .put("connectionToken", issued.token())
+                                        .put("expiresAt", issued.expiresAt().toString())
+                                        .put("expiresInSeconds", issued.expiresInSeconds())
+                                        .encode());
+                    })
+                    .onFailure(err -> fail(ctx, 401, "invalid_token", "invalid token"));
+        });
+
         router.get("/.well-known/jwks.json").handler(ctx -> ctx.response()
                 .putHeader("content-type", "application/json")
                 .end(new JsonObject().put("keys", new JsonArray().add(publicJwk)).encode()));
 
         return router;
+    }
+
+    private static void fail(io.vertx.ext.web.RoutingContext ctx, int status, String error, String message) {
+        LOG.log(System.Logger.Level.WARNING, "request.rejected error={0} status={1}", error, status);
+        ctx.response().setStatusCode(status)
+                .putHeader("content-type", "application/json")
+                .end(new JsonObject().put("error", error).put("message", message).encode());
     }
 
     private static String parsePlayerId(JsonObject body) {

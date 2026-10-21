@@ -30,6 +30,13 @@ public final class MatchOrchestratorApplication {
 
     private static final System.Logger LOG = System.getLogger("orchestrator");
 
+    /**
+     * How often the allocation lifecycle is inspected (W23). One second is the resolution of every
+     * deadline the watchdog enforces (30 s, 60 s, 90 s), and it is the same order of magnitude as the
+     * engine's pairing tick - a retry that lands a second late costs a second, not a match.
+     */
+    static final long WATCHDOG_INTERVAL_MS = 1000;
+
     private MatchOrchestratorApplication() {
     }
 
@@ -58,13 +65,31 @@ public final class MatchOrchestratorApplication {
         PostgresConfirmedMatchInbox inbox = new PostgresConfirmedMatchInbox(pool, servers, metrics.registry());
         KafkaMatchConfirmedConsumer consumer = KafkaMatchConfirmedConsumer.fromEnv(inbox);
 
+        // The half that keeps a confirmed match from becoming an orphan (W23, ADR 0032): retries,
+        // the two deadlines, a server that died, and the players who never connected.
+        com.victor.matchmaking.db.AllocationRepository allocations =
+                new com.victor.matchmaking.db.AllocationRepository(pool, servers);
+        com.victor.matchmaking.orchestrator.application.AllocationWatchdog watchdog =
+                new com.victor.matchmaking.orchestrator.application.AllocationWatchdog(allocations,
+                        metrics.registry(),
+                        com.victor.matchmaking.orchestrator.application.AllocationWatchdog
+                                .allocationTimeoutFromEnv(),
+                        com.victor.matchmaking.orchestrator.application.AllocationWatchdog
+                                .startTimeoutFromEnv(),
+                        com.victor.matchmaking.orchestrator.application.AllocationWatchdog
+                                .connectWindowFromEnv(),
+                        serverTtlSeconds);
+        vertx.setPeriodic(WATCHDOG_INTERVAL_MS, id -> watchdog.tick()
+                .onFailure(error -> LOG.log(System.Logger.Level.ERROR,
+                        "orchestrator.watchdog.failed error={0}", error.getMessage())));
+
         com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(),
                         com.victor.matchmaking.metrics.MetricsEndpoint.portFromEnv(METRICS_PORT))
                 .onFailure(error -> LOG.log(System.Logger.Level.ERROR,
                         "orchestrator.metrics.failed port={0} error={1}", METRICS_PORT, error.getMessage()));
 
         int httpPort = GameServerRoutes.portFromEnv();
-        GameServerRoutes routes = new GameServerRoutes(vertx, servers, serverTtlSeconds,
+        GameServerRoutes routes = new GameServerRoutes(vertx, servers, allocations, serverTtlSeconds,
                 GameServerRoutes.tokenFromEnv());
         vertx.createHttpServer()
                 .requestHandler(routes.router())

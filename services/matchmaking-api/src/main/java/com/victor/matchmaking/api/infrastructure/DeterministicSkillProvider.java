@@ -1,5 +1,6 @@
 package com.victor.matchmaking.api.infrastructure;
 
+import com.victor.matchmaking.domain.player.DeterministicSkill;
 import com.victor.matchmaking.domain.player.SkillProvider;
 
 /**
@@ -10,14 +11,14 @@ import com.victor.matchmaking.domain.player.SkillProvider;
  * skill-service gRPC API.</p>
  *
  * <p>It lives in matchmaking-api (not in skill-service) because services cannot
- * have compile-time dependencies on each other (AGENTS.md rule 5).</p>
+ * have compile-time dependencies on each other (AGENTS.md rule 5). The hash itself is
+ * {@link DeterministicSkill}'s, in the domain, because the scenario harness must generate ids with
+ * the same skill the API will give them (the harness used to reimplement it in Python).</p>
  */
 public final class DeterministicSkillProvider implements SkillProvider {
 
     @Override
     public int skillForPlayer(String playerId) {
-        // Stable hash → skill 0..100. Same player always gets the same value.
-        int hash = playerId.hashCode();
-        return Math.abs(hash) % 101;
+        return DeterministicSkill.of(playerId);
     }
 }

@@ -29,4 +29,9 @@ message MatchPlayerState {
   string player_id = 1;
   int32 team = 2;                         // 1 or 2 (the domain labels them A/B)
   int32 skill_at_match = 3;               // skill snapshot at match time
+  // The ticket this player was paired with (W23, ADR 0032). The queue's member is the ticket,
+  // so it is the identity a consumer needs to put the player back where he was when a match
+  // cannot run - a player id is not enough to find the queue entry. Added as field 4: an
+  // addition is a compatible change, and existing consumers simply do not read it.
+  string ticket_id = 4;
 }

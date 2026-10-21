@@ -253,6 +253,11 @@ class PartitionedQueueTest {
     private static void clean(Redis redis) throws Exception {
         List<String> toDelete = new ArrayList<>(RedisKeys.queueKeys(MODE.label(), REGION.name(), PARTITIONS));
         toDelete.addAll(keys(redis, "ticket:w20-*"));
+        // The idempotency keys outlive the tickets (their own TTL), so a second run without a
+        // `flushall` replayed 48 of the 200 creations: the script answered with the stored ticket and
+        // the loop counted an admission that never reached the queue (admitted 72, depth 24). The
+        // suite must be re-runnable without flushing a shared Redis.
+        toDelete.addAll(keys(redis, "idem:w20-*"));
         toDelete.addAll(keys(redis, "match-pending:*"));
         if (toDelete.isEmpty()) {
             return;

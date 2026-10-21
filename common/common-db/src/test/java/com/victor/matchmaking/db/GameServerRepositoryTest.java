@@ -186,6 +186,31 @@ class GameServerRepositoryTest {
                 "and cannot return a second slot");
     }
 
+    /**
+     * W23: a match that started is released when it ends. Before the release knew {@code STARTED},
+     * the game server's call for a running match answered {@code allocation_not_found} and the slot
+     * stayed taken until the watchdog decided the server was dead — a slot leaked by the *normal*
+     * path, which is the one nobody watches.
+     */
+    @Test
+    void releaseFinishesARunningMatchToo() {
+        String matchId = MATCH_PREFIX + "running";
+        await(servers.register(registration("running", 1, "10.0.0.8:7777")));
+        assertEquals(Optional.of(SERVER_PREFIX + "running"), allocate());
+        await(recordAllocation(matchId, SERVER_PREFIX + "running"));
+        await(pool.preparedQuery("UPDATE match_allocations SET status = 'STARTED', started_at = now() "
+                + "WHERE match_id = ?").execute(Tuple.of(matchId)).mapEmpty());
+
+        Optional<GameServer> released = await(servers.release(SERVER_PREFIX + "running", matchId));
+
+        assertEquals(0, released.orElseThrow().allocated(),
+                "a running match's release gives the slot back, exactly as a waiting one's does");
+        String status = await(pool.preparedQuery("SELECT status FROM match_allocations WHERE match_id = ?")
+                .execute(Tuple.of(matchId))).iterator().next().getString("status");
+        assertEquals(com.victor.matchmaking.domain.match.AllocationStatus.RELEASED.name(), status,
+                "and the row says the match is over");
+    }
+
     @Test
     void aDrainedServerStopsReceivingUntilItOffersAgain() {
         await(servers.register(registration("drained", 2, "10.0.0.7:7777")));

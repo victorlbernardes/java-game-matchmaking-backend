@@ -7,6 +7,7 @@ import com.google.protobuf.Timestamp;
 import com.victor.matchmaking.domain.ticket.GameMode;
 import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.events.MatchConfirmed;
+import com.victor.matchmaking.events.MatchPlayerState;
 import com.victor.matchmaking.orchestrator.application.DecodedEvent;
 import com.victor.matchmaking.orchestrator.application.MatchConfirmedDecoder;
 import com.victor.matchmaking.orchestrator.application.RawRecord;
@@ -56,7 +57,29 @@ public final class MatchConfirmedTranslator implements MatchConfirmedDecoder {
         GameMode gameMode = gameMode(event.getGameMode());
         requireContract(event, gameMode);
         return new AllocationRequest(event.getMatchId(), gameMode, region(event.getRegion()),
-                event.getPlayersCount(), AllocationStatus.PENDING_ALLOCATION, occurredAt(event));
+                rosterOf(event), AllocationStatus.PENDING_ALLOCATION, occurredAt(event));
+    }
+
+    /**
+     * The players as the allocation needs them (W23): the ticket is carried through untouched,
+     * including its absence — an event produced before W23 has none, and a replay of the topic's
+     * history must still project (the requeue reports the missing ticket instead of guessing one).
+     */
+    private static java.util.List<AllocationRequest.RosterEntry> rosterOf(MatchConfirmed event) {
+        java.util.List<AllocationRequest.RosterEntry> roster = new java.util.ArrayList<>(event.getPlayersCount());
+        for (MatchPlayerState player : event.getPlayersList()) {
+            if (player.getTeam() != 1 && player.getTeam() != 2) {
+                throw new IllegalArgumentException("player " + player.getPlayerId() + " carries team "
+                        + player.getTeam() + "; the contract numbers them 1 and 2");
+            }
+            if (player.getPlayerId().isBlank()) {
+                throw new IllegalArgumentException("roster carries a blank player id");
+            }
+            String ticketId = player.getTicketId().isBlank() ? null : player.getTicketId();
+            roster.add(new AllocationRequest.RosterEntry(player.getPlayerId(), ticketId, player.getTeam(),
+                    player.getSkillAtMatch()));
+        }
+        return roster;
     }
 
     private static void requireContract(MatchConfirmed event, GameMode gameMode) {

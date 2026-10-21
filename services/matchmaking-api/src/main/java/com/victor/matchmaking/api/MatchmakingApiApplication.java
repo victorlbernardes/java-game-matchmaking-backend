@@ -95,8 +95,17 @@ public final class MatchmakingApiApplication {
                         System.getenv(com.victor.matchmaking.api.application.RegionPlacement.ENV_REGION_RTT_MS));
         com.victor.matchmaking.api.application.PlayerLatency playerLatency =
                 new com.victor.matchmaking.api.infrastructure.RedisPlayerLatency(redis);
+        // Where the player plays, and who signs the credential for it (W23, ADR 0033). The read model
+        // is the orchestrator's projection; the signature is the auth service's, because the private
+        // key lives in exactly one process.
+        com.victor.matchmaking.api.presentation.MatchConnections matchConnections =
+                new com.victor.matchmaking.api.presentation.MatchConnections(
+                        com.victor.matchmaking.db.MatchConnectionRepository.connect(vertx, dbConfig),
+                        new com.victor.matchmaking.api.infrastructure.ConnectionTokenClient(vertx,
+                                com.victor.matchmaking.api.infrastructure.ConnectionTokenClient.baseUrlFromEnv()));
         Router router = HttpRoutes.createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository,
-                skillProvider, partyStore, metrics.registry(), rateLimiter, readiness, placement, playerLatency);
+                skillProvider, partyStore, metrics.registry(), rateLimiter, readiness, placement, playerLatency,
+                matchConnections);
 
         com.victor.matchmaking.metrics.MetricsEndpoint.start(vertx, metrics.registry(), metricsPort)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
@@ -109,9 +118,10 @@ public final class MatchmakingApiApplication {
         server.requestHandler(router)
                 .listen(port)
                 .onSuccess(s -> LOG.log(System.Logger.Level.INFO,
-                        "api.started port={0} instance={1} regions={2} declaredRtts={3} jwksUrl={4}",
+                        "api.started port={0} instance={1} regions={2} declaredRtts={3} jwksUrl={4} authBaseUrl={5}",
                         String.valueOf(s.actualPort()), instanceId, servedRegions,
-                        String.valueOf(placement.hasDeclaredRtts()), jwksUrl))
+                        String.valueOf(placement.hasDeclaredRtts()), jwksUrl,
+                        com.victor.matchmaking.api.infrastructure.ConnectionTokenClient.baseUrlFromEnv()))
                 .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "api.start.failed port=" + port, err));
     }
 

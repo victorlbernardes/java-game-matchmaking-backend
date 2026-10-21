@@ -202,6 +202,30 @@ public final class EngineKpis {
         registry.counter(MetricNames.PAIRING_SUSPENDED, tagsOf(gameMode, region)).increment();
     }
 
+    /**
+     * A rejected match came back to the queue (W23, ADR 0032): the players, the match, and the time
+     * they spent out of the queue. Counted after the requeue and before the marker, so the number is
+     * "players who are queued again", not "matches the engine tried".
+     */
+    public void matchRequeued(GameMode gameMode, Region region, int players, Duration delay) {
+        Tags tags = tagsOf(gameMode, region);
+        registry.counter(MetricNames.MATCHES_REQUEUED, tags).increment();
+        registry.counter(MetricNames.PLAYERS_REQUEUED, tags).increment(players);
+        Timer.builder(MetricNames.REQUEUE_DELAY).tags(tags)
+                .description("Time between a match being rejected and its players being queued again")
+                .register(registry)
+                .record(delay);
+    }
+
+    /**
+     * A player of a rejected match could not be put back: his ticket expired, or the event that
+     * projected the match predates W23. Tagged by reason, because the two need different fixes
+     * (a longer TTL, or nothing at all — old events are history).
+     */
+    public void requeueSkipped(long players, String reason) {
+        registry.counter(MetricNames.REQUEUE_SKIPPED, MetricNames.TAG_REASON, reason).increment(players);
+    }
+
     private AtomicLong gauge(String name, Tags tags, Map<String, AtomicLong> holders, String key,
             String description) {
         return holders.computeIfAbsent(key, ignored -> {

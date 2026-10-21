@@ -46,16 +46,38 @@ public final class MatchConfirmedMapper {
      */
     public static MatchConfirmed toEvent(Match match, List<MatchPlayer> players, Instant occurredAt,
             String correlationId) {
+        return toEvent(match, players, java.util.Map.of(), occurredAt, correlationId);
+    }
+
+    /**
+     * The same event, with the ticket each player was paired with (W23, ADR 0032).
+     *
+     * <p>The ticket is the queue's member, so it is what a consumer needs to put the player back
+     * where he was when a match cannot run. It travels in the event rather than being looked up
+     * later because the ticket may be gone by then (its TTL is 900 s) and because a consumer
+     * should not have to know the matchmaker's hot state to undo a promise.
+     *
+     * @param ticketIds player id to ticket id; a player missing from the map is published without
+     *                  one (the 4-arg overload keeps the W12 contract), which is a degraded
+     *                  payload rather than a refused event
+     */
+    public static MatchConfirmed toEvent(Match match, List<MatchPlayer> players,
+            java.util.Map<String, String> ticketIds, Instant occurredAt, String correlationId) {
         MatchConfirmed.Builder event = MatchConfirmed.newBuilder()
                 .setMeta(metadata(occurredAt, correlationId))
                 .setMatchId(match.id())
                 .setGameMode(gameMode(match.gameMode()))
                 .setRegion(region(match.region()));
         for (MatchPlayer player : players) {
-            event.addPlayers(MatchPlayerState.newBuilder()
+            MatchPlayerState.Builder state = MatchPlayerState.newBuilder()
                     .setPlayerId(player.playerId())
                     .setTeam(team(player.team()))
-                    .setSkillAtMatch(player.skillAtMatch()));
+                    .setSkillAtMatch(player.skillAtMatch());
+            String ticketId = ticketIds.get(player.playerId());
+            if (ticketId != null) {
+                state.setTicketId(ticketId);
+            }
+            event.addPlayers(state);
         }
         return event.build();
     }

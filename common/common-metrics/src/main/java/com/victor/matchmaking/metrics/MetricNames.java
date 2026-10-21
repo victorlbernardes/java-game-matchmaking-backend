@@ -139,6 +139,67 @@ public final class MetricNames {
      */
     public static final String PAIRING_SUSPENDED = "matchmaking.pairing.suspended";
 
+    // ── The allocation's life: what could not run, and did the players come back? (W23) ──
+
+    /**
+     * Matches the watchdog gave up on, tagged by {@link #TAG_REASON} (a {@code RejectionReason}).
+     * This is the number that separates "the pool is full" from "a game server died mid-flight":
+     * both end a match, and only one of them is fixed by adding servers.
+     */
+    public static final String MATCH_REJECTIONS = "matchmaking.match.rejections";
+
+    /**
+     * Pending matches the watchdog retried, tagged by {@link #TAG_RESULT}. A retry that succeeds is
+     * a match that waited instead of dissolving, which is the whole point of retrying before the
+     * deadline instead of only rejecting at it.
+     */
+    public static final String ALLOCATION_RETRIES = "matchmaking.allocation.retries";
+
+    /**
+     * Players marked absent after the connect window (W23, ADR 0034). The match they were in keeps
+     * running: this counter is "who did not show up", not "which match died".
+     */
+    public static final String NO_SHOWS = "matchmaking.no.shows";
+
+    /** Rejected matches whose roster the engine put back in the queue (W23, ADR 0032). */
+    public static final String MATCHES_REQUEUED = "matchmaking.matches.requeued";
+
+    /** Players put back in the queue, the sum of the completed matches above. */
+    public static final String PLAYERS_REQUEUED = "matchmaking.players.requeued";
+
+    /**
+     * How long a rejected match's players spent out of the queue (from the rejection to the
+     * requeue). It is the cost of a rejection to the player, and it is bounded by the sweep
+     * interval only when the engine is healthy - which makes it the right number to alert on.
+     */
+    public static final String REQUEUE_DELAY = "matchmaking.requeue.delay.seconds";
+
+    /**
+     * Players who could not be requeued at all, tagged by {@link #TAG_REASON}: an expired ticket
+     * (the TTL ran out while the match waited) or a match projected from an event that predates
+     * W23 and carries no ticket id. A number here is not a bug - it is a match that cannot come
+     * back, made visible instead of silent.
+     */
+    public static final String REQUEUE_SKIPPED = "matchmaking.requeue.skipped";
+
+    /**
+     * Connection-info requests, tagged by {@link #TAG_RESULT}: {@code served}, {@code not_allocated},
+     * {@code match_rejected}, {@code match_finished}, {@code not_found} or
+     * {@code issuer_unavailable}. The first is a player on his way to a server; the rest say why
+     * the answer was no, which a client cannot act on if the server does not count it.
+     */
+    public static final String CONNECTION_REQUESTS = "matchmaking.connection.requests";
+    public static final String RESULT_SERVED = "served";
+    public static final String RESULT_NOT_ALLOCATED = "not_allocated";
+    public static final String RESULT_MATCH_REJECTED = "match_rejected";
+    public static final String RESULT_MATCH_FINISHED = "match_finished";
+    public static final String RESULT_NOT_FOUND = "not_found";
+    public static final String RESULT_ISSUER_UNAVAILABLE = "issuer_unavailable";
+    /** The ticket's TTL ran out while the match waited: there is nothing to put back. */
+    public static final String REASON_TICKET_EXPIRED = "ticket_expired";
+    /** The event that projected the match predates W23 and carries no ticket id. */
+    public static final String REASON_NO_TICKET = "no_ticket";
+
     // ── Tags ────────────────────────────────────────────────────────────────────────
 
     public static final String TAG_MODE = "mode";
@@ -172,6 +233,8 @@ public final class MetricNames {
     public static final String TAG_DEPENDENCY_REDIS = "redis";
     /** The source of truth: match history (PostgreSQL). */
     public static final String TAG_DEPENDENCY_POSTGRES = "postgres";
+    /** The auth service, called for one thing only: signing a connection token (W23, ADR 0033). */
+    public static final String TAG_DEPENDENCY_AUTH = "auth";
 
     public static final String TAG_DEPENDENCY = "dependency";
 

@@ -52,6 +52,15 @@ public final class PostgresConfirmedMatchInbox implements ConfirmedMatchInbox, A
             "INSERT INTO match_allocations (match_id, game_mode, region, player_count, status, confirmed_at) "
                     + "VALUES (?, ?, ?, ?, ?, ?)";
 
+    /**
+     * The allocation's roster, with the ticket each player must be given back (W23, ADR 0032).
+     * Nothing here is a convenience copy: the requeue needs the queue member, and the connection
+     * token needs the team.
+     */
+    private static final String INSERT_ROSTER =
+            "INSERT INTO match_roster (match_id, player_id, ticket_id, team, skill_at_match) "
+                    + "VALUES (?, ?, ?, ?, ?)";
+
     private static final String MARK_ALLOCATED =
             "UPDATE match_allocations SET status = ?, server_id = ?, allocated_at = now() WHERE match_id = ?";
 
@@ -122,17 +131,29 @@ public final class PostgresConfirmedMatchInbox implements ConfirmedMatchInbox, A
 
     private Future<Applied> projectAndAllocate(SqlConnection connection, AllocationRequest allocation) {
         return projectAllocation(connection, allocation)
+                .compose(projected -> insertRoster(connection, allocation))
                 .compose(projected -> servers.reserve(connection, allocation.gameMode(), allocation.region()))
                 .compose(reserved -> {
                     if (reserved.isEmpty()) {
                         // The pool is full, draining, stale or absent. The match is still
                         // confirmed and still projected; it simply has nowhere to run yet.
+                        // The watchdog retries it until its deadline (W23, ADR 0032).
                         return Future.succeededFuture(
                                 new Applied(ProcessingOutcome.APPLIED, AllocationOutcome.NO_CAPACITY));
                     }
                     return markAllocated(connection, allocation.matchId(), reserved.get())
                             .map(updated -> new Applied(ProcessingOutcome.APPLIED, AllocationOutcome.ALLOCATED));
                 });
+    }
+
+    /** One batch, inside the effect's transaction: a roster that lands without its projection is impossible. */
+    private Future<Void> insertRoster(SqlConnection connection, AllocationRequest allocation) {
+        java.util.List<Tuple> rows = new java.util.ArrayList<>(allocation.playerCount());
+        for (AllocationRequest.RosterEntry entry : allocation.roster()) {
+            rows.add(Tuple.of(allocation.matchId(), entry.playerId(), entry.ticketId(), entry.team(),
+                    entry.skillAtMatch()));
+        }
+        return connection.preparedQuery(INSERT_ROSTER).executeBatch(rows).map(ignored -> (Void) null);
     }
 
     private Future<Integer> markAllocated(SqlConnection connection, String matchId, String serverId) {

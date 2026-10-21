@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import com.victor.matchmaking.db.AllocationRepository;
 import com.victor.matchmaking.db.GameServerRepository;
 import com.victor.matchmaking.db.GameServerRepository.CapacityBelowAllocated;
 import com.victor.matchmaking.db.GameServerRepository.GameServer;
@@ -44,12 +45,15 @@ public final class GameServerRoutes {
 
     private final Vertx vertx;
     private final GameServerRepository servers;
+    private final AllocationRepository allocations;
     private final int ttlSeconds;
     private final String token;
 
-    public GameServerRoutes(Vertx vertx, GameServerRepository servers, int ttlSeconds, String token) {
+    public GameServerRoutes(Vertx vertx, GameServerRepository servers, AllocationRepository allocations,
+            int ttlSeconds, String token) {
         this.vertx = vertx;
         this.servers = servers;
+        this.allocations = allocations;
         this.ttlSeconds = ttlSeconds;
         this.token = token;
     }
@@ -76,6 +80,12 @@ public final class GameServerRoutes {
         router.put("/v1/game-servers/:serverId").handler(this::register);
         router.delete("/v1/game-servers/:serverId").handler(this::drain);
         router.post("/v1/game-servers/:serverId/allocations/:matchId/release").handler(this::release);
+        // The other half of the allocation's life (W23, ADR 0032/0034): the server says the match
+        // began, and says which players arrived. Both are reports about a match this server already
+        // holds, so both are scoped by (server, match) and both are idempotent.
+        router.post("/v1/game-servers/:serverId/allocations/:matchId/started").handler(this::started);
+        router.post("/v1/game-servers/:serverId/allocations/:matchId/players/:playerId/connected")
+                .handler(this::connected);
         router.get("/v1/game-servers").handler(this::list);
         router.get("/v1/capacity").handler(this::capacity);
         return router;
@@ -133,6 +143,45 @@ public final class GameServerRoutes {
                         // repeated call cannot return a second slot, because it has no row to flip.
                         () -> fail(context, 404, "allocation_not_found",
                                 "match is not allocated on this server")))
+                .onFailure(error -> fail(context, 500, "internal_error", error.getMessage()));
+    }
+
+    private void started(RoutingContext context) {
+        String matchId = context.pathParam("matchId");
+        allocations.start(context.pathParam("serverId"), matchId)
+                .onSuccess(outcome -> {
+                    switch (outcome.transition()) {
+                        case APPLIED, ALREADY -> respond(context, 200, new JsonObject()
+                                .put("matchId", matchId)
+                                .put("status", "STARTED")
+                                .put("startedAt", outcome.at() == null ? null : outcome.at().toString())
+                                .put("transition", outcome.transition().name()));
+                        case NOT_FOUND -> fail(context, 404, "allocation_not_found",
+                                "match is not allocated on this server");
+                        default -> fail(context, 409, "invalid_transition",
+                                "match is " + outcome.transition() + " and cannot be started");
+                    }
+                })
+                .onFailure(error -> fail(context, 500, "internal_error", error.getMessage()));
+    }
+
+    private void connected(RoutingContext context) {
+        String playerId = context.pathParam("playerId");
+        allocations.connect(context.pathParam("serverId"), context.pathParam("matchId"), playerId)
+                .onSuccess(outcome -> {
+                    switch (outcome.transition()) {
+                        case APPLIED, ALREADY -> respond(context, 200, new JsonObject()
+                                .put("playerId", playerId)
+                                .put("connectedAt", outcome.at() == null ? null : outcome.at().toString())
+                                .put("transition", outcome.transition().name()));
+                        case NOT_FOUND -> fail(context, 404, "allocation_not_found",
+                                "match is not allocated on this server");
+                        case PLAYER_NOT_IN_MATCH -> fail(context, 404, "player_not_in_match",
+                                "player is not in this match");
+                        default -> fail(context, 409, "invalid_transition",
+                                "match has not started yet");
+                    }
+                })
                 .onFailure(error -> fail(context, 500, "internal_error", error.getMessage()));
     }
 

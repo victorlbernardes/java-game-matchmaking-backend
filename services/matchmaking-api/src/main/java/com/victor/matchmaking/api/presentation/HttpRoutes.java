@@ -158,12 +158,25 @@ public final class HttpRoutes {
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
             MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement,
             PlayerLatency latency) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider,
+                partyStore, registry, rateLimiter, readiness, placement, latency, MatchConnections.disabled());
+    }
+
+    /**
+     * Main wiring plus the connection-info route (W23, ADR 0033): the allocation's read model and the
+     * issuer of the signed token. {@link MatchConnections#disabled()} is every older wiring, where the
+     * route does not exist - an endpoint that exists but cannot answer is worse than one that does not.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement,
+            PlayerLatency latency, MatchConnections matchConnections) {
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
                 new PartyUseCases(partyStore, repository, skillProvider), registry, rateLimiter, readiness,
-                placement, latency);
+                placement, latency, matchConnections);
     }
 
     /**
@@ -180,13 +193,14 @@ public final class HttpRoutes {
                 new GetTicketUseCase(repository),
                 new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
                 new PartyUseCases(partyStore, repository, skillProvider), new SimpleMeterRegistry(), null,
-                Readiness.none(), RegionPlacement.all(), PlayerLatency.none());
+                Readiness.none(), RegionPlacement.all(), PlayerLatency.none(), MatchConnections.disabled());
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
             GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, PartyUseCases partyUseCases, MeterRegistry registry,
-            RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement, PlayerLatency latency) {
+            RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement, PlayerLatency latency,
+            MatchConnections matchConnections) {
 
         Router router = Router.router(vertx);
         router.route().handler(ctx -> {
@@ -399,6 +413,12 @@ public final class HttpRoutes {
                         fail(ctx, 400, e.getMessage());
                     }
                 }));
+
+        // ---- Connection info (W23, ADR 0033) ----
+        if (matchConnections.enabled()) {
+            router.get("/v1/matches/:matchId/connection").handler(ctx ->
+                    authenticate(ctx, jwtAuth, user -> connectionInfo(ctx, user, registry, matchConnections)));
+        }
 
         // ---- Party routes (W11) ----
         router.get("/v1/parties/:partyId").handler(ctx ->
@@ -807,6 +827,89 @@ public final class HttpRoutes {
      * driver exception's message names hosts, ports and table shapes - useful to an operator,
      * free reconnaissance to everyone else.
      */
+    /**
+     * The player asks where to play (W23, ADR 0033).
+     *
+     * <p>Four answers, and the difference matters to a client: {@code 200} with an address and a
+     * signed token (the match is on a server), {@code 409 not_allocated} (confirmed, still waiting),
+     * {@code 409 match_rejected} with the reason (it will not run), {@code 409 match_finished} (it
+     * already did), and {@code 404} for a match the player is not in - which is also the answer for a
+     * match that does not exist, because the two must not be tellable apart.
+     *
+     * <p>The token is minted per request and never cached: a cached token is a client that connects
+     * after it expired and is refused with no way to tell why.
+     */
+    private static void connectionInfo(RoutingContext ctx, User user, MeterRegistry registry,
+            MatchConnections connections) {
+        String matchId = ctx.pathParam("matchId");
+        connections.repository().find(matchId, user.subject())
+                .onSuccess(found -> {
+                    if (found.isEmpty()) {
+                        countConnection(registry, MetricNames.RESULT_NOT_FOUND);
+                        fail(ctx, 404, "match_not_found");
+                        return;
+                    }
+                    var connection = found.get();
+                    switch (connection.status()) {
+                        case PENDING_ALLOCATION -> {
+                            countConnection(registry, MetricNames.RESULT_NOT_ALLOCATED);
+                            respond(ctx, 409, new JsonObject().put("error", "not_allocated")
+                                    .put("message", "the match is confirmed and no game server took it yet"));
+                        }
+                        case REJECTED -> {
+                            countConnection(registry, MetricNames.RESULT_MATCH_REJECTED);
+                            respond(ctx, 409, new JsonObject().put("error", "match_rejected")
+                                    .put("reason", connection.rejectionReason() == null
+                                            ? null
+                                            : connection.rejectionReason().wireName()));
+                        }
+                        case RELEASED -> {
+                            countConnection(registry, MetricNames.RESULT_MATCH_FINISHED);
+                            respond(ctx, 409, new JsonObject().put("error", "match_finished"));
+                        }
+                        case ALLOCATED, STARTED -> {
+                            if (connection.serverAddress() == null) {
+                                // The pool row is gone under a live allocation. The watchdog rejects
+                                // it on its next tick; until then there is no address to hand out.
+                                countConnection(registry, MetricNames.RESULT_NOT_ALLOCATED);
+                                respond(ctx, 409, new JsonObject().put("error", "not_allocated"));
+                                return;
+                            }
+                            String playerToken = bearerToken(ctx);
+                            connections.tokens().issue(playerToken, matchId, connection.team())
+                                    .onSuccess(issued -> {
+                                        countConnection(registry, MetricNames.RESULT_SERVED);
+                                        respond(ctx, 200, new JsonObject()
+                                                .put("matchId", matchId)
+                                                .put("status", connection.status().name())
+                                                .put("team", connection.team())
+                                                .put("serverAddress", connection.serverAddress())
+                                                .put("connectionToken", issued.token())
+                                                .put("expiresAt", issued.expiresAt().toString())
+                                                .put("expiresInSeconds", issued.expiresInSeconds()));
+                                    })
+                                    .onFailure(err -> {
+                                        countConnection(registry, MetricNames.RESULT_ISSUER_UNAVAILABLE);
+                                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_AUTH,
+                                                "token_issuer_unavailable", err);
+                                    });
+                        }
+                    }
+                })
+                .onFailure(err -> {
+                    if (isDependencyUnavailable(err)) {
+                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_POSTGRES,
+                                "allocation store unavailable", err);
+                        return;
+                    }
+                    failInternal(ctx, err);
+                });
+    }
+
+    private static void countConnection(MeterRegistry registry, String result) {
+        registry.counter(MetricNames.CONNECTION_REQUESTS, MetricNames.TAG_RESULT, result).increment();
+    }
+
     private static void failInternal(RoutingContext ctx, Throwable err) {
         LOG.log(System.Logger.Level.ERROR, "http.internal {0} {1} reason={2}",
                 ctx.request().method().name(), ctx.normalizedPath(), String.valueOf(err.getMessage()));

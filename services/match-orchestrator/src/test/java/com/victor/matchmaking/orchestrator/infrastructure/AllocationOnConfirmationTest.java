@@ -189,12 +189,22 @@ class AllocationOnConfirmationTest {
     }
 
     private static AllocationRequest allocation(String matchId) {
-        return new AllocationRequest(matchId, GameMode.ONE_V_ONE, Region.NA, 2,
+        return new AllocationRequest(matchId, GameMode.ONE_V_ONE, Region.NA, roster(2),
                 AllocationStatus.PENDING_ALLOCATION, CONFIRMED_AT);
     }
 
     private static ProcessedEvent event() {
         return new ProcessedEvent(UUID.randomUUID(), CONSUMER_GROUP, TOPIC, 0, 42L, Instant.now());
+    }
+
+    /** The roster the allocation needs since W23: one ticket per player, teams split in half. */
+    private static java.util.List<AllocationRequest.RosterEntry> roster(int players) {
+        java.util.List<AllocationRequest.RosterEntry> entries = new java.util.ArrayList<>(players);
+        for (int i = 1; i <= players; i++) {
+            entries.add(new AllocationRequest.RosterEntry("player-" + i, "ticket-" + i,
+                    i <= players / 2 ? 1 : 2, 50));
+        }
+        return entries;
     }
 
     private static ProcessingOutcome apply(ProcessedEvent event, AllocationRequest allocation) {

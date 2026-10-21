@@ -44,6 +44,14 @@
             <groupId>io.vertx</groupId>
             <artifactId>vertx-auth-jwt</artifactId>
         </dependency>
+        <!-- The one internal HTTP call the gateway makes (W23, ADR 0033): asking the auth service
+             to sign a connection token. A blocking JDK client would park an event loop; the JWKS
+             fetch can afford one (it runs once, before the server listens), a per-request call
+             cannot. -->
+        <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-web-client</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.vertx</groupId>
             <artifactId>vertx-redis-client</artifactId>

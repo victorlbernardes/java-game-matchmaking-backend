@@ -67,6 +67,14 @@ public final class MatchmakingEngineApplication {
      */
     static final long KPI_POLL_INTERVAL_MS = 2000;
     /**
+     * How often rejected allocations are read and their rosters put back in the queue (W23). One
+     * second is the same freshness the pairing has: the players who lost a match are the ones who
+     * should be first in line for the next one.
+     */
+    static final long REQUEUE_INTERVAL_MS = 1000;
+    /** Rejected matches handled per tick, per region: bounded so one bad second cannot stall the loop. */
+    static final int REQUEUE_BATCH = 32;
+    /**
      * How often the game server pool's capacity is read (W22, ADR 0031). One second is the whole
      * staleness budget of the gate: a slot freed by an allocation that just happened can be used by
      * the next match one tick later, and a match formed on a stale belief lands in
@@ -192,6 +200,16 @@ public final class MatchmakingEngineApplication {
         com.victor.matchmaking.engine.infrastructure.PostgresCapacity capacity =
                 new com.victor.matchmaking.engine.infrastructure.PostgresCapacity(gameServers, kpis, SERVED_REGIONS);
 
+        // The other half of W23 (ADR 0032): the orchestrator decides a match cannot run and leaves
+        // a REJECTED row; this reads it and puts the roster back in the queue. The table is the
+        // channel, so a rejection that happens while the engine is down is a row nobody marked -
+        // not a lost player.
+        com.victor.matchmaking.db.RejectedMatchRepository rejectedMatches =
+                new com.victor.matchmaking.db.RejectedMatchRepository(dbPool);
+        com.victor.matchmaking.engine.application.MatchRequeueSweeper requeueSweeper =
+                new com.victor.matchmaking.engine.application.MatchRequeueSweeper(SERVED_REGIONS.list(),
+                        rejectedMatches, tickets, kpis, java.time.Clock.systemUTC(), REQUEUE_BATCH);
+
         // Durable event log (Kafka): Redis carries the live push to the API, Kafka the
         // event every other consumer (orchestrator, analytics) reads. See ADR 0014/0016.
         // Since W14 the engine does not publish on the confirmation path: the event is a
@@ -227,6 +245,16 @@ public final class MatchmakingEngineApplication {
             vertx.setPeriodic(CAPACITY_POLL_INTERVAL_MS, id -> capacity.pollOnce()
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=capacityPoll", err)));
             vertx.setPeriodic(SWEEP_INTERVAL_MS, id -> sweepExpired(redis, tickets, pending, notifier, kpis));
+            // A rejected match's players come back on the next tick: the decision is already
+            // durable, so a slow requeue costs a second of waiting, never the match (W23).
+            vertx.setPeriodic(REQUEUE_INTERVAL_MS, id -> requeueSweeper.sweepOnce()
+                    .onSuccess(requeued -> {
+                        if (requeued > 0) {
+                            LOG.log(System.Logger.Level.INFO,
+                                    "engine.requeued matches={0} reason=allocation_rejected", requeued);
+                        }
+                    })
+                    .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=requeue", err)));
             vertx.setPeriodic(OUTBOX_INTERVAL_MS, id -> relay.drainOnce()
                     .onSuccess(kpis::relayDrained)
                     .onFailure(err -> LOG.log(System.Logger.Level.ERROR, "engine.error stage=outboxDrain", err)));
@@ -912,8 +940,15 @@ public final class MatchmakingEngineApplication {
             // leave a match nobody was told about (W14, ADR 0018). Publishing is the
             // relay's job, and the event id is what tells a consumer this event is this
             // event (ADR 0038).
+            // The ticket of each player travels with the event (W23, ADR 0032): if the match is
+            // rejected, the queue entry to give back is this one, and it may not exist by then.
+            java.util.Map<String, String> ticketIds = new java.util.HashMap<>();
+            for (PendingMatch.PendingPlayer player : pm.players()) {
+                ticketIds.put(player.playerId(), player.ticketId());
+            }
             com.victor.matchmaking.events.MatchConfirmed event =
-                    com.victor.matchmaking.events.MatchConfirmedMapper.toEvent(match, players, Instant.now(), pm.matchId());
+                    com.victor.matchmaking.events.MatchConfirmedMapper.toEvent(match, players, ticketIds,
+                            Instant.now(), pm.matchId());
             OutboxRecord record = new OutboxRecord(
                     event.getMeta().getEventId(),
                     com.victor.matchmaking.events.EventTopics.MATCH_CONFIRMED,

@@ -151,8 +151,16 @@ public final class GameServerRepository {
     private static final String TAKE_SLOT =
             "UPDATE game_servers SET allocated = allocated + 1 WHERE server_id = ? AND allocated < capacity";
 
+    /**
+     * A match is released from either live state: {@code ALLOCATED} (the server took it and the match
+     * never started) or {@code STARTED} (it ran, and this is its normal end). W23 added the second
+     * one, and a release that only knew {@code ALLOCATED} made a running match impossible to finish:
+     * the game server's call answered {@code 404 allocation_not_found} and the slot stayed taken
+     * until the watchdog's TTL decided the server was dead. The state after the release is the same
+     * for both, which is why it is one statement.
+     */
     private static final String RELEASE_ALLOCATION =
-            "UPDATE match_allocations SET status = ? WHERE match_id = ? AND server_id = ? AND status = ?";
+            "UPDATE match_allocations SET status = ? WHERE match_id = ? AND server_id = ? AND status IN (?, ?)";
 
     private static final String GIVE_SLOT_BACK =
             "UPDATE game_servers SET allocated = allocated - 1 WHERE server_id = ? AND allocated > 0";
@@ -296,11 +304,20 @@ public final class GameServerRepository {
     public Future<Optional<GameServer>> release(String serverId, String matchId) {
         return pool.withTransaction(connection -> connection.preparedQuery(RELEASE_ALLOCATION)
                 .execute(Tuple.of(AllocationStatus.RELEASED.name(), matchId, serverId,
-                        AllocationStatus.ALLOCATED.name()))
+                        AllocationStatus.ALLOCATED.name(), AllocationStatus.STARTED.name()))
                 .compose(released -> released.rowCount() == 0
                         ? Future.succeededFuture(Optional.<GameServer>empty())
                         : connection.preparedQuery(GIVE_SLOT_BACK).execute(Tuple.of(serverId))
                                 .compose(ignored -> findOn(connection, serverId))));
+    }
+
+    /**
+     * Puts a slot back, on a connection the caller already owns (W23). Used by {@link #release} and
+     * by the rejection path in {@link AllocationRepository}: the two ways a match stops running must
+     * give the slot back the same way, in the same transaction that flips the row.
+     */
+    public Future<Void> giveSlotBack(SqlConnection connection, String serverId) {
+        return connection.preparedQuery(GIVE_SLOT_BACK).execute(Tuple.of(serverId)).map(ignored -> (Void) null);
     }
 
     private Future<Optional<GameServer>> findOn(SqlConnection connection, String serverId) {

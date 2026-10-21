@@ -28,6 +28,7 @@ public final class RedisTicketRepository implements TicketRepository {
     private final int queueMaxDepth;
     private final int partitions;
     private final RedisScript createScript;
+    private final RedisScript requeueScript;
 
     public RedisTicketRepository(Redis client) {
         this(client, UNBOUNDED_QUEUE);
@@ -52,6 +53,7 @@ public final class RedisTicketRepository implements TicketRepository {
         this.queueMaxDepth = queueMaxDepth;
         this.partitions = Math.max(1, partitions);
         this.createScript = new RedisScript(client, "/create.lua");
+        this.requeueScript = new RedisScript(client, "/requeue.lua");
     }
 
     @Override
@@ -199,6 +201,20 @@ public final class RedisTicketRepository implements TicketRepository {
         return tickets.stream()
                 .map(MatchmakingTicket::id)
                 .toList();
+    }
+
+    @Override
+    public Future<RequeueOutcome> requeue(MatchmakingTicket ticket) {
+        // The score is the ticket's own queuedAt, not now(): a requeue preserves the wait the
+        // player already served (W23). The queue key carries the partition the ticket was created
+        // in, so it comes back to the same key and not to "some partition".
+        String score = String.valueOf(ticket.queuedAt().toEpochMilli());
+        return requeueScript.eval(sha -> Request.cmd(Command.EVALSHA).arg(sha)
+                        .arg("2").arg(ticketKey(ticket.id())).arg(queueKey(ticket))
+                        .arg(ticket.id())
+                        .arg(score)
+                        .arg(String.valueOf(TICKET_TTL_SECONDS)))
+                .map(resp -> RequeueOutcome.valueOf(resp.get(0).toString()));
     }
 
     @Override

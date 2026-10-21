@@ -36,8 +36,18 @@ class ProcessConfirmedMatchTest {
     private static final RawRecord RECORD =
             new RawRecord("matchmaking.events.match-confirmed", 0, 7L, "match-w13-handler", new byte[] {1, 2, 3});
     private static final AllocationRequest ALLOCATION = new AllocationRequest("match-w13-handler",
-            GameMode.ONE_V_ONE, Region.NA, 2, AllocationStatus.PENDING_ALLOCATION, Instant.now());
+            GameMode.ONE_V_ONE, Region.NA, roster(2), AllocationStatus.PENDING_ALLOCATION, Instant.now());
     private static final UUID EVENT_ID = UUID.randomUUID();
+    /** The roster the allocation needs since W23: one ticket per player, teams split in half. */
+    private static java.util.List<AllocationRequest.RosterEntry> roster(int players) {
+        java.util.List<AllocationRequest.RosterEntry> entries = new java.util.ArrayList<>(players);
+        for (int i = 1; i <= players; i++) {
+            entries.add(new AllocationRequest.RosterEntry("player-" + i, "ticket-" + i,
+                    i <= players / 2 ? 1 : 2, 50));
+        }
+        return entries;
+    }
+
     /** No sleeping in the tests: the backoff sequence is asserted on its own. */
     private static final RetryPolicy FAST_RETRY = new RetryPolicy(3, Duration.ZERO);
 

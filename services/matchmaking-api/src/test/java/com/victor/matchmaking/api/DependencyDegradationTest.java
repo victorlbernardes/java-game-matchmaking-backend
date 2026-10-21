@@ -279,6 +279,11 @@ class DependencyDegradationTest {
         }
 
         @Override
+        public Future<RequeueOutcome> requeue(MatchmakingTicket ticket) {
+            return Future.failedFuture(HOT_STATE_FAILURE.get());
+        }
+
+        @Override
         public Future<Long> queueDepth(String gameModeLabel, String regionName) {
             return Future.failedFuture(HOT_STATE_FAILURE.get());
         }

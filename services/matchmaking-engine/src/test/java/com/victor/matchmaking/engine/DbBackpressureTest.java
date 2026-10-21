@@ -298,12 +298,20 @@ class DbBackpressureTest {
         boolean anyPending = false;
         for (String key : allKeys("match-pending:*")) {
             String matchId = key.substring("match-pending:".length());
-            if (matchId.startsWith("match-w17")) {
+            // The prefix is not enough: the code under test names matches `match-<uuid>`, so a
+            // pending match this test formed survived the clean-up and the next run's
+            // `assertNull(pendingMatchHolding(...))` found it — the scenario answering with a
+            // previous run's leftovers. The payload is what identifies the roster.
+            if (matchId.startsWith("match-w17") || mentionsThisRoster(key)) {
                 del = del.arg(key)
                         .arg(RedisKeys.matchConfirmedKey(matchId))
                         .arg(RedisKeys.matchConfirmedClaimKey(matchId));
                 anyPending = true;
             }
+        }
+        for (String key : allKeys("player-pending:w17-*")) {
+            del = del.arg(key);
+            anyPending = true;
         }
         if (anyPending) {
             await(redis.send(del));
@@ -315,9 +323,28 @@ class DbBackpressureTest {
             delTickets = delTickets.arg(key);
             anyTicket = true;
         }
+        // The confirmation counter and its claim outlive the pending match (they carry their own
+        // TTL), and the pending key is already gone when the confirmation completes — so the loop
+        // above finds nothing to clean them through. Left behind, they make the *next* run's first
+        // confirmation a duplicate (`count=2 required=2`, `ignored=true`) and the burst writes
+        // nothing at all: 12 expected, 0 written, 60 s of waiting.
+        for (String key : allKeys("match-confirmed:match-w17-*")) {
+            delTickets = delTickets.arg(key);
+            anyTicket = true;
+        }
+        for (String key : allKeys("match-confirmed-claim:match-w17-*")) {
+            delTickets = delTickets.arg(key);
+            anyTicket = true;
+        }
         if (anyTicket) {
             await(redis.send(delTickets));
         }
+    }
+
+    /** A pending match key whose payload names one of this test's tickets. */
+    private static boolean mentionsThisRoster(String key) throws Exception {
+        Response json = await(redis.send(Request.cmd(Command.GET).arg(key)));
+        return json != null && json.toString().contains("ticket-w17-");
     }
 
     private static <T> T await(Future<T> future) {
