@@ -83,10 +83,9 @@ public final class MatchConfirmedMapper {
     }
 
     /**
-     * A fresh event id per delivery: consumers deduplicate by it, so a redelivery of
-     * the same business fact is recognised instead of applied twice.
+     * Creates event metadata with a fresh event id.
      */
-    private static EventMetadata metadata(Instant occurredAt, String correlationId) {
+    public static EventMetadata metadata(Instant occurredAt, String correlationId) {
         return EventMetadata.newBuilder()
                 .setEventId(UUID.randomUUID().toString())
                 .setEventType(EVENT_TYPE)

@@ -26,12 +26,20 @@ public final class EventContracts {
         if (EventTopics.MATCH_CONFIRMED.equals(topic)) {
             return parseMatchConfirmed(payload);
         }
+        if (EventTopics.MATCH_FINISHED.equals(topic)) {
+            return parseMatchFinished(payload);
+        }
+        if (EventTopics.SKILL_UPDATED.equals(topic)) {
+            return parseSkillUpdated(payload);
+        }
         throw new IllegalArgumentException("no contract is registered for topic " + topic);
     }
 
     /** Whether this build knows the contract of a topic (used to diagnose a parked row). */
     public static boolean isKnown(String topic) {
-        return EventTopics.MATCH_CONFIRMED.equals(topic);
+        return EventTopics.MATCH_CONFIRMED.equals(topic)
+                || EventTopics.MATCH_FINISHED.equals(topic)
+                || EventTopics.SKILL_UPDATED.equals(topic);
     }
 
     private static Message parseMatchConfirmed(byte[] payload) {
@@ -39,6 +47,22 @@ public final class EventContracts {
             return MatchConfirmed.parseFrom(payload);
         } catch (InvalidProtocolBufferException e) {
             throw new IllegalArgumentException("payload does not decode as " + EventTopics.MATCH_CONFIRMED, e);
+        }
+    }
+
+    private static Message parseMatchFinished(byte[] payload) {
+        try {
+            return MatchFinished.parseFrom(payload);
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalArgumentException("payload does not decode as " + EventTopics.MATCH_FINISHED, e);
+        }
+    }
+
+    private static Message parseSkillUpdated(byte[] payload) {
+        try {
+            return SkillUpdated.parseFrom(payload);
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalArgumentException("payload does not decode as " + EventTopics.SKILL_UPDATED, e);
         }
     }
 }

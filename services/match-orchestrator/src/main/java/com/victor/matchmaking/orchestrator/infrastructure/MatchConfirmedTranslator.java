@@ -4,15 +4,16 @@ import java.time.Instant;
 import java.util.UUID;
 
 import com.google.protobuf.Timestamp;
-import com.victor.matchmaking.domain.ticket.GameMode;
-import com.victor.matchmaking.domain.ticket.Region;
+import com.victor.matchmaking.orchestrator.infrastructure.ProtobufEventReaderWrapper;
 import com.victor.matchmaking.events.MatchConfirmed;
 import com.victor.matchmaking.events.MatchPlayerState;
 import com.victor.matchmaking.orchestrator.application.DecodedEvent;
 import com.victor.matchmaking.orchestrator.application.MatchConfirmedDecoder;
-import com.victor.matchmaking.orchestrator.application.RawRecord;
+import com.victor.matchmaking.events.RawRecord;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
 import com.victor.matchmaking.domain.match.AllocationStatus;
+import com.victor.matchmaking.domain.ticket.GameMode;
+import com.victor.matchmaking.domain.ticket.Region;
 
 /**
  * Translates the wire contract into the orchestrator's own records.
@@ -27,9 +28,9 @@ public final class MatchConfirmedTranslator implements MatchConfirmedDecoder {
     /** {@code EventMetadata.event_type} this consumer accepts; mirrors the topic (ADR 0016). */
     public static final String EVENT_TYPE = "MATCH_CONFIRMED";
 
-    private final ProtobufEventReader reader;
+    private final ProtobufEventReaderWrapper reader;
 
-    public MatchConfirmedTranslator(ProtobufEventReader reader) {
+    public MatchConfirmedTranslator(ProtobufEventReaderWrapper reader) {
         this.reader = reader;
     }
 

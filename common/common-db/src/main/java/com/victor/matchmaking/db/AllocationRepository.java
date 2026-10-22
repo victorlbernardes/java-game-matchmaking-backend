@@ -116,6 +116,17 @@ public final class AllocationRepository {
     private static final String STARTED_AT =
             "SELECT started_at FROM match_allocations WHERE match_id = ? AND server_id = ?";
 
+    /**
+     * The server reports the match result. Only a STARTED match accepts a result (a match that
+     * never started cannot finish), and only the server that owns the allocation. Idempotent:
+     * a repeated call returns the stored winner (the row count is 1 on the first call, 0 on
+     * subsequent calls because winner_team is already set — we don't overwrite).
+     */
+    private static final String FINISH =
+            "UPDATE match_allocations SET winner_team = ?, finished_at = now() "
+                    + "WHERE match_id = ? AND server_id = ? AND status = ? AND winner_team IS NULL "
+                    + "RETURNING winner_team";
+
     /** A player connecting is a report from the server, not a state machine of its own. */
     private static final String CONNECT =
             "UPDATE match_roster r SET connected_at = now() "
@@ -295,6 +306,42 @@ public final class AllocationRepository {
                                     ? new ReportOutcome(Transition.PLAYER_NOT_IN_MATCH, null)
                                     : new ReportOutcome(Transition.INVALID_TRANSITION, null);
                         });
+                    });
+                });
+    }
+
+    /**
+     * The server reports the match result. Only a STARTED match accepts a result, and only
+     * the server that owns the allocation. Idempotent: a repeated call returns the stored
+     * winner.
+     */
+    public Future<ReportOutcome> finish(String serverId, String matchId,
+            com.victor.matchmaking.domain.match.MatchWinner winner) {
+        return pool.preparedQuery(FINISH)
+                .execute(Tuple.of(winner.team(), matchId, serverId, AllocationStatus.STARTED.name()))
+                .compose(finished -> {
+                    if (finished.rowCount() == 1) {
+                        // First call: winner_team was NULL, now set. Read it back to confirm.
+                        return Future.succeededFuture(new ReportOutcome(Transition.APPLIED, java.time.Instant.now()));
+                    }
+                    // Either already finished or invalid state - check current status.
+                    return statusOf(serverId, matchId).compose(status -> {
+                        if (status.isEmpty()) {
+                            return Future.succeededFuture(new ReportOutcome(Transition.NOT_FOUND, null));
+                        }
+                        if (status.get() == AllocationStatus.STARTED) {
+                            // Check if winner_team is already set (idempotent repeat).
+                            return pool.preparedQuery("SELECT winner_team FROM match_allocations WHERE match_id = ? AND server_id = ?")
+                                    .execute(Tuple.of(matchId, serverId))
+                                    .map(rows -> {
+                                        var iterator = rows.iterator();
+                                        if (iterator.hasNext() && iterator.next().getInteger("winner_team") != null) {
+                                            return new ReportOutcome(Transition.ALREADY, java.time.Instant.now());
+                                        }
+                                        return new ReportOutcome(Transition.INVALID_TRANSITION, null);
+                                    });
+                        }
+                        return Future.succeededFuture(new ReportOutcome(Transition.INVALID_TRANSITION, null));
                     });
                 });
     }

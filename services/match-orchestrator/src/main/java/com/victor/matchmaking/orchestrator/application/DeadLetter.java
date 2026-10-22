@@ -1,5 +1,6 @@
 package com.victor.matchmaking.orchestrator.application;
 
+import com.victor.matchmaking.events.RawRecord;
 import java.util.UUID;
 
 /**

@@ -17,6 +17,7 @@
         <module>common/common-db</module>
         <module>common/common-events</module>
         <module>common/common-metrics</module>
+        <module>common/common-outbox</module>
         <module>services/matchmaking-api</module>
         <module>services/matchmaking-engine</module>
         <module>services/auth-service</module>

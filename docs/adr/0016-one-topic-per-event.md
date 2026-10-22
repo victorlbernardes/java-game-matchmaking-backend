@@ -132,7 +132,7 @@ task 3 wires that into CI as the gate.
 |--------|-------|
 | `mvn -B clean test` (whole reactor) | 72 tests, 0 failures (65 before this task) |
 | Mapper tests (unit, no infrastructure) | 7 checks |
-| E2E `python3 requests/e2e/run_e2e.py` | 47 checks (10 scenarios), 0 failed (37 before S10) |
+| E2E `requests/mm.sh e2e` | 47 checks (10 scenarios), 0 failed (37 before S10) |
 | E2E S10: CONFIRM published → `MATCH_CONFIRMED` on the log | 416–831 ms over 4 runs (median ~600 ms) |
 | Registry after registration | `matchmaking.events.match-confirmed-value` version 1, id 2, `PROTOBUF` |
 | Registry imports resolved | `matchmaking/common/types.proto` registered as a reference of the event |
@@ -153,7 +153,7 @@ docker compose up -d zookeeper kafka schema-registry
 mvn -B -pl common/common-events exec:java -Dexec.mainClass=com.victor.matchmaking.events.SchemaRegistrar
 mvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication
 # drive a confirmed match and read the event back
-python3 requests/e2e/run_e2e.py                # S10 confirms and asserts the event
+requests/mm.sh e2e                # S10 confirms and asserts the event
 requests/kafka/verify_match_confirmed.sh <matchId>   # decodes the log through the registry
 ```
 

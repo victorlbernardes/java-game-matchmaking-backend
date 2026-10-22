@@ -54,7 +54,7 @@ requests/
 ├── multiregion/verify_multiregion.sh  # two regions, two Redises, placement and failover (W21)
 ├── gameservers/verify_capacity.sh     # the pool, the allocation, the gate and the TTL (W22)
 ├── lifecycle/verify_lifecycle.sh      # deadlines, requeue, connection token, no-show (W23)
-├── load/run_load.py                   # load: the ceiling and the behaviour at it (W16)
+├── load/                             # the results of each load run (the harness itself is `mm.sh load`)
 └── (the E2E and the multiregion probe are harness subcommands: `mm.sh e2e`, `mm.sh multiregion`)
 ```
 
@@ -79,10 +79,12 @@ script never runs against a stale probe (the same trap as starting a service bef
 and starting services — because that is what a scenario *does*; the logic that reads an
 answer moved to Java.
 
-Still Python, pending migration: the load harness (`load/run_load.py`) and the helpers the
-Kafka scripts generate at runtime (`compat.py` in the contract gate, `mutate.py` in the proto
-evolution check, the two parsers in `verify_dlq.sh`, the log reader in
-`verify_match_confirmed.sh`). `11 - Progresso.md` (vault) tracks the phases and what is left.
+There is **no Python left** in `requests/`: the load harness is `mm.sh load`, and the parts the
+Kafka scripts used to generate at runtime are subcommands too — the log reader
+(`mm.sh kafka verify-log`), the dead letter parsers (`dlq-offset`, `dlq-checks`), the registry
+verdict (`compat`) and the contract mutations (`mutate`). `find . -name '*.py'` answers nothing, and a search for the
+interpreter answers nothing. ADR 0040 records why the boundary is exactly there:
+the logic is Java, the orchestration (curl, docker, psql, redis-cli, kafka-*) stays in bash.
 
 ## Party flow (W11)
 
@@ -505,7 +507,7 @@ grafana server                                        # provisioning: ops/grafan
 ## The load test — where the ceiling is (W16)
 
 ```bash
-python3 requests/load/run_load.py --players 400 --concurrency 64 --label after
+requests/mm.sh load --players 400 --concurrency 64 --label after
 ```
 
 It drives real players through the whole stack (auth → API → engine → Redis/Postgres/Kafka),
@@ -636,7 +638,7 @@ Under load, the same cap at 4000 players (1v1/NA, concurrency 192, one build):
 The capped run is honest about what it bought: a third of the arrivals got a fast, explicit "no" in
 under a second instead of a match 20 s later, and the players who *were* admitted waited much less
 (the backlog is bounded, so the wait is bounded with it). Nothing was lost in either run — no
-dissolved match, no duplicate event. `run_load.py` counts the shed separately from errors for this
+dissolved match, no duplicate event. `mm.sh load` counts the shed separately from errors for this
 reason: a refusal on purpose is not a failure, but a run that hides it would be.
 
 Two traps that cost time here, both about measuring under pressure: the harness's own probe

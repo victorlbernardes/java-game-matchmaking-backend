@@ -3388,7 +3388,7 @@
        "raw": "{{lifecycleApiBaseUrl}}/v1/matchmaking/tickets"
       }
      },
-     "description": "Wait a second, then read p1's ticket: it is CONFIRMING and the match id is the one the `matchId` variable holds (`GET /v1/matchmaking/tickets/{{ticketId}}`). Both players confirm through the WebSocket (`ws://` folder) — the script `requests/e2e/run_e2e.py` does it in one line if you do not want to click."
+     "description": "Wait a second, then read p1's ticket: it is CONFIRMING and the match id is the one the `matchId` variable holds (`GET /v1/matchmaking/tickets/{{ticketId}}`). Both players confirm through the WebSocket (`ws://` folder) — the script `requests/mm.sh e2e` does it in one line if you do not want to click."
     },
     {
      "name": "8. GET /v1/matches/{matchId}/connection — the address, the team and a scoped token",

@@ -86,6 +86,9 @@ public final class GameServerRoutes {
         router.post("/v1/game-servers/:serverId/allocations/:matchId/started").handler(this::started);
         router.post("/v1/game-servers/:serverId/allocations/:matchId/players/:playerId/connected")
                 .handler(this::connected);
+        // The match reports its result (W24, ADR 0035): the game server is the only one that
+        // knows who won. Idempotent - a repeated call returns the stored result.
+        router.post("/v1/game-servers/:serverId/allocations/:matchId/finished").handler(this::finished);
         router.get("/v1/game-servers").handler(this::list);
         router.get("/v1/capacity").handler(this::capacity);
         return router;
@@ -180,6 +183,42 @@ public final class GameServerRoutes {
                                 "player is not in this match");
                         default -> fail(context, 409, "invalid_transition",
                                 "match has not started yet");
+                    }
+                })
+                .onFailure(error -> fail(context, 500, "internal_error", error.getMessage()));
+    }
+
+    private void finished(RoutingContext context) {
+        String matchId = context.pathParam("matchId");
+        String serverId = context.pathParam("serverId");
+        JsonObject body = body(context);
+        String winnerRaw = body.getString("winner");
+        if (winnerRaw == null || winnerRaw.isBlank()) {
+            fail(context, 400, "invalid_result", "winner is required (TEAM_1, TEAM_2, or DRAW)");
+            return;
+        }
+        com.victor.matchmaking.domain.match.MatchWinner winner;
+        try {
+            winner = com.victor.matchmaking.domain.match.MatchWinner.fromWireName(winnerRaw);
+        } catch (IllegalArgumentException invalid) {
+            fail(context, 400, "invalid_result", "winner must be TEAM_1, TEAM_2, or DRAW");
+            return;
+        }
+        allocations.finish(serverId, matchId, winner)
+                .onSuccess(outcome -> {
+                    switch (outcome.transition()) {
+                        case APPLIED -> respond(context, 200, new JsonObject()
+                                .put("matchId", matchId)
+                                .put("winner", winner.wireName())
+                                .put("transition", outcome.transition().name()));
+                        case ALREADY -> respond(context, 200, new JsonObject()
+                                .put("matchId", matchId)
+                                .put("winner", winner.wireName())
+                                .put("transition", outcome.transition().name()));
+                        case NOT_FOUND -> fail(context, 404, "allocation_not_found",
+                                "match is not allocated on this server");
+                        default -> fail(context, 409, "invalid_transition",
+                                "match is not STARTED and cannot be finished");
                     }
                 })
                 .onFailure(error -> fail(context, 500, "internal_error", error.getMessage()));

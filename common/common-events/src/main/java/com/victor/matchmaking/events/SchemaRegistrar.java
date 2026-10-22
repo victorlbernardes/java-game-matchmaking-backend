@@ -36,7 +36,9 @@ public final class SchemaRegistrar {
      * default instance is enough - no fixture has to be kept in sync with the contract.
      */
     private static final Map<String, Message> CONTRACTS = Map.of(
-            EventTopics.MATCH_CONFIRMED, MatchConfirmed.getDefaultInstance());
+            EventTopics.MATCH_CONFIRMED, MatchConfirmed.getDefaultInstance(),
+            EventTopics.MATCH_FINISHED, MatchFinished.getDefaultInstance(),
+            EventTopics.SKILL_UPDATED, SkillUpdated.getDefaultInstance());
 
     private SchemaRegistrar() {
     }

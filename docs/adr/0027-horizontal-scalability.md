@@ -105,7 +105,7 @@ The API's story is unchanged since W19: N replicas behind a plain load balancer.
 
 ## Measured numbers (local stack, 2026-10-20)
 
-Correctness under load with the W16/W19 harness (`requests/load/run_load.py`, 400 players,
+Correctness under load with the W16/W19 harness (`requests/mm.sh load`, 400 players,
 concurrency 64, 1v1/NA, every client confirmation driven over the real channels):
 
 | Metric | `QUEUE_PARTITIONS=1` | `QUEUE_PARTITIONS=8` |
@@ -138,7 +138,7 @@ arrivals; eight keys hold 13.65 % at the deepest, hotspot 1.092, sum exactly 200
 - `mvn -o -B -pl common/common-redis -Dtest=QueuePartitionsTest test` — stability, uniformity, remap.
 - `mvn -o -B -pl services/matchmaking-engine -Dtest=PartitionedQueueTest test` — cross-partition
   pairing, party locality, depth sum, cap.
-- `python3 requests/load/run_load.py --players 400 --concurrency 64 --label w20-p8` with both
+- `requests/mm.sh load --players 400 --concurrency 64 --label w20-p8` with both
   services started with `QUEUE_PARTITIONS=8` — the load-regression number above.
 
 ## Trade-offs

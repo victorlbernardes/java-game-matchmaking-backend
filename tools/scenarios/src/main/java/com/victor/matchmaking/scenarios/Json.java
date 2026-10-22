@@ -7,7 +7,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.util.DefaultIndenter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -24,6 +27,28 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 final class Json {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /**
+     * Jackson's default pretty printer writes {@code "field" : value} and keeps an array on one
+     * line; the results files were written by {@code json.dump(..., indent=2)}, so the separator
+     * and the array indentation are set here instead of leaving the harness's own files in a
+     * different shape than the ones they are compared against.
+     */
+    private static final DefaultPrettyPrinter PRETTY = new DefaultPrettyPrinter() {
+        @Override
+        public DefaultPrettyPrinter createInstance() {
+            return this;
+        }
+
+        @Override
+        public void writeObjectFieldValueSeparator(JsonGenerator generator) throws IOException {
+            generator.writeRaw(": ");
+        }
+    };
+
+    static {
+        PRETTY.indentArraysWith(DefaultIndenter.SYSTEM_LINEFEED_INSTANCE);
+    }
 
     private Json() {
     }
@@ -46,6 +71,19 @@ final class Json {
     static String write(Object value) {
         try {
             return MAPPER.writeValueAsString(value);
+        } catch (JsonProcessingException impossibleForMaps) {
+            throw new IllegalStateException(impossibleForMaps);
+        }
+    }
+
+    /**
+     * The document as a file a human reads: two spaces per level, every array element on its own
+     * line, {@code "field": value} — the shape the load results were written in before the harness
+     * was Java, so the numbers stay comparable side by side.
+     */
+    static String pretty(Object value) {
+        try {
+            return MAPPER.writer(PRETTY).writeValueAsString(value);
         } catch (JsonProcessingException impossibleForMaps) {
             throw new IllegalStateException(impossibleForMaps);
         }

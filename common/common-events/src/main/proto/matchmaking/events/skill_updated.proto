@@ -1,0 +1,32 @@
+// Contract of the `matchmaking.events.skill-updated` topic - one file per event type,
+// one topic per event type (ADR 0016). The subject in the Schema Registry is
+// `matchmaking.events.skill-updated-value` (TopicNameStrategy).
+syntax = "proto3";
+
+package matchmaking.events;
+
+import "matchmaking/common/types.proto";
+
+option java_package = "com.victor.matchmaking.events";
+option java_outer_classname = "SkillUpdatedEvent";
+option java_multiple_files = true;
+
+// One recalculation happened: these players' skills moved by this much (W24, ADR 0035).
+//
+// Telemetry, not a dependency: the authoritative state is `player_skills` and the
+// matchmaking reads the Redis cache. A consumer that misses this event loses a chart
+// point, never a number the game uses - which is why it carries both the before and
+// the after (the delta can be reconstructed, the starting point cannot).
+message SkillUpdated {
+  matchmaking.common.EventMetadata meta = 1;
+  string match_id = 2;
+  repeated PlayerSkillUpdate updates = 3;
+}
+
+message PlayerSkillUpdate {
+  string player_id = 1;
+  double skill_before = 2;    // 0-100, the stored rating before the match
+  double skill_after = 3;     // 0-100, the stored rating after it
+  int32 matches_played = 4;   // including the match that caused this update
+  bool provisional = 5;       // still calibrating (before reaching the calibration window)
+}

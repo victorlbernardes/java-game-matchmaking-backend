@@ -1,5 +1,7 @@
 package com.victor.matchmaking.orchestrator.application;
 
+import com.victor.matchmaking.events.RawRecord;
+
 /**
  * Turns the bytes of a record into the orchestrator's records.
  *

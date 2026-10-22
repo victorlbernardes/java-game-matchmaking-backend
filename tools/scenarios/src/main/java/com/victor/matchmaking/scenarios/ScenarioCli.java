@@ -78,6 +78,7 @@ public final class ScenarioCli {
             case "resilience" -> ResilienceProbe.dispatch(rest);
             case "routing" -> RoutingProbe.run(rest);
             case "e2e" -> E2eProbe.run(rest);
+            case "load" -> LoadProbe.run(rest);
             case "kafka" -> KafkaProbe.dispatch(rest);
             case "multiregion" -> MultiregionProbe.dispatch(rest);
             case "delay-proxy" -> DelayProxy.run(rest);
@@ -134,6 +135,8 @@ public final class ScenarioCli {
                   e2e [sweep] [--api URL] [--auth URL] [--redis-port P]
                                                       the whole end-to-end validation (52 checks),
                                                       or the confirmation-timeout timeline
-                  kafka <stamp|send|report|epoch> ...  the timing around a Kafka round trip""");
+                  kafka <stamp|send|report|epoch> ...  the timing around a Kafka round trip
+                  kafka <verify-log|dlq-offset|dlq-checks|compat|mutate> ...
+                                                      the log read, the dead letters and the contract""");
     }
 }

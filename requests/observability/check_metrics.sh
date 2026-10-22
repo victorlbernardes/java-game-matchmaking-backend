@@ -163,11 +163,8 @@ step "2. a match, driven by hand, must move the numbers"
 # Players a and b share a deterministic skill - the pairing policy refuses a spread wider than
 # a ticket's search range, so the ids have to be chosen, not invented - and are fresh on every
 # run. Player c is a third id, waiting alone, so the queue cannot move under the observation.
-# The skill helper is the E2E's, imported rather than copied (run_e2e.py only defines things at
-# import time).
-# Two players who can be paired plus one the engine never considers compatible, so the queue
-# cannot move under the observation. The ids come from the harness, which uses the product's own
-# DeterministicSkill instead of importing the E2E's copy of it.
+# The ids come from the harness, which uses the product's own DeterministicSkill instead of a
+# second copy of it.
 players="$("$MM" pairing three --prefix "kpi$(date +%s)-")"
 player_a="$(echo "$players" | cut -d' ' -f1)"
 player_b="$(echo "$players" | cut -d' ' -f2)"
@@ -197,7 +194,7 @@ fi
 
 # 2a. a lonely player: the depth and the head's wait are read from Redis, and they come back.
 # A known starting point first: the queue and the pending matches of the local stack are
-# cleared, exactly as the E2E scenarios do (requests/e2e/run_e2e.py). Without it a ticket left
+# cleared, exactly as the E2E scenarios do (requests/mm.sh e2e). Without it a ticket left
 # behind by another run could pair with the "lonely" player, and the depth would be 0.
 redis flushall >/dev/null
 note "redis flushed: the queue and the pending matches start empty"

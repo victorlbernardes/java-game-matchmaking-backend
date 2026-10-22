@@ -33,6 +33,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The harness: one jar, one language, no Python (see tools/scenarios).
+MM="$REPO_ROOT/requests/mm.sh"
 BASE_REF="${BASE_REF:-origin/main}"
 EVENT_PROTO="common/common-events/src/main/proto/matchmaking/events/match_confirmed.proto"
 TYPES_PROTO="common/common-proto/src/main/proto/matchmaking/common/types.proto"
@@ -193,49 +195,15 @@ fi
 step "2. the checker refuses each break it exists for"
 # ---------------------------------------------------------------------------
 # Each case is a copy of THIS tree with one edit: what a future pull request would look
-# like if it broke a rule. The mutation lives in $TMP_DIR/mutate.py, which fails if the
-# text it edits moved - a mutation that silently stopped applying would turn the control
-# into a green lie.
-cat >"$TMP_DIR/mutate.py" <<'PY'
-import sys
-
-case, event_proto, types_proto = sys.argv[1], sys.argv[2], sys.argv[3]
-
-
-def edit(path, old, new):
-    text = open(path).read()
-    if old not in text:
-        sys.exit("the mutation no longer matches %s: %r" % (path, old))
-    open(path, "w").write(text.replace(old, new, 1))
-
-
-if case == "additive":
-    # A new field with a number that was never used: the supported way to grow a contract.
-    edit(event_proto, "\n}\n\nmessage MatchPlayerState {",
-         "\n  string correlation_note = 6;\n}\n\nmessage MatchPlayerState {")
-elif case == "renumbered":
-    edit(event_proto, "repeated MatchPlayerState players = 5;", "repeated MatchPlayerState players = 6;")
-elif case == "removed":
-    edit(event_proto, "  repeated MatchPlayerState players = 5;\n", "")
-elif case == "reserved":
-    # The same removal, done the documented way.
-    edit(event_proto, "  repeated MatchPlayerState players = 5;\n",
-         "  reserved 5;\n  reserved \"players\";\n")
-elif case == "kind":
-    edit(event_proto, "int32 skill_at_match = 3;", "sint32 skill_at_match = 3;")
-elif case == "enum":
-    # An imported enum: the shared types are compared because the descriptor set
-    # carries the imports.
-    edit(types_proto, "GAME_MODE_5V5 = 2;", "GAME_MODE_5V5 = 6;")
-else:
-    sys.exit("unknown case: %s" % case)
-PY
+# like if it broke a rule. The mutation is `mm.sh kafka mutate`, which fails if the text it
+# edits moved - a mutation that silently stopped applying would turn the control into a green
+# lie.
 
 for case in additive renumbered removed reserved kind enum; do
   tree="$TMP_DIR/case-$case"
   cp -R "$TMP_DIR/current" "$tree"
-  if ! python3 "$TMP_DIR/mutate.py" "$case" "$tree/$EVENT_PROTO" "$tree/$TYPES_PROTO" \
-      >"$TMP_DIR/$case-mutation.log" 2>&1; then
+  if ! "$MM" kafka mutate --case "$case" --event-proto "$tree/$EVENT_PROTO" \
+      --types-proto "$tree/$TYPES_PROTO" >"$TMP_DIR/$case-mutation.log" 2>&1; then
     bad "$case: the mutation no longer applies to the contract"
     sed 's/^/        /' "$TMP_DIR/$case-mutation.log"
     continue

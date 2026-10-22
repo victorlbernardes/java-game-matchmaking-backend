@@ -3,6 +3,7 @@ package com.victor.matchmaking.orchestrator.application;
 import java.time.Instant;
 import java.util.UUID;
 
+import com.victor.matchmaking.events.RawRecord;
 import com.victor.matchmaking.orchestrator.domain.ProcessedEvent;
 import com.victor.matchmaking.orchestrator.domain.ProcessingOutcome;
 

@@ -144,4 +144,14 @@ public final class RedisKeys {
     public static String playerPendingKey(String playerId) {
         return "player-pending:" + playerId;
     }
+
+    /**
+     * One player's skill cache (W24): a hash with fields {@code rating}, {@code matchesPlayed},
+     * {@code provisional}, {@code updatedAt}. TTL configured by {@code SKILL_CACHE_TTL_SECONDS}
+     * (default 1 h). The cache is an acceleration; losing it falls back to Postgres and then to
+     * the deterministic provider.
+     */
+    public static String playerSkillKey(String playerId) {
+        return "skill:" + playerId;
+    }
 }

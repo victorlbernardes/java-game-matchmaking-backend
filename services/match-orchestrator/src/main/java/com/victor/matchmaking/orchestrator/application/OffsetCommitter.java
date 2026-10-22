@@ -1,5 +1,7 @@
 package com.victor.matchmaking.orchestrator.application;
 
+import com.victor.matchmaking.events.RawRecord;
+
 /**
  * Marks the position a consumer group has fully processed, so a restart resumes after it.
  *
