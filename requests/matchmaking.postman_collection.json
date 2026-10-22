@@ -1,1890 +1,4122 @@
 {
-  "info": {
-    "name": "matchmaking",
-    "description": "Complete matchmaking backend API — auth-service + matchmaking-api.\n\n## Services\n- **auth-service** (:8081) — session JWT issuance + JWKS\n- **matchmaking-api** (:8080) — HTTP/WebSocket gateway (tickets, history, WS push)\n\n## Start (order matters)\n```bash\nmvn -B install -DskipTests   # build + install every module FIRST\nmvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication\nmvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication\nmvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication\n```\n\n## Auth\nEvery matchmaking-api request except `/health` needs a Bearer token from `POST /v1/auth/login`.\n\n## WebSocket\nOpen `WS Connect`, then send frames: PING, MATCH_CONFIRM, MATCH_DECLINE. Incoming: PONG, MATCH_PENDING_CONFIRMATION, MATCH_CONFIRMED, MATCH_CANCELLED, ERROR.",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+ "info": {
+  "name": "matchmaking",
+  "description": "Complete matchmaking backend API — auth-service + matchmaking-api.\n\n## Services\n- **auth-service** (:8081) — session JWT issuance + JWKS\n- **matchmaking-api** (:8080) — HTTP/WebSocket gateway (tickets, history, WS push)\n\n## Start (order matters)\n```bash\nmvn -B install -DskipTests   # build + install every module FIRST\nmvn -pl services/auth-service exec:java -Dexec.mainClass=com.victor.matchmaking.auth.AuthServiceApplication\nmvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaking.api.MatchmakingApiApplication\nmvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication\n```\n\n## Auth\nEvery matchmaking-api request except `/health` needs a Bearer token from `POST /v1/auth/login`.\n\n## WebSocket\nOpen `WS Connect`, then send frames: PING, MATCH_CONFIRM, MATCH_DECLINE. Incoming: PONG, MATCH_PENDING_CONFIRMATION, MATCH_CONFIRMED, MATCH_CANCELLED, ERROR.",
+  "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+ },
+ "variable": [
+  {
+   "key": "authBaseUrl",
+   "value": "http://localhost:8081"
   },
-  "variable": [
+  {
+   "key": "apiBaseUrl",
+   "value": "http://localhost:8080"
+  },
+  {
+   "key": "token",
+   "value": ""
+  },
+  {
+   "key": "tokenP1",
+   "value": ""
+  },
+  {
+   "key": "tokenP2",
+   "value": ""
+  },
+  {
+   "key": "ticketId",
+   "value": ""
+  },
+  {
+   "key": "matchId",
+   "value": ""
+  },
+  {
+   "key": "nextCursor",
+   "value": ""
+  },
+  {
+   "key": "partitionedApiBaseUrl",
+   "value": "http://localhost:8094"
+  },
+  {
+   "key": "enginePartitionedMetricsUrl",
+   "value": "http://localhost:9194/metrics"
+  },
+  {
+   "key": "lifecycleApiBaseUrl",
+   "value": "http://localhost:8099"
+  },
+  {
+   "key": "lifecycleOrchestratorBaseUrl",
+   "value": "http://localhost:8087"
+  },
+  {
+   "key": "lifecycleOrchestratorToken",
+   "value": "w23-game-server-token"
+  },
+  {
+   "key": "connectionToken",
+   "value": ""
+  }
+ ],
+ "item": [
+  {
+   "name": "auth-service",
+   "item": [
     {
-      "key": "authBaseUrl",
-      "value": "http://localhost:8081"
+     "name": "POST /v1/auth/login",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('token', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"player-1\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      }
+     },
+     "description": "Issue a session token. In dev, login auto-provisions the player.\n\n**Expected:** 200 with `{ \"token\": \"...\", \"expiresIn\": 3600 }`.\n**Error:** missing/blank playerId → 400."
     },
     {
-      "key": "apiBaseUrl",
-      "value": "http://localhost:8080"
-    },
-    {
-      "key": "token",
-      "value": ""
-    },
-    {
-      "key": "tokenP1",
-      "value": ""
-    },
-    {
-      "key": "tokenP2",
-      "value": ""
-    },
-    {
-      "key": "ticketId",
-      "value": ""
-    },
-    {
-      "key": "matchId",
-      "value": ""
-    },
-    {
-      "key": "nextCursor",
-      "value": ""
+     "name": "GET /.well-known/jwks.json",
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{authBaseUrl}}/.well-known/jwks.json",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        ".well-known",
+        "jwks.json"
+       ]
+      }
+     },
+     "description": "Public keys for offline JWT validation. matchmaking-api fetches this on startup.\n\n**Expected:** 200 with `{ \"keys\": [ { \"kty\": \"RSA\", \"alg\": \"RS256\", \"kid\": ... } ] }`."
     }
-  ],
-  "item": [
+   ]
+  },
+  {
+   "name": "matchmaking-api",
+   "item": [
     {
-      "name": "auth-service",
-      "item": [
+     "name": "health",
+     "item": [
+      {
+       "name": "GET /health/ready",
+       "event": [
         {
-          "name": "POST /v1/auth/login",
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.environment.set('token', pm.response.json().token);",
-                  "pm.test('status 200', () => pm.response.to.have.status(200));"
-                ]
-              }
-            }
-          ],
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"playerId\": \"player-1\"\n}"
-            },
-            "url": {
-              "raw": "{{authBaseUrl}}/v1/auth/login",
-              "host": [
-                "{{authBaseUrl}}"
-              ],
-              "path": [
-                "v1",
-                "auth",
-                "login"
-              ]
-            }
-          },
-          "description": "Issue a session token. In dev, login auto-provisions the player.\n\n**Expected:** 200 with `{ \"token\": \"...\", \"expiresIn\": 3600 }`.\n**Error:** missing/blank playerId → 400."
-        },
-        {
-          "name": "GET /.well-known/jwks.json",
-          "request": {
-            "method": "GET",
-            "header": [],
-            "url": {
-              "raw": "{{authBaseUrl}}/.well-known/jwks.json",
-              "host": [
-                "{{authBaseUrl}}"
-              ],
-              "path": [
-                ".well-known",
-                "jwks.json"
-              ]
-            }
-          },
-          "description": "Public keys for offline JWT validation. matchmaking-api fetches this on startup.\n\n**Expected:** 200 with `{ \"keys\": [ { \"kty\": \"RSA\", \"alg\": \"RS256\", \"kid\": ... } ] }`."
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200 when the dependencies answer', () => pm.response.to.have.status(200));",
+           "const body = pm.response.json();",
+           "pm.test('every dependency is named', () => {",
+           "  pm.expect(body.checks).to.have.property('redis');",
+           "  pm.expect(body.checks).to.have.property('postgres');",
+           "});",
+           "pm.test('status is UP', () => pm.expect(body.status).to.eql('UP'));"
+          ]
+         }
         }
-      ]
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{apiBaseUrl}}/health/ready",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "health",
+          "ready"
+         ]
+        }
+       },
+       "description": "Readiness probe (no auth, W18, ADR 0024).\n\n**Expected (every dependency up):** 200 with `{\"status\":\"UP\",\"checks\":{\"redis\":\"UP\",\"postgres\":\"UP\"}}`.\n\n**Expected (a dependency down):** 503 with the offending dependency named, e.g. `{\"status\":\"DOWN\",\"checks\":{\"redis\":\"DOWN\",\"postgres\":\"UP\"}}`. Each check is capped at 1 s, so a hung dependency answers the probe instead of holding it.\n\nThis is the endpoint a router or an orchestrator should use: `/health` stays 200 while a dependency is down (the process is fine; killing it does not fix Redis), so routing on liveness during a Redis outage sends traffic to instances that cannot serve it. `requests/resilience/verify_degradation.sh` asserts both answers with the dependency actually stopped."
+      },
+      {
+       "name": "GET /health/ready — dependency down (503)",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 503 when a dependency is down', () => pm.response.to.have.status(503));",
+           "const body = pm.response.json();",
+           "pm.test('the offending dependency is named DOWN', () => {",
+           "  const down = Object.keys(body.checks).filter(k => body.checks[k] === 'DOWN');",
+           "  pm.expect(down.length).to.be.above(0);",
+           "});"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{apiBaseUrl}}/health/ready",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "health",
+          "ready"
+         ]
+        }
+       },
+       "description": "The same endpoint, asked while a dependency is stopped (W18, ADR 0024).\n\nPrecondition: stop one dependency, e.g. `docker stop game-matchmaking-backend-redis-1` (or start the API with Postgres down and watch the boot path instead).\n\n**Expected:** 503 and `checks` naming the dependency that is DOWN while the others stay UP. Stop the container again when done: `docker start game-matchmaking-backend-redis-1`."
+      },
+      {
+       "name": "GET /health",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{apiBaseUrl}}/health",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "health"
+         ]
+        }
+       },
+       "description": "Liveness probe (no auth).\n\n**Expected:** 200 with `{ \"status\": \"UP\" }`."
+      }
+     ]
     },
     {
-      "name": "matchmaking-api",
-      "item": [
+     "name": "tickets",
+     "item": [
+      {
+       "name": "POST /v1/matchmaking/tickets",
+       "event": [
         {
-          "name": "health",
-          "item": [
-            {
-              "name": "GET /health",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/health",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "health"
-                  ]
-                }
-              },
-              "description": "Liveness probe (no auth).\n\n**Expected:** 200 with `{ \"status\": \"UP\" }`."
-            }
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.environment.set('ticketId', pm.response.json().ticketId);",
+           "pm.test('status 201', () => pm.response.to.have.status(201));"
           ]
-        },
-        {
-          "name": "tickets",
-          "item": [
-            {
-              "name": "POST /v1/matchmaking/tickets",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.environment.set('ticketId', pm.response.json().ticketId);",
-                      "pm.test('status 201', () => pm.response.to.have.status(201));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "postman-{{$timestamp}}"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              },
-              "description": "Enqueue a player for matchmaking.\n\n**Expected:** 201 with `{ \"ticketId\", \"status\": \"SEARCHING\", ... }`.\n**Idempotency:** same `Idempotency-Key` returns the same ticket.\n**Errors:** invalid payload → 400; missing token → 401."
-            },
-            {
-              "name": "POST /v1/matchmaking/tickets — idempotent replay",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "postman-{{$timestamp}}"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              },
-              "description": "Same `Idempotency-Key` returns the SAME ticketId (idempotent)."
-            },
-            {
-              "name": "POST /v1/matchmaking/tickets — invalid payload (400)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"5v5\"\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              },
-              "description": "Missing fields → expect 400."
-            },
-            {
-              "name": "POST /v1/matchmaking/tickets — no token (401)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              },
-              "description": "No token → expect 401."
-            },
-            {
-              "name": "GET /v1/matchmaking/tickets/{ticketId}",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "{{ticketId}}"
-                  ]
-                }
-              },
-              "description": "Fetch ticket status.\n\n**Expected:** 200 with the ticket JSON.\n**Errors:** unknown id → 404; other player's ticket → 403."
-            },
-            {
-              "name": "GET /v1/matchmaking/tickets/{ticketId} — unknown id (404)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "does-not-exist"
-                  ]
-                }
-              },
-              "description": "Unknown id → expect 404."
-            },
-            {
-              "name": "DELETE /v1/matchmaking/tickets/{ticketId}",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "{{ticketId}}"
-                  ]
-                }
-              },
-              "description": "Cancel a search. Only while SEARCHING and owned by the authenticated player.\n\n**Expected:** 200 (status: CANCELLED).\n**Errors:** unknown id → 404; other player → 403; not SEARCHING → 409."
-            },
-            {
-              "name": "DELETE /v1/matchmaking/tickets/{ticketId} — second cancel (409)",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "{{ticketId}}"
-                  ]
-                }
-              },
-              "description": "Second cancel → expect 409 (already CANCELLED)."
-            },
-            {
-              "name": "DELETE /v1/matchmaking/tickets/{ticketId} — unknown id (404)",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "does-not-exist"
-                  ]
-                }
-              },
-              "description": "Unknown id → expect 404."
-            }
-          ]
-        },
-        {
-          "name": "POST /v1/matchmaking/tickets — party enqueue",
-          "request": {
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              },
-              {
-                "key": "Authorization",
-                "value": "Bearer {{token}}"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"SA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyId}}\",\n  \"members\": [\n    \"player-2\",\n    \"player-3\"\n  ]\n}"
-            },
-            "url": {
-              "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-              "host": [
-                "{{apiBaseUrl}}"
-              ],
-              "path": [
-                "v1",
-                "matchmaking",
-                "tickets"
-              ]
-            }
-          },
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test('status 201', () => pm.response.to.have.status(201));",
-                  "pm.test('whole party enqueued', () => pm.expect(true).to.be.true);"
-                ]
-              }
-            }
-          ],
-          "description": "Enqueue every member of a party in one atomic request.\n\n**Expected:** 201; every member of the party is queued together.\n**Errors:** unknown party → 400; missing token → 401."
-        },
-        {
-          "name": "parties",
-          "item": [
-            {
-              "name": "GET /v1/parties/{partyId}",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyId}}"
-                  ]
-                }
-              },
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "const party = pm.response.json();",
-                      "pm.test('aggregatedSkill present', () => pm.expect(party.aggregatedSkill).to.exist);"
-                    ]
-                  }
-                }
-              ],
-              "description": "Fetch a party with its aggregated skill and dispersion.\n\n**Expected:** 200 with the party JSON.\n**Errors:** unknown party → 404."
-            },
-            {
-              "name": "POST /v1/parties",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties"
-                  ]
-                }
-              },
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 201', () => pm.response.to.have.status(201));",
-                      "const partyId = pm.response.json().partyId;",
-                      "pm.environment.set('partyId', partyId);"
-                    ]
-                  }
-                }
-              ],
-              "description": "Create a party owned by the authenticated leader.\n\n**Expected:** 201 with `{ \"partyId\" }` — the party id is stored in the `partyId` environment variable.\n**Errors:** missing token → 401; blank leaderId is not applicable (the leader is the caller)."
-            },
-            {
-              "name": "POST /v1/parties/{partyId}/members",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyId}}",
-                    "members"
-                  ]
-                }
-              },
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "const party = pm.response.json();",
-                      "pm.test('party is active', () => pm.expect(party.active).to.be.true);"
-                    ]
-                  }
-                }
-              ],
-              "description": "Add the authenticated player to a party.\n\n**Expected:** 200 with the updated party.\n**Errors:** party not found → 404; not a member → 403; party dissolved → 409."
-            },
-            {
-              "name": "DELETE /v1/parties/{partyId}/members/{playerId}",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members/{{playerId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyId}}",
-                    "members",
-                    "{{playerId}}"
-                  ]
-                }
-              },
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "const party = pm.response.json();",
-                      "pm.test('player removed', () => pm.expect(party.members).to.not.include('{{playerId}}'));"
-                    ]
-                  }
-                }
-              ],
-              "description": "Remove a member. Only the party leader may remove another member.\n\n**Expected:** 200 with the updated party, or 403 for a non-leader.\n**Errors:** player not a member → 403."
-            },
-            {
-              "name": "DELETE /v1/parties/{partyId}",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyId}}"
-                  ]
-                }
-              },
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "const party = pm.response.json();",
-                      "pm.test('party dissolved', () => pm.expect(party.active).to.be.false);"
-                    ]
-                  }
-                }
-              ],
-              "description": "Dissolve a party. Only the party leader may dissolve it.\n\n**Expected:** 200 with the dissolved party, or 403 for a non-leader.\n**Errors:** unknown party → 404."
-            }
-          ]
-        },
-        {
-          "name": "history",
-          "item": [
-            {
-              "name": "GET /v1/players/{playerId}/matches",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.environment.set('nextCursor', pm.response.json().nextCursor);",
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=2",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p1",
-                    "matches"
-                  ],
-                  "query": [
-                    {
-                      "key": "limit",
-                      "value": "2"
-                    }
-                  ]
-                }
-              },
-              "description": "Cursor-paginated match history (newest first).\n\n**Expected:** 200 with `{ \"items\": [...], \"nextCursor\": \"...\" | null }`.\n**Errors:** limit out of range → 400; invalid cursor → 400; other player → 403."
-            },
-            {
-              "name": "GET /v1/players/{playerId}/matches — other player (403)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p2/matches",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p2",
-                    "matches"
-                  ]
-                }
-              },
-              "description": "Another player's history → expect 403."
-            },
-            {
-              "name": "GET /v1/players/{playerId}/matches — limit out of range (400)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=500",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p1",
-                    "matches"
-                  ],
-                  "query": [
-                    {
-                      "key": "limit",
-                      "value": "500"
-                    }
-                  ]
-                }
-              },
-              "description": "Limit out of range → expect 400."
-            },
-            {
-              "name": "GET /v1/players/{playerId}/matches — invalid cursor (400)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{token}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p1/matches?cursor=!!!invalid!!!",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p1",
-                    "matches"
-                  ],
-                  "query": [
-                    {
-                      "key": "cursor",
-                      "value": "!!!invalid!!!"
-                    }
-                  ]
-                }
-              },
-              "description": "Invalid cursor → expect 400."
-            }
-          ]
-        },
-        {
-          "name": "websocket",
-          "item": [
-            {
-              "name": "WS Connect",
-              "request": {
-                "header": [],
-                "url": {
-                  "raw": "ws://localhost:8080/v1/ws?token={{token}}",
-                  "protocol": "ws",
-                  "host": [
-                    "localhost"
-                  ],
-                  "port": "8080",
-                  "path": [
-                    "v1",
-                    "ws"
-                  ],
-                  "query": [
-                    {
-                      "key": "token",
-                      "value": "{{token}}"
-                    }
-                  ]
-                }
-              },
-              "description": "Push notifications channel. Open the connection, then send frames.\n\n**Client→server:**\n- `{\"type\":\"PING\",\"payload\":{}}` → expect `PONG`\n- `{\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"...\"}}` → confirm\n- `{\"type\":\"MATCH_DECLINE\",\"payload\":{\"matchId\":\"...\"}}` → decline\n\n**Server→client:** `PONG`, `MATCH_PENDING_CONFIRMATION`, `MATCH_CONFIRMED`, `MATCH_CANCELLED`, `ERROR`.\n\nThe matchmaking-engine must be running for pairing/confirmation."
-            }
-          ]
-        },
-        {
-          "name": "e2e-w5",
-          "item": [
-            {
-              "name": "1. Login p1",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.environment.set('tokenP1', pm.response.json().token);",
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p1\"\n}"
-                },
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                }
-              }
-            },
-            {
-              "name": "2. Login p2",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.environment.set('tokenP2', pm.response.json().token);",
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p2\"\n}"
-                },
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                }
-              }
-            },
-            {
-              "name": "3. WS Connect p1",
-              "request": {
-                "header": [],
-                "url": {
-                  "raw": "ws://localhost:8080/v1/ws?token={{tokenP1}}",
-                  "protocol": "ws",
-                  "host": [
-                    "localhost"
-                  ],
-                  "port": "8080",
-                  "path": [
-                    "v1",
-                    "ws"
-                  ],
-                  "query": [
-                    {
-                      "key": "token",
-                      "value": "{{tokenP1}}"
-                    }
-                  ]
-                }
-              },
-              "description": "Open WebSocket for p1. Send PING to test. Expect PONG."
-            },
-            {
-              "name": "4. WS Connect p2",
-              "request": {
-                "header": [],
-                "url": {
-                  "raw": "ws://localhost:8080/v1/ws?token={{tokenP2}}",
-                  "protocol": "ws",
-                  "host": [
-                    "localhost"
-                  ],
-                  "port": "8080",
-                  "path": [
-                    "v1",
-                    "ws"
-                  ],
-                  "query": [
-                    {
-                      "key": "token",
-                      "value": "{{tokenP2}}"
-                    }
-                  ]
-                }
-              },
-              "description": "Open WebSocket for p2. Send PING to test. Expect PONG."
-            },
-            {
-              "name": "5. Create ticket p1",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenP1}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "e2e-p1-{{$timestamp}}"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              }
-            },
-            {
-              "name": "6. Create ticket p2",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenP2}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "e2e-p2-{{$timestamp}}"
-                  }
-                ],
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
-                },
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                }
-              }
-            },
-            {
-              "name": "7. WS Send MATCH_CONFIRM p1",
-              "request": {
-                "header": [],
-                "url": {
-                  "raw": "ws://localhost:8080/v1/ws?token={{tokenP1}}",
-                  "protocol": "ws",
-                  "host": [
-                    "localhost"
-                  ],
-                  "port": "8080",
-                  "path": [
-                    "v1",
-                    "ws"
-                  ],
-                  "query": [
-                    {
-                      "key": "token",
-                      "value": "{{tokenP1}}"
-                    }
-                  ]
-                }
-              },
-              "description": "Reuse the p1 WS connection. Send: {\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"{{matchId}}\"}}. Expect MATCH_CONFIRMED."
-            },
-            {
-              "name": "8. WS Send MATCH_CONFIRM p2",
-              "request": {
-                "header": [],
-                "url": {
-                  "raw": "ws://localhost:8080/v1/ws?token={{tokenP2}}",
-                  "protocol": "ws",
-                  "host": [
-                    "localhost"
-                  ],
-                  "port": "8080",
-                  "path": [
-                    "v1",
-                    "ws"
-                  ],
-                  "query": [
-                    {
-                      "key": "token",
-                      "value": "{{tokenP2}}"
-                    }
-                  ]
-                }
-              },
-              "description": "Reuse the p2 WS connection. Send: {\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"{{matchId}}\"}}. Expect MATCH_CONFIRMED."
-            },
-            {
-              "name": "9. History page 1",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.environment.set('nextCursor', pm.response.json().nextCursor);",
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenP1}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=1",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p1",
-                    "matches"
-                  ],
-                  "query": [
-                    {
-                      "key": "limit",
-                      "value": "1"
-                    }
-                  ]
-                }
-              }
-            },
-            {
-              "name": "10. History page 2 (cursor)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenP1}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=1&cursor={{nextCursor}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "players",
-                    "p1",
-                    "matches"
-                  ],
-                  "query": [
-                    {
-                      "key": "limit",
-                      "value": "1"
-                    },
-                    {
-                      "key": "cursor",
-                      "value": "{{nextCursor}}"
-                    }
-                  ]
-                }
-              }
-            }
-          ]
-        },
-        {
-          "name": "e2e-w11",
-          "item": [
-            {
-              "name": "1. Login party leader (skill 88)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p2\"\n}"
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.environment.set('tokenW11Leader', pm.response.json().token);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "2. Login party member A (skill 88)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p38\"\n}"
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.environment.set('tokenW11MemberA', pm.response.json().token);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "3. Login party member B (skill 88)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p163\"\n}"
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.environment.set('tokenW11MemberB', pm.response.json().token);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "4. Create party",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Leader}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties"
-                  ]
-                },
-                "description": "The authenticated leader creates the party; the partyId is stored in `partyW11`."
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 201', () => pm.response.to.have.status(201));",
-                      "pm.environment.set('partyW11', pm.response.json().partyId);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "5. Member A joins",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11MemberA}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyW11"
-                  ]
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "6. Member B joins",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11MemberB}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyW11"
-                  ]
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "7. GET party (3 members, aggregated skill)",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Leader}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyW11}}"
-                  ]
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "const p = pm.response.json();",
-                      "pm.test('3 members', () => pm.expect(p.members.length).to.eql(3));",
-                      "pm.test('aggregatedSkill is 88', () => pm.expect(p.aggregatedSkill).to.eql(88));"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "8. Party enqueue (5v5, atomic)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Leader}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "w11-party-{{$timestamp}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11}}\",\n  \"members\": [\n    \"p2\",\n    \"p38\",\n    \"p163\"\n  ]\n}"
-                },
-                "description": "One ticket per member is created and linked to the party."
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 201', () => pm.response.to.have.status(201));",
-                      "const t = pm.response.json();",
-                      "pm.test('the ticket carries the partyId', () => pm.expect(t.partyId).to.eql(pm.environment.get('partyW11')));",
-                      "pm.environment.set('partyTicketW11', t.ticketId);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "9. Enqueue 7 solo fillers (5v5, skill 88)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Leader}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                },
-                "description": "Pre-request script: 7 solos (all skill 88) queue in the same 5v5/NA partition, so the engine can fill the party."
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "prerequest",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "const solos = [\"p215\", \"p360\", \"p398\", \"p412\", \"p595\", \"p647\", \"p792\"];",
-                      "solos.forEach((pid) => {",
-                      "  pm.sendRequest({url: pm.environment.get('authBaseUrl') + '/v1/auth/login', method: 'POST',",
-                      "    header: {'Content-Type': 'application/json'},",
-                      "    body: {mode: 'raw', raw: JSON.stringify({playerId: pid})}}, (err, login) => {",
-                      "    pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets', method: 'POST',",
-                      "      header: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + login.json().token},",
-                      "      body: {mode: 'raw', raw: JSON.stringify({gameMode: '5v5', region: 'NA', maxLatencyMs: 120})}}, (e, r) => {",
-                      "      pm.test('solo ' + pid + ' enqueued', () => pm.expect(r.code).to.be.oneOf([200, 201]));",
-                      "    });",
-                      "  });",
-                      "});"
-                    ]
-                  }
-                },
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('pre-request enqueued the fillers', () => pm.expect(true).to.be.true);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "10. Party was filled into one match",
-              "request": {
-                "method": "GET",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Leader}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{partyTicketW11}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "{{partyTicketW11}}"
-                  ]
-                },
-                "description": "Waits ~3s so the engine (500ms cycle) fills the 3-member party with the 7 solos; the party ticket must be CONFIRMING."
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "setTimeout(() => {",
-                      "  pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets/' + pm.environment.get('partyTicketW11'),",
-                      "    method: 'GET', header: {Authorization: 'Bearer ' + pm.environment.get('tokenW11Leader')}}, (err, res) => {",
-                      "    pm.test('the party ticket is CONFIRMING (party filled, never split)', () =>",
-                      "      pm.expect(res.json().status).to.eql('CONFIRMING'));",
-                      "    pm.test('the whole party shares one partyId', () =>",
-                      "      pm.expect(res.json().partyId).to.eql(pm.environment.get('partyW11')));",
-                      "  });",
-                      "}, 3000);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "11. Login cancel leader (skill 88)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  }
-                ],
-                "url": {
-                  "raw": "{{authBaseUrl}}/v1/auth/login",
-                  "host": [
-                    "{{authBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "auth",
-                    "login"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"playerId\": \"p844\"\n}"
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.environment.set('tokenW11Cancel', pm.response.json().token);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "12. Create second party",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Cancel}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties"
-                  ]
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 201', () => pm.response.to.have.status(201));",
-                      "pm.environment.set('partyW11Cancel', pm.response.json().partyId);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "13. Second party enqueue (5v5/EU, stays SEARCHING)",
-              "request": {
-                "method": "POST",
-                "header": [
-                  {
-                    "key": "Content-Type",
-                    "value": "application/json"
-                  },
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Cancel}}"
-                  },
-                  {
-                    "key": "Idempotency-Key",
-                    "value": "w11-cancel-{{$timestamp}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets"
-                  ]
-                },
-                "body": {
-                  "mode": "raw",
-                  "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"EU\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11Cancel}}\",\n  \"members\": [\n    \"p844\",\n    \"p1019\"\n  ]\n}"
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 201', () => pm.response.to.have.status(201));",
-                      "pm.environment.set('cancelTicketW11', pm.response.json().ticketId);"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "14. Cancel one member ticket -> cancels the whole party",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Cancel}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{cancelTicketW11}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "matchmaking",
-                    "tickets",
-                    "{{cancelTicketW11}}"
-                  ]
-                },
-                "description": "The party unit is atomic: cancelling one member ticket takes every member ticket out of the queue."
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.test('ticket CANCELLED', () => pm.expect(pm.response.json().status).to.eql('CANCELLED'));"
-                    ]
-                  }
-                }
-              ]
-            },
-            {
-              "name": "15. Dissolve the second party",
-              "request": {
-                "method": "DELETE",
-                "header": [
-                  {
-                    "key": "Authorization",
-                    "value": "Bearer {{tokenW11Cancel}}"
-                  }
-                ],
-                "url": {
-                  "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11Cancel}}",
-                  "host": [
-                    "{{apiBaseUrl}}"
-                  ],
-                  "path": [
-                    "v1",
-                    "parties",
-                    "{{partyW11Cancel}}"
-                  ]
-                }
-              },
-              "response": [],
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.test('party dissolved', () => pm.expect(pm.response.json().active).to.eql(false));"
-                    ]
-                  }
-                }
-              ]
-            }
-          ]
+         }
         }
-      ]
+       ],
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "postman-{{$timestamp}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "Enqueue a player for matchmaking.\n\n**Expected:** 201 with `{ \"ticketId\", \"status\": \"SEARCHING\", ... }`.\n**Idempotency:** same `Idempotency-Key` returns the same ticket.\n**Errors:** invalid payload → 400; missing token → 401."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — idempotent replay",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "postman-{{$timestamp}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "Same `Idempotency-Key` returns the SAME ticketId (idempotent)."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — invalid payload (400)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"5v5\"\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "Missing fields → expect 400."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — no token (401)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "No token → expect 401."
+      },
+      {
+       "name": "GET /v1/matchmaking/tickets/{ticketId}",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "{{ticketId}}"
+         ]
+        }
+       },
+       "description": "Fetch ticket status.\n\n**Expected:** 200 with the ticket JSON.\n**Errors:** unknown id → 404; other player's ticket → 403."
+      },
+      {
+       "name": "GET /v1/matchmaking/tickets/{ticketId} — unknown id (404)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "does-not-exist"
+         ]
+        }
+       },
+       "description": "Unknown id → expect 404."
+      },
+      {
+       "name": "DELETE /v1/matchmaking/tickets/{ticketId}",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "{{ticketId}}"
+         ]
+        }
+       },
+       "description": "Cancel a search. Only while SEARCHING and owned by the authenticated player.\n\n**Expected:** 200 (status: CANCELLED).\n**Errors:** unknown id → 404; other player → 403; not SEARCHING → 409."
+      },
+      {
+       "name": "DELETE /v1/matchmaking/tickets/{ticketId} — second cancel (409)",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "{{ticketId}}"
+         ]
+        }
+       },
+       "description": "Second cancel → expect 409 (already CANCELLED)."
+      },
+      {
+       "name": "DELETE /v1/matchmaking/tickets/{ticketId} — unknown id (404)",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/does-not-exist",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "does-not-exist"
+         ]
+        }
+       },
+       "description": "Unknown id → expect 404."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — rate limited (429)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{playerToken}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "Send this request more than RATE_LIMIT_BURST times in a row (default 20) with the same player's token inside a few seconds. The token bucket lives in Redis (ratelimit:tickets:{playerId}), so the limit is per player and survives an API restart.\n\nExpect the first RATE_LIMIT_BURST requests to answer 201 and the next ones 429 with:\n- Retry-After: seconds until the next token (RATE_LIMIT_REFILL_PER_SECOND, default 5/s)\n- X-RateLimit-Limit: the burst, so a client can size itself without guessing\n- X-RateLimit-Remaining: 0\n- body: {\"error\": \"rate limit exceeded: at most N enqueue requests are admitted per burst\"}\n\nBy hand it is quicker with curl (a loop of 60 requests): this is what step 1 of requests/backpressure/verify_load_shedding.sh does, and it asserts the count stays within burst + refill × elapsed. The API counts the refusals as matchmaking_tickets_rejected_total{reason=\"rate_limited\"} on :9090/metrics."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — queue full (503)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{playerToken}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "A queue that is deep enough to promise nobody a game admits nobody more (ADR 0022).\n\nPrecondition: the target queue holds QUEUE_MAX_DEPTH tickets (default 1000). Reach it by stopping the engine so nothing drains and enqueueing past the cap — requests/backpressure/verify_load_shedding.sh does exactly that in its step 3 (engine stopped, 1100 arrivals, 1000 admitted).\n\nExpect 503 with Retry-After: 5 and a body naming the queue it refused for:\n{\"error\":\"queue full\",\"queue\":\"queue:1v1:NA\",\"depth\":1000,\"capacity\":1000,\"retryAfterSeconds\":5}\n\nThe refusal is temporary: once the queue drains below the cap, the same request is admitted. A replay of a ticket that was already accepted is still answered while the queue is full — the player did enqueue, and refusing the retry would lose a ticket that exists. Counted as matchmaking_tickets_rejected_total{reason=\"queue_full\"}."
+      },
+      {
+       "name": "POST /v1/matchmaking/tickets — hot state unavailable (503)",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 503 while Redis is down', () => pm.response.to.have.status(503));",
+           "pm.test('Retry-After tells the client when to come back', () => pm.expect(pm.response.headers.get('Retry-After')).to.eql('1'));",
+           "const body = pm.response.json();",
+           "pm.test('the body names the dependency', () => pm.expect(body.dependency).to.eql('redis'));",
+           "pm.test('the body carries no internal address', () => {",
+           "  pm.expect(pm.response.text()).to.not.include('localhost');",
+           "  pm.expect(pm.response.text()).to.not.include('6379');",
+           "});"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{playerToken}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       },
+       "description": "What an arrival hears when the hot state is gone (W18, ADR 0024).\n\nPrecondition: `docker stop game-matchmaking-backend-redis-1`. Start it again afterwards (`docker start game-matchmaking-backend-redis-1`) — the services do not need restarting, which is the other half of the change: their Lua SHAs reload on the next call.\n\nExpected: **503** with `Retry-After: 1` and a body that names what is unavailable without saying where it lives:\n{\"error\":\"hot state unavailable\",\"dependency\":\"redis\",\"retryAfterSeconds\":1}\n\nBefore this, the same request answered `500 {\"error\":\"Connection refused: localhost/127.0.0.1:6379\"}` — the wrong status (it tells the client to stop), plus a map of the internal network. The refusal is counted as `matchmaking_dependency_errors_total{dependency=\"redis\"}` on the API's scrape (:9090).\n\nRedis RESTARTED (not down) is the same endpoint answering 201: the cached script SHA is rebuilt on the first `EVALSHA` that reports `NOSCRIPT`, so a cache restart is not an outage."
+      }
+     ]
     },
     {
-      "name": "infra",
-      "item": [
-        {
-          "name": "schema-registry",
-          "item": [
-            {
-              "name": "GET /config",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.test('global compatibility is FULL', () => pm.expect(pm.response.json().compatibilityLevel).to.eql('FULL'));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [],
-                "url": {
-                  "raw": "{{schemaRegistryUrl}}/config",
-                  "host": [
-                    "{{schemaRegistryUrl}}"
-                  ],
-                  "path": [
-                    "config"
-                  ]
-                }
-              },
-              "description": "Global compatibility level enforced by the Schema Registry (W12).\n\n**Expected:** 200 with `{ \"compatibilityLevel\": \"FULL\" }`.\n\nSet by `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=full` in `docker-compose.yml`. It is the server-side half of the CI gate (W12 task 3): a new version of a subject must be readable by old AND new consumers, otherwise the registry rejects the registration.\n\nRequires: `docker compose up -d zookeeper kafka schema-registry`."
-            },
-            {
-              "name": "GET /subjects",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.test('payload is a list of subjects', () => pm.expect(pm.response.json()).to.be.an('array'));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [],
-                "url": {
-                  "raw": "{{schemaRegistryUrl}}/subjects",
-                  "host": [
-                    "{{schemaRegistryUrl}}"
-                  ],
-                  "path": [
-                    "subjects"
-                  ]
-                }
-              },
-              "description": "Subjects registered in the `_schemas` topic.\n\n**Expected:** 200 with `[]` until W12 task 2 registers the first event contract (`match-confirmed-value`, `player-search-value`).\n\nA non-empty list here is also the proof that the registry reached the broker over the INTERNAL listener."
-            },
-            {
-              "name": "GET /schemas/types",
-              "event": [
-                {
-                  "listen": "test",
-                  "script": {
-                    "type": "text/javascript",
-                    "exec": [
-                      "pm.test('status 200', () => pm.response.to.have.status(200));",
-                      "pm.test('PROTOBUF is supported', () => pm.expect(pm.response.json()).to.include('PROTOBUF'));"
-                    ]
-                  }
-                }
-              ],
-              "request": {
-                "method": "GET",
-                "header": [],
-                "url": {
-                  "raw": "{{schemaRegistryUrl}}/schemas/types",
-                  "host": [
-                    "{{schemaRegistryUrl}}"
-                  ],
-                  "path": [
-                    "schemas",
-                    "types"
-                  ]
-                }
-              },
-              "description": "Schema formats this registry accepts.\n\n**Expected:** 200 with `[\"JSON\", \"PROTOBUF\", \"AVRO\"]`. The event contracts use Protobuf (see `04 - Engenharia Distribuída`)."
-            }
-          ]
+     "name": "POST /v1/matchmaking/tickets — party enqueue",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{token}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"SA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyId}}\",\n  \"members\": [\n    \"player-2\",\n    \"player-3\"\n  ]\n}"
+      },
+      "url": {
+       "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{apiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.test('whole party enqueued', () => pm.expect(true).to.be.true);"
+        ]
+       }
+      }
+     ],
+     "description": "Enqueue every member of a party in one atomic request.\n\n**Expected:** 201; every member of the party is queued together.\n**Errors:** unknown party → 400; missing token → 401."
+    },
+    {
+     "name": "parties",
+     "item": [
+      {
+       "name": "GET /v1/parties/{partyId}",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyId}}"
+         ]
         }
-      ]
+       },
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "const party = pm.response.json();",
+           "pm.test('aggregatedSkill present', () => pm.expect(party.aggregatedSkill).to.exist);"
+          ]
+         }
+        }
+       ],
+       "description": "Fetch a party with its aggregated skill and dispersion.\n\n**Expected:** 200 with the party JSON.\n**Errors:** unknown party → 404."
+      },
+      {
+       "name": "POST /v1/parties",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties"
+         ]
+        }
+       },
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 201', () => pm.response.to.have.status(201));",
+           "const partyId = pm.response.json().partyId;",
+           "pm.environment.set('partyId', partyId);"
+          ]
+         }
+        }
+       ],
+       "description": "Create a party owned by the authenticated leader.\n\n**Expected:** 201 with `{ \"partyId\" }` — the party id is stored in the `partyId` environment variable.\n**Errors:** missing token → 401; blank leaderId is not applicable (the leader is the caller)."
+      },
+      {
+       "name": "POST /v1/parties/{partyId}/members",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyId}}",
+          "members"
+         ]
+        }
+       },
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "const party = pm.response.json();",
+           "pm.test('party is active', () => pm.expect(party.active).to.be.true);"
+          ]
+         }
+        }
+       ],
+       "description": "Add the authenticated player to a party.\n\n**Expected:** 200 with the updated party.\n**Errors:** party not found → 404; not a member → 403; party dissolved → 409."
+      },
+      {
+       "name": "DELETE /v1/parties/{partyId}/members/{playerId}",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}/members/{{playerId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyId}}",
+          "members",
+          "{{playerId}}"
+         ]
+        }
+       },
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "const party = pm.response.json();",
+           "pm.test('player removed', () => pm.expect(party.members).to.not.include('{{playerId}}'));"
+          ]
+         }
+        }
+       ],
+       "description": "Remove a member. Only the party leader may remove another member.\n\n**Expected:** 200 with the updated party, or 403 for a non-leader.\n**Errors:** player not a member → 403."
+      },
+      {
+       "name": "DELETE /v1/parties/{partyId}",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyId}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyId}}"
+         ]
+        }
+       },
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "const party = pm.response.json();",
+           "pm.test('party dissolved', () => pm.expect(party.active).to.be.false);"
+          ]
+         }
+        }
+       ],
+       "description": "Dissolve a party. Only the party leader may dissolve it.\n\n**Expected:** 200 with the dissolved party, or 403 for a non-leader.\n**Errors:** unknown party → 404."
+      }
+     ]
+    },
+    {
+     "name": "history",
+     "item": [
+      {
+       "name": "GET /v1/players/{playerId}/matches",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.environment.set('nextCursor', pm.response.json().nextCursor);",
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=2",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p1",
+          "matches"
+         ],
+         "query": [
+          {
+           "key": "limit",
+           "value": "2"
+          }
+         ]
+        }
+       },
+       "description": "Cursor-paginated match history (newest first).\n\n**Expected:** 200 with `{ \"items\": [...], \"nextCursor\": \"...\" | null }`.\n**Errors:** limit out of range → 400; invalid cursor → 400; other player → 403."
+      },
+      {
+       "name": "GET /v1/players/{playerId}/matches — other player (403)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p2/matches",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p2",
+          "matches"
+         ]
+        }
+       },
+       "description": "Another player's history → expect 403."
+      },
+      {
+       "name": "GET /v1/players/{playerId}/matches — limit out of range (400)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=500",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p1",
+          "matches"
+         ],
+         "query": [
+          {
+           "key": "limit",
+           "value": "500"
+          }
+         ]
+        }
+       },
+       "description": "Limit out of range → expect 400."
+      },
+      {
+       "name": "GET /v1/players/{playerId}/matches — invalid cursor (400)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{token}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p1/matches?cursor=!!!invalid!!!",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p1",
+          "matches"
+         ],
+         "query": [
+          {
+           "key": "cursor",
+           "value": "!!!invalid!!!"
+          }
+         ]
+        }
+       },
+       "description": "Invalid cursor → expect 400."
+      }
+     ]
+    },
+    {
+     "name": "websocket",
+     "item": [
+      {
+       "name": "WS Connect",
+       "request": {
+        "header": [],
+        "url": {
+         "raw": "ws://localhost:8080/v1/ws?token={{token}}",
+         "protocol": "ws",
+         "host": [
+          "localhost"
+         ],
+         "port": "8080",
+         "path": [
+          "v1",
+          "ws"
+         ],
+         "query": [
+          {
+           "key": "token",
+           "value": "{{token}}"
+          }
+         ]
+        },
+        "description": "Push notifications channel. Open the connection, then send frames.\n\n**Client→server:**\n- `{\"type\":\"PING\",\"payload\":{}}` → expect `PONG`; while a match is pending, the heartbeat also **re-presents** `MATCH_PENDING_CONFIRMATION` (W19, ADR 0026: a reconnect on any instance recovers what a lost notification owed)\n- `{\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"...\"}}` → confirm\n- `{\"type\":\"MATCH_DECLINE\",\"payload\":{\"matchId\":\"...\"}}` → decline\n\n**Server→client:** `PONG`, `MATCH_PENDING_CONFIRMATION`, `MATCH_CONFIRMED`, `MATCH_CANCELLED`, `ERROR`.\n\nThe socket is not pinned: `presence:<playerId>` in Redis names the instance holding it (TTL 90 s), `GET /health` returns the instance's name, and any instance accepts `MATCH_CONFIRM`.\n\nThe matchmaking-engine must be running for pairing/confirmation."
+       },
+       "description": "Push notifications channel. Open the connection, then send frames.\n\n**Client→server:**\n- `{\"type\":\"PING\",\"payload\":{}}` → expect `PONG`\n- `{\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"...\"}}` → confirm\n- `{\"type\":\"MATCH_DECLINE\",\"payload\":{\"matchId\":\"...\"}}` → decline\n\n**Server→client:** `PONG`, `MATCH_PENDING_CONFIRMATION`, `MATCH_CONFIRMED`, `MATCH_CANCELLED`, `ERROR`.\n\nThe matchmaking-engine must be running for pairing/confirmation."
+      }
+     ]
+    },
+    {
+     "name": "e2e-w5",
+     "item": [
+      {
+       "name": "1. Login p1",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.environment.set('tokenP1', pm.response.json().token);",
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p1\"\n}"
+        },
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        }
+       }
+      },
+      {
+       "name": "2. Login p2",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.environment.set('tokenP2', pm.response.json().token);",
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p2\"\n}"
+        },
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        }
+       }
+      },
+      {
+       "name": "3. WS Connect p1",
+       "request": {
+        "header": [],
+        "url": {
+         "raw": "ws://localhost:8080/v1/ws?token={{tokenP1}}",
+         "protocol": "ws",
+         "host": [
+          "localhost"
+         ],
+         "port": "8080",
+         "path": [
+          "v1",
+          "ws"
+         ],
+         "query": [
+          {
+           "key": "token",
+           "value": "{{tokenP1}}"
+          }
+         ]
+        }
+       },
+       "description": "Open WebSocket for p1. Send PING to test. Expect PONG."
+      },
+      {
+       "name": "4. WS Connect p2",
+       "request": {
+        "header": [],
+        "url": {
+         "raw": "ws://localhost:8080/v1/ws?token={{tokenP2}}",
+         "protocol": "ws",
+         "host": [
+          "localhost"
+         ],
+         "port": "8080",
+         "path": [
+          "v1",
+          "ws"
+         ],
+         "query": [
+          {
+           "key": "token",
+           "value": "{{tokenP2}}"
+          }
+         ]
+        }
+       },
+       "description": "Open WebSocket for p2. Send PING to test. Expect PONG."
+      },
+      {
+       "name": "5. Create ticket p1",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenP1}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "e2e-p1-{{$timestamp}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       }
+      },
+      {
+       "name": "6. Create ticket p2",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenP2}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "e2e-p2-{{$timestamp}}"
+         }
+        ],
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+        },
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        }
+       }
+      },
+      {
+       "name": "7. WS Send MATCH_CONFIRM p1",
+       "request": {
+        "header": [],
+        "url": {
+         "raw": "ws://localhost:8080/v1/ws?token={{tokenP1}}",
+         "protocol": "ws",
+         "host": [
+          "localhost"
+         ],
+         "port": "8080",
+         "path": [
+          "v1",
+          "ws"
+         ],
+         "query": [
+          {
+           "key": "token",
+           "value": "{{tokenP1}}"
+          }
+         ]
+        }
+       },
+       "description": "Reuse the p1 WS connection. Send: {\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"{{matchId}}\"}}. Expect MATCH_CONFIRMED."
+      },
+      {
+       "name": "8. WS Send MATCH_CONFIRM p2",
+       "request": {
+        "header": [],
+        "url": {
+         "raw": "ws://localhost:8080/v1/ws?token={{tokenP2}}",
+         "protocol": "ws",
+         "host": [
+          "localhost"
+         ],
+         "port": "8080",
+         "path": [
+          "v1",
+          "ws"
+         ],
+         "query": [
+          {
+           "key": "token",
+           "value": "{{tokenP2}}"
+          }
+         ]
+        }
+       },
+       "description": "Reuse the p2 WS connection. Send: {\"type\":\"MATCH_CONFIRM\",\"payload\":{\"matchId\":\"{{matchId}}\"}}. Expect MATCH_CONFIRMED."
+      },
+      {
+       "name": "9. History page 1",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.environment.set('nextCursor', pm.response.json().nextCursor);",
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenP1}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=1",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p1",
+          "matches"
+         ],
+         "query": [
+          {
+           "key": "limit",
+           "value": "1"
+          }
+         ]
+        }
+       }
+      },
+      {
+       "name": "10. History page 2 (cursor)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenP1}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/players/p1/matches?limit=1&cursor={{nextCursor}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "players",
+          "p1",
+          "matches"
+         ],
+         "query": [
+          {
+           "key": "limit",
+           "value": "1"
+          },
+          {
+           "key": "cursor",
+           "value": "{{nextCursor}}"
+          }
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "e2e-w11",
+     "item": [
+      {
+       "name": "1. Login party leader (skill 88)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p2\"\n}"
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.environment.set('tokenW11Leader', pm.response.json().token);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "2. Login party member A (skill 88)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p38\"\n}"
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.environment.set('tokenW11MemberA', pm.response.json().token);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "3. Login party member B (skill 88)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p163\"\n}"
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.environment.set('tokenW11MemberB', pm.response.json().token);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "4. Create party",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Leader}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties"
+         ]
+        },
+        "description": "The authenticated leader creates the party; the partyId is stored in `partyW11`."
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 201', () => pm.response.to.have.status(201));",
+           "pm.environment.set('partyW11', pm.response.json().partyId);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "5. Member A joins",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11MemberA}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyW11"
+         ]
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "6. Member B joins",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11MemberB}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}/members",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyW11"
+         ]
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "7. GET party (3 members, aggregated skill)",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Leader}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyW11}}"
+         ]
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "const p = pm.response.json();",
+           "pm.test('3 members', () => pm.expect(p.members.length).to.eql(3));",
+           "pm.test('aggregatedSkill is 88', () => pm.expect(p.aggregatedSkill).to.eql(88));"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "8. Party enqueue (5v5, atomic)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Leader}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "w11-party-{{$timestamp}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11}}\",\n  \"members\": [\n    \"p2\",\n    \"p38\",\n    \"p163\"\n  ]\n}"
+        },
+        "description": "One ticket per member is created and linked to the party."
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 201', () => pm.response.to.have.status(201));",
+           "const t = pm.response.json();",
+           "pm.test('the ticket carries the partyId', () => pm.expect(t.partyId).to.eql(pm.environment.get('partyW11')));",
+           "pm.environment.set('partyTicketW11', t.ticketId);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "9. Enqueue 7 solo fillers (5v5, skill 88)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Leader}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        },
+        "description": "Pre-request script: 7 solos (all skill 88) queue in the same 5v5/NA partition, so the engine can fill the party."
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "prerequest",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "const solos = [\"p215\", \"p360\", \"p398\", \"p412\", \"p595\", \"p647\", \"p792\"];",
+           "solos.forEach((pid) => {",
+           "  pm.sendRequest({url: pm.environment.get('authBaseUrl') + '/v1/auth/login', method: 'POST',",
+           "    header: {'Content-Type': 'application/json'},",
+           "    body: {mode: 'raw', raw: JSON.stringify({playerId: pid})}}, (err, login) => {",
+           "    pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets', method: 'POST',",
+           "      header: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + login.json().token},",
+           "      body: {mode: 'raw', raw: JSON.stringify({gameMode: '5v5', region: 'NA', maxLatencyMs: 120})}}, (e, r) => {",
+           "      pm.test('solo ' + pid + ' enqueued', () => pm.expect(r.code).to.be.oneOf([200, 201]));",
+           "    });",
+           "  });",
+           "});"
+          ]
+         }
+        },
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('pre-request enqueued the fillers', () => pm.expect(true).to.be.true);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "10. Party was filled into one match",
+       "request": {
+        "method": "GET",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Leader}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{partyTicketW11}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "{{partyTicketW11}}"
+         ]
+        },
+        "description": "Waits ~3s so the engine (500ms cycle) fills the 3-member party with the 7 solos; the party ticket must be CONFIRMING."
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "setTimeout(() => {",
+           "  pm.sendRequest({url: pm.environment.get('apiBaseUrl') + '/v1/matchmaking/tickets/' + pm.environment.get('partyTicketW11'),",
+           "    method: 'GET', header: {Authorization: 'Bearer ' + pm.environment.get('tokenW11Leader')}}, (err, res) => {",
+           "    pm.test('the party ticket is CONFIRMING (party filled, never split)', () =>",
+           "      pm.expect(res.json().status).to.eql('CONFIRMING'));",
+           "    pm.test('the whole party shares one partyId', () =>",
+           "      pm.expect(res.json().partyId).to.eql(pm.environment.get('partyW11')));",
+           "  });",
+           "}, 3000);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "11. Login cancel leader (skill 88)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         }
+        ],
+        "url": {
+         "raw": "{{authBaseUrl}}/v1/auth/login",
+         "host": [
+          "{{authBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "auth",
+          "login"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"playerId\": \"p844\"\n}"
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.environment.set('tokenW11Cancel', pm.response.json().token);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "12. Create second party",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Cancel}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties"
+         ]
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 201', () => pm.response.to.have.status(201));",
+           "pm.environment.set('partyW11Cancel', pm.response.json().partyId);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "13. Second party enqueue (5v5/EU, stays SEARCHING)",
+       "request": {
+        "method": "POST",
+        "header": [
+         {
+          "key": "Content-Type",
+          "value": "application/json"
+         },
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Cancel}}"
+         },
+         {
+          "key": "Idempotency-Key",
+          "value": "w11-cancel-{{$timestamp}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets"
+         ]
+        },
+        "body": {
+         "mode": "raw",
+         "raw": "{\n  \"gameMode\": \"5v5\",\n  \"region\": \"EU\",\n  \"maxLatencyMs\": 120,\n  \"partyId\": \"{{partyW11Cancel}}\",\n  \"members\": [\n    \"p844\",\n    \"p1019\"\n  ]\n}"
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 201', () => pm.response.to.have.status(201));",
+           "pm.environment.set('cancelTicketW11', pm.response.json().ticketId);"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "14. Cancel one member ticket -> cancels the whole party",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Cancel}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{cancelTicketW11}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "matchmaking",
+          "tickets",
+          "{{cancelTicketW11}}"
+         ]
+        },
+        "description": "The party unit is atomic: cancelling one member ticket takes every member ticket out of the queue."
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.test('ticket CANCELLED', () => pm.expect(pm.response.json().status).to.eql('CANCELLED'));"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "name": "15. Dissolve the second party",
+       "request": {
+        "method": "DELETE",
+        "header": [
+         {
+          "key": "Authorization",
+          "value": "Bearer {{tokenW11Cancel}}"
+         }
+        ],
+        "url": {
+         "raw": "{{apiBaseUrl}}/v1/parties/{{partyW11Cancel}}",
+         "host": [
+          "{{apiBaseUrl}}"
+         ],
+         "path": [
+          "v1",
+          "parties",
+          "{{partyW11Cancel}}"
+         ]
+        }
+       },
+       "response": [],
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.test('party dissolved', () => pm.expect(pm.response.json().active).to.eql(false));"
+          ]
+         }
+        }
+       ]
+      }
+     ]
     }
-  ]
+   ]
+  },
+  {
+   "name": "routing-w19 (two instances)",
+   "description": "W19 (ADR 0026): the WebSocket connection is not pinned to one instance.\n\nStart a second API instance first:\n`PORT=8093 METRICS_PORT=9193 INSTANCE_ID=api-b mvn -o -q -pl services/matchmaking-api exec:java`\n(the first instance stays on 8080, or use 8092/`api-a` with `apiBaseUrlA`).\n\nRun the items top to bottom. Steps 8-10 exercise the re-presentation: after the match is pending, kill the instance holding `tokenP1`, connect the same token to the other instance and send PING - the pending `MATCH_PENDING_CONFIRMATION` is sent again. The automated version is `requests/routing/verify_routing.sh`.",
+   "item": [
+    {
+     "name": "1. Login p1 (routing-a)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenP1', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"routing-a\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      }
+     }
+    },
+    {
+     "name": "2. Login p2 (routing-b)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenP2', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"routing-b\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      }
+     }
+    },
+    {
+     "name": "3. GET /health — instance A names itself",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the instance has a name', () => pm.expect(pm.response.json().instance).to.be.a('string'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{apiBaseUrlA}}/health",
+       "host": [
+        "{{apiBaseUrlA}}"
+       ],
+       "path": [
+        "health"
+       ]
+      }
+     }
+    },
+    {
+     "name": "4. WS Connect p1 — instance A",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8092/v1/ws?token={{tokenP1}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8092",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP1}}"
+        }
+       ]
+      },
+      "description": "Player p1's socket lives on instance A. `redis-cli get presence:routing-a` now names api-a."
+     }
+    },
+    {
+     "name": "5. WS Connect p2 — instance B",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8093/v1/ws?token={{tokenP2}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8093",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP2}}"
+        }
+       ]
+      },
+      "description": "Player p2's socket lives on instance B: one match, two instances."
+     }
+    },
+    {
+     "name": "6. Create ticket p1 (via A)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.environment.set('ticketId', pm.response.json().ticketId);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{apiBaseUrlA}}/v1/matchmaking/tickets",
+       "host": [
+        "{{apiBaseUrlA}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      }
+     }
+    },
+    {
+     "name": "7. Create ticket p2 (via B)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.environment.set('ticketId', pm.response.json().ticketId);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP2}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{apiBaseUrlB}}/v1/matchmaking/tickets",
+       "host": [
+        "{{apiBaseUrlB}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      }
+     }
+    },
+    {
+     "name": "8. WS Send PING p1 — heartbeat",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8092/v1/ws?token={{tokenP1}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8092",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP1}}"
+        }
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\"type\": \"PING\", \"payload\": {}}"
+      },
+      "description": "Expect PONG. While the match is pending, the same PING also re-presents `MATCH_PENDING_CONFIRMATION` (the client deduplicates by matchId)."
+     }
+    },
+    {
+     "name": "9. WS Connect p1 — instance B (A was killed)",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8093",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP1}}"
+        }
+       ]
+      },
+      "description": "Kill instance A (`kill -9 <pid>`) and reconnect the same token here: the player lands on instance B and the socket has not been pinned to anything."
+     }
+    },
+    {
+     "name": "10. WS Send PING p1 on B — re-presents the pending match",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8093",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP1}}"
+        }
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\"type\": \"PING\", \"payload\": {}}"
+      },
+      "description": "Expect PONG and `MATCH_PENDING_CONFIRMATION` with the pending matchId - the notification A never delivered."
+     }
+    },
+    {
+     "name": "11. WS Send MATCH_CONFIRM p1",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8093/v1/ws?token={{tokenP1}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8093",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP1}}"
+        }
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\"type\": \"MATCH_CONFIRM\", \"payload\": {\"matchId\": \"{{matchId}}\"}}"
+      }
+     }
+    },
+    {
+     "name": "12. WS Send MATCH_CONFIRM p2",
+     "request": {
+      "header": [],
+      "url": {
+       "raw": "ws://localhost:8093/v1/ws?token={{tokenP2}}",
+       "protocol": "ws",
+       "host": [
+        "localhost"
+       ],
+       "port": "8093",
+       "path": [
+        "v1",
+        "ws"
+       ],
+       "query": [
+        {
+         "key": "token",
+         "value": "{{tokenP2}}"
+        }
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\"type\": \"MATCH_CONFIRM\", \"payload\": {\"matchId\": \"{{matchId}}\"}}"
+      },
+      "description": "Any instance can finish the match: both confirmations go through B."
+     }
+    }
+   ]
+  },
+  {
+   "name": "partitioning-w20 (queue partitions)",
+   "description": "W20/ADR 0028: the queue is spread over QUEUE_PARTITIONS keys, hashed by the enqueue key (partyId or playerId). The full proof is `bash requests/partitioning/verify_partitioning.sh` (27 checks): start the API with QUEUE_PARTITIONS=8 on 8094 and the engine with QUEUE_PARTITIONS=8 on 9194, then run these requests and read the per-partition gauges. With QUEUE_PARTITIONS=1 (default) the key is the historical `queue:{mode}:{region}`.",
+   "item": [
+    {
+     "name": "1. Login p1 (partitioning)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenPartitionP1', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"partition-p1\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      }
+     }
+    },
+    {
+     "name": "2. Login p2 (partitioning)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenPartitionP2', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"partition-p2\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      }
+     }
+    },
+    {
+     "name": "3. Enqueue p1 (partitioned API 8094)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "// With QUEUE_PARTITIONS=8 the member lands in queue:1v1:NA:<hash(playerId) % 8>;",
+         "// redis-cli zcard queue:1v1:NA:* shows the distribution."
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenPartitionP1}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{partitionedApiBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{partitionedApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      }
+     }
+    },
+    {
+     "name": "4. Enqueue p2 (partitioned API 8094)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "// Two players in different partitions still pair: the engine merges the heads.",
+         "// The match id is in GET /v1/matchmaking/tickets/{ticketId} (CONFIRMING) and on the WS."
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenPartitionP2}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{partitionedApiBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{partitionedApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      }
+     }
+    },
+    {
+     "name": "5. GET /health (the instance serving the partitioned queue)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('names the instance', () => pm.expect(pm.response.json().instance).to.be.a('string'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{partitionedApiBaseUrl}}/health",
+       "host": [
+        "{{partitionedApiBaseUrl}}"
+       ],
+       "path": [
+        "health"
+       ]
+      }
+     }
+    },
+    {
+     "name": "6. Engine per-partition depth (scrape)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('one series per partition', () => pm.expect(pm.response.text()).to.include('matchmaking_queue_partition_depth'));",
+         "pm.test('the hotspot ratio is published', () => pm.expect(pm.response.text()).to.include('matchmaking_queue_hotspot_ratio'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{enginePartitionedMetricsUrl}}",
+       "host": [
+        "{{enginePartitionedMetricsUrl}}"
+       ],
+       "path": []
+      }
+     }
+    },
+    {
+     "name": "7. Engine queue depth and hotspot (scrape, CTRL+F 'queue')",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('the total depth still exists', () => pm.expect(pm.response.text()).to.include('matchmaking_queue_depth'));",
+         "pm.test('the oldest wait is still published', () => pm.expect(pm.response.text()).to.include('matchmaking_queue_oldest_wait_seconds'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{enginePartitionedMetricsUrl}}",
+       "host": [
+        "{{enginePartitionedMetricsUrl}}"
+       ],
+       "path": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "multiregion-w21 (regions, placement and failover)",
+   "description": "Requires the two regions the W21 scenario starts: `KEEP=1 bash requests/multiregion/verify_multiregion.sh` leaves auth on 8091, the EU API on 8097 (scrape 9198), the NA API on 8096 (scrape 9196), their engines, both Redis containers and a delay proxy on 8099 in front of NA. Run the items top to bottom.",
+   "item": [
+    {
+     "name": "1. Login p1 in EU (the token carries the home region)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenRegionP1', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the token says EU', () => pm.expect(pm.environment.get('tokenRegionP1')).to.be.a('string'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"postman-region-p1\",\n  \"region\": \"EU\"\n}"
+      },
+      "description": "`region` is a claim the server puts in the token (default NA, unknown -> 400). The client cannot move its home region by asking at ticket time."
+     }
+    },
+    {
+     "name": "2. Login p2 in EU",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenRegionP2', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"postman-region-p2\",\n  \"region\": \"EU\"\n}"
+      }
+     }
+    },
+    {
+     "name": "3. Login in an unknown region (400)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 400', () => pm.response.to.have.status(400));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login",
+       "host": [
+        "{{authBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "auth",
+        "login"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"postman-region-p3\",\n  \"region\": \"MARS\"\n}"
+      }
+     }
+    },
+    {
+     "name": "4. GET /v1/regions — the directory from the EU endpoint",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the player is at home in EU', () => pm.expect(pm.response.json().playerRegion).to.eql('EU'));",
+         "pm.test('this endpoint serves EU only', () => pm.expect(pm.response.json().served).to.eql(['EU']));",
+         "pm.environment.set('declaredEuNa', pm.response.json().regions.find(r => r.region === 'NA').declaredRttMs);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{regionEuApiBaseUrl}}/v1/regions",
+       "host": [
+        "{{regionEuApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions"
+       ]
+      },
+      "description": "Answers with the caller's home region (from the token), the regions this endpoint serves, and per region the declared distance and — only if this endpoint measured it — the player's own RTT."
+     }
+    },
+    {
+     "name": "5. GET /v1/regions/EU/ping — issue the probe (near)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.environment.set('nonceEu', pm.response.json().nonce);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/ping",
+       "host": [
+        "{{regionEuApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "EU",
+        "ping"
+       ]
+      },
+      "description": "Step one of the two-request probe: the server issues a nonce (30 s, single use, bound to this player and this region) and stamps the instant it was issued."
+     }
+    },
+    {
+     "name": "6. POST /v1/regions/EU/pong — press it (the server times the gap)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the region answers for itself', () => pm.expect(pm.response.json().region).to.eql('EU'));",
+         "pm.test('a measured rtt', () => pm.expect(pm.response.json().rttMs).to.be.a('number'));",
+         "pm.environment.set('rttEuEu', pm.response.json().rttMs);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/pong",
+       "host": [
+        "{{regionEuApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "EU",
+        "pong"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"nonce\": \"{{nonceEu}}\"\n}"
+      },
+      "description": "The number is the server's: it is the gap between the two requests, not a value the client reports. The profile keeps the minimum of the samples, with a 5 min TTL."
+     }
+    },
+    {
+     "name": "7. POST /v1/regions/EU/pong — replay the same nonce (422 invalid_nonce)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 422', () => pm.response.to.have.status(422));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionEuApiBaseUrl}}/v1/regions/EU/pong",
+       "host": [
+        "{{regionEuApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "EU",
+        "pong"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"nonce\": \"{{nonceEu}}\"\n}"
+      },
+      "description": "A nonce is consumed by the pong that matches it: one round trip cannot be reported as two measurements."
+     }
+    },
+    {
+     "name": "8. GET /v1/regions/NA/ping — measure the far region (through the delay proxy)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.environment.set('nonceNa', pm.response.json().nonce);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{regionProxyBaseUrl}}/v1/regions/NA/ping",
+       "host": [
+        "{{regionProxyBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "NA",
+        "ping"
+       ]
+      },
+      "description": "The proxy adds 40 ms each way (80 ms RTT). Without it, run this against the NA API directly ({{regionNaApiBaseUrl}}) and the measurement is a local one."
+     }
+    },
+    {
+     "name": "9. POST /v1/regions/NA/pong — the far measurement",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.environment.set('rttEuNa', pm.response.json().rttMs);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionProxyBaseUrl}}/v1/regions/NA/pong",
+       "host": [
+        "{{regionProxyBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "NA",
+        "pong"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"nonce\": \"{{nonceNa}}\"\n}"
+      }
+     }
+    },
+    {
+     "name": "10. GET /v1/regions — the measurement is region-local",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('NA shows the measurement NA took', () => {",
+         "  const na = pm.response.json().regions.find(r => r.region === 'NA');",
+         "  pm.expect(na.served).to.eql(true);",
+         "  pm.expect(na.measuredRttMs).to.be.a('number');",
+         "});",
+         "pm.test('the EU measurement is not visible here: it lives in the EU Redis', () => {",
+         "  const eu = pm.response.json().regions.find(r => r.region === 'EU');",
+         "  pm.expect(eu.served).to.eql(false);",
+         "  pm.expect(eu.measuredRttMs).to.be.null;",
+         "});"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{regionNaApiBaseUrl}}/v1/regions",
+       "host": [
+        "{{regionNaApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions"
+       ]
+      },
+      "description": "Measurements live in the Redis of the region that took them, so an endpoint never shows another region's number as if it were its own."
+     }
+    },
+    {
+     "name": "11. GET /v1/regions/EU/ping at the NA endpoint (422 region_unsupported)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 422', () => pm.response.to.have.status(422));",
+         "pm.test('the body names what this endpoint serves', () => pm.expect(pm.response.json().served).to.eql(['NA']));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{regionNaApiBaseUrl}}/v1/regions/EU/ping",
+       "host": [
+        "{{regionNaApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "regions",
+        "EU",
+        "ping"
+       ]
+      },
+      "description": "An endpoint that measured another region would measure itself and call it the other region."
+     }
+    },
+    {
+     "name": "12. Enqueue in NA with a 60 ms budget (422 latency_budget)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 422', () => pm.response.to.have.status(422));",
+         "pm.test('the refusal says latency_budget', () => pm.expect(pm.response.json().error).to.eql('latency_budget'));",
+         "pm.test('and carries the three numbers', () => {",
+         "  const body = pm.response.json();",
+         "  pm.expect(body.rttMs).to.be.a('number');",
+         "  pm.expect(body.maxLatencyMs).to.eql(60);",
+         "});"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionProxyBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{regionProxyBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 60\n}"
+      },
+      "description": "`rttMs` is `max(declared, measured)`: the operator's floor or the player's own path, whichever is larger. The client can choose another region with the numbers in hand."
+     }
+    },
+    {
+     "name": "13. Enqueue in NA with a 150 ms budget (201, the far region takes the player)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.test('the ticket was placed in NA', () => pm.expect(pm.response.json().region).to.eql('NA'));",
+         "pm.environment.set('regionTicket', pm.response.json().ticketId);"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionProxyBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{regionProxyBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+      }
+     }
+    },
+    {
+     "name": "14. Enqueue in EU at the NA endpoint (422 region_unsupported)",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 422', () => pm.response.to.have.status(422));",
+         "pm.test('a 1000 ms budget does not buy a region this endpoint does not serve', () =>",
+         "  pm.expect(pm.response.json().error).to.eql('region_unsupported'));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenRegionP1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{regionNaApiBaseUrl}}/v1/matchmaking/tickets",
+       "host": [
+        "{{regionNaApiBaseUrl}}"
+       ],
+       "path": [
+        "v1",
+        "matchmaking",
+        "tickets"
+       ]
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"EU\",\n  \"maxLatencyMs\": 1000\n}"
+      },
+      "description": "Refused whatever the budget is: the region is not a distance question here, it is a deployment this endpoint does not have."
+     }
+    },
+    {
+     "name": "15. GET /health — the instance names the region it serves",
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('it serves NA', () => pm.expect(pm.response.json().regions).to.eql(['NA']));"
+        ]
+       }
+      }
+     ],
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{regionNaApiBaseUrl}}/health",
+       "host": [
+        "{{regionNaApiBaseUrl}}"
+       ],
+       "path": [
+        "health"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "lifecycle-w23 (deadlines, requeue, connection token)",
+   "description": "The allocation lifecycle (W23, ADRs 0032/0033/0034). Start the scenario's stack: auth on 8081, the API on 8099 with `AUTH_JWKS_URL=http://localhost:8081/.well-known/jwks.json`, the engine on metrics 9102 and the orchestrator on 8087 with `ALLOCATION_TIMEOUT=8 START_TIMEOUT=20 CONNECT_WINDOW=10 SERVER_TTL_SECONDS=120`. `bash requests/lifecycle/verify_lifecycle.sh` is the automated version — 70 checks across 10 steps — and this folder is the by-hand path through the same states. The two deadlines the script waits out (`no_capacity` at 8 s, `start_timeout` at 20 s) are the ones a click cannot wait for; requests 1-14 are the states a running match goes through, and the script's phases 3 and 5 are the two rejections.",
+   "item": [
+    {
+     "name": "1. POST /v1/auth/connection-tokens — no token is not a player",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"matchId\": \"match-local\",\n  \"team\": 1\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/connection-tokens"
+      }
+     },
+     "description": "The issuer is the player's own session token and nothing else: a game server cannot ask for a connection token, and a match id alone is not an identity (ADR 0033)."
+    },
+    {
+     "name": "2. Login p1 (W23)",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"w23-p1\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login"
+      }
+     }
+    },
+    {
+     "name": "3. Login p2 (W23)",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"w23-p2\"\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login"
+      }
+     }
+    },
+    {
+     "name": "4. GET /v1/matches/{matchId}/connection — an unknown match is a 404",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleApiBaseUrl}}/v1/matches/match-does-not-exist/connection"
+      }
+     },
+     "description": "A match that does not exist and a match the caller is not in answer the same thing: the endpoint cannot be used to learn who plays whom (ADR 0033)."
+    },
+    {
+     "name": "5. PUT /v1/game-servers/gs-w23-local — one slot in NA",
+     "request": {
+      "method": "PUT",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{lifecycleOrchestratorToken}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 1,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+      },
+      "url": {
+       "raw": "{{lifecycleOrchestratorBaseUrl}}/v1/game-servers/gs-w23-local"
+      }
+     },
+     "description": "The pool of W22 (ADR 0031) is what an allocation names. This folder drives one match through it; `verify_lifecycle.sh` is the automated version with the deadlines."
+    },
+    {
+     "name": "6. Enqueue p1 — the pair forms because a slot is free",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{lifecycleApiBaseUrl}}/v1/matchmaking/tickets"
+      }
+     }
+    },
+    {
+     "name": "7. Enqueue p2 — the match is formed and both tickets are CONFIRMING",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 80\n}"
+      },
+      "url": {
+       "raw": "{{lifecycleApiBaseUrl}}/v1/matchmaking/tickets"
+      }
+     },
+     "description": "Wait a second, then read p1's ticket: it is CONFIRMING and the match id is the one the `matchId` variable holds (`GET /v1/matchmaking/tickets/{{ticketId}}`). Both players confirm through the WebSocket (`ws://` folder) — the script `requests/mm.sh e2e` does it in one line if you do not want to click."
+    },
+    {
+     "name": "8. GET /v1/matches/{matchId}/connection — the address, the team and a scoped token",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleApiBaseUrl}}/v1/matches/{{matchId}}/connection"
+      }
+     },
+     "description": "What the client needs and nothing else: the address of the server, its team, and a token that expires in 120 s (ADR 0033). The token's claims (`sub`, `matchId`, `team`, `scope=game-connect`) are what the game server verifies offline against the auth service's JWKS."
+    },
+    {
+     "name": "9. POST /v1/auth/connection-tokens — the same token, asked for directly",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"matchId\": \"{{matchId}}\",\n  \"team\": 1\n}"
+      },
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/connection-tokens"
+      }
+     },
+     "description": "The API is a client of this route, not the owner of the signing key: a reconnecting client (or a game server asking on the player's behalf) can ask again and gets a fresh short-lived token. Note the body's `team` is what the caller claims — the API passes the roster's team, and a wrong one is the game server's to refuse."
+    },
+    {
+     "name": "10. POST .../allocations/{matchId}/started — the game server says it started",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{lifecycleOrchestratorToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleOrchestratorBaseUrl}}/v1/game-servers/gs-w23-local/allocations/{{matchId}}/started"
+      }
+     },
+     "description": "The start deadline (ADR 0032) is measured from this report, not from the allocation: a match the server never started is `start_timeout` and its slot comes back. Without the report the watchdog would be guessing."
+    },
+    {
+     "name": "11. POST .../started again — the same report twice is not a second start",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{lifecycleOrchestratorToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleOrchestratorBaseUrl}}/v1/game-servers/gs-w23-local/allocations/{{matchId}}/started"
+      }
+     },
+     "description": "A game server that retries its own report (a timeout it did not see the answer to) must not move the deadline: `ALREADY` keeps `started_at` where it was."
+    },
+    {
+     "name": "12. POST .../players/{playerId}/connected — the first of the two players is in",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{lifecycleOrchestratorToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleOrchestratorBaseUrl}}/v1/game-servers/gs-w23-local/allocations/{{matchId}}/players/w23-p1/connected"
+      }
+     },
+     "description": "One of the two is enough: a match is only `all_no_show` when **nobody** connected inside the window (ADR 0034)."
+    },
+    {
+     "name": "13. POST .../release — the match is over and the slot comes back",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{lifecycleOrchestratorToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleOrchestratorBaseUrl}}/v1/game-servers/gs-w23-local/allocations/{{matchId}}/release"
+      }
+     },
+     "description": "Release is the only thing that gives a slot back on purpose; the watchdog is what covers the server that dies without calling it (the `server_failed` phase of the script)."
+    },
+    {
+     "name": "14. GET /v1/matches/{matchId}/connection — a finished match is a 409, not a 500",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenP1}}"
+       }
+      ],
+      "url": {
+       "raw": "{{lifecycleApiBaseUrl}}/v1/matches/{{matchId}}/connection"
+      }
+     },
+     "description": "The client learns why it is not being sent anywhere. The other two answers are `409 not_allocated` (confirmed, no server yet) and `409 match_rejected` with the `reason` (`no_capacity`, `start_timeout`, `server_failed`, `all_no_show`) — see `GET /v1/matches/{matchId}/connection` after making the pool full and waiting out `ALLOCATION_TIMEOUT`."
+    }
+   ]
+  },
+  {
+   "name": "infra",
+   "item": [
+    {
+     "name": "schema-registry",
+     "item": [
+      {
+       "name": "GET /config",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.test('global compatibility is FULL', () => pm.expect(pm.response.json().compatibilityLevel).to.eql('FULL'));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{schemaRegistryUrl}}/config",
+         "host": [
+          "{{schemaRegistryUrl}}"
+         ],
+         "path": [
+          "config"
+         ]
+        }
+       },
+       "description": "Global compatibility level enforced by the Schema Registry (W12).\n\n**Expected:** 200 with `{ \"compatibilityLevel\": \"FULL\" }`.\n\nSet by `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=full` in `docker-compose.yml`. It is the server-side half of the CI gate (W12 task 3): a new version of a subject must be readable by old AND new consumers, otherwise the registry rejects the registration.\n\nRequires: `docker compose up -d zookeeper kafka schema-registry`."
+      },
+      {
+       "name": "GET /subjects",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.test('payload is a list of subjects', () => pm.expect(pm.response.json()).to.be.an('array'));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{schemaRegistryUrl}}/subjects",
+         "host": [
+          "{{schemaRegistryUrl}}"
+         ],
+         "path": [
+          "subjects"
+         ]
+        }
+       },
+       "description": "Subjects registered in the `_schemas` topic.\n\n**Expected:** 200 with `[]` until W12 task 2 registers the first event contract (`match-confirmed-value`, `player-search-value`).\n\nA non-empty list here is also the proof that the registry reached the broker over the INTERNAL listener."
+      },
+      {
+       "name": "GET /schemas/types",
+       "event": [
+        {
+         "listen": "test",
+         "script": {
+          "type": "text/javascript",
+          "exec": [
+           "pm.test('status 200', () => pm.response.to.have.status(200));",
+           "pm.test('PROTOBUF is supported', () => pm.expect(pm.response.json()).to.include('PROTOBUF'));"
+          ]
+         }
+        }
+       ],
+       "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+         "raw": "{{schemaRegistryUrl}}/schemas/types",
+         "host": [
+          "{{schemaRegistryUrl}}"
+         ],
+         "path": [
+          "schemas",
+          "types"
+         ]
+        }
+       },
+       "description": "Schema formats this registry accepts.\n\n**Expected:** 200 with `[\"JSON\", \"PROTOBUF\", \"AVRO\"]`. The event contracts use Protobuf (see `04 - Engenharia Distribuída`)."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "gameservers-w22 (pool, allocation, capacity-aware pairing)",
+   "description": "The orchestrator's internal pool API (W22, ADR 0031). Start it with ORCHESTRATOR_PORT=8085 METRICS_PORT=9093 GAME_SERVER_TOKEN=<token>. `verify_capacity.sh` is the automated version of this folder and the numbers it asserts; the folder is the by-hand version, so each request states what to look at. Requests 1-7 are the pool itself; 8-13 drive two players through a full pool so the wait is visible; 14-17 fill the pool, allocate and release.",
+   "item": [
+    {
+     "name": "1. GET /health — the orchestrator is up",
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/health"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('it names itself', () => pm.expect(pm.response.json().service).to.eql('match-orchestrator'));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "2. GET /v1/capacity — no token is not an answer (401)",
+     "request": {
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 401', () => pm.response.to.have.status(401));",
+         "pm.test('the error says why', () => pm.expect(pm.response.json().error).to.eql('unauthorized'));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "3. GET /v1/capacity — the empty pool reads as unknown, not zero",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('authoritative is false with no pool (the W1-W21 behaviour survives)', () => pm.expect(pm.response.json().authoritative).to.eql(false));",
+         "pm.test('free is 0 but means unknown', () => pm.expect(pm.response.json().free).to.eql(0));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "4. PUT /v1/game-servers/gs-local-1 — register (and heartbeat) a server",
+     "request": {
+      "method": "PUT",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 1,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "const s = pm.response.json();",
+         "pm.test('capacity 1, nothing allocated yet', () => pm.expect(s.capacity).to.eql(1) && pm.expect(s.allocated).to.eql(0));",
+         "pm.test('the state is derived at read (READY)', () => pm.expect(s.state).to.eql('READY'));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "5. GET /v1/game-servers — the pool, with derived states",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('gs-local-1 is listed', () => pm.expect(pm.response.json().servers.map(s => s.serverId)).to.include('gs-local-1'));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "6. GET /v1/capacity — the pool exists now, so 1 is the truth",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('authoritative with a registered pool', () => pm.expect(pm.response.json().authoritative).to.eql(true));",
+         "pm.test('one free slot', () => pm.expect(pm.response.json().free).to.eql(1));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "7. PUT /v1/game-servers/gs-local-1 — heartbeat with capacity 0 (a full server)",
+     "request": {
+      "method": "PUT",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 0,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('a full server is READY and free 0: full is not stale', () => pm.expect(pm.response.json().state).to.eql('READY') && pm.expect(pm.response.json().free).to.eql(0));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "8. Login p1 (W22)",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"w22-pool-p1\"\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenW22P1', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "9. Login p2 (W22)",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{authBaseUrl}}/v1/auth/login"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"playerId\": \"w22-pool-p2\"\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.environment.set('tokenW22P2', pm.response.json().token);",
+         "pm.test('status 200', () => pm.response.to.have.status(200));"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "10. Enqueue p1 — the pool is full, so the pair will wait",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenW22P1}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.test('SEARCHING, not refused: the player waits', () => pm.expect(pm.response.json().status).to.eql('SEARCHING'));",
+         "pm.environment.set('ticketW22P1', pm.response.json().ticketId);"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "11. Enqueue p2 — both wait, no match is formed",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenW22P2}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"gameMode\": \"1v1\",\n  \"region\": \"NA\",\n  \"maxLatencyMs\": 150\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 201', () => pm.response.to.have.status(201));",
+         "pm.environment.set('ticketW22P2', pm.response.json().ticketId);"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "12. GET the ticket — still SEARCHING after a few seconds",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenW22}}"
+       }
+      ],
+      "url": {
+       "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketW22P1}}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the ticket is still SEARCHING: capacity is the gate, not admission', () => pm.expect(pm.response.json().status).to.eql('SEARCHING'));",
+         "// the engine counter that explains it: matchmaking_pairing_suspended_total{mode=\"1v1\",region=\"NA\"} on :9091"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "13. PUT capacity 1 — the slot appears and the pair is formed",
+     "request": {
+      "method": "PUT",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       },
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+      },
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"region\": \"NA\",\n  \"gameModes\": [\"1v1\"],\n  \"capacity\": 1,\n  \"endpoint\": \"10.0.0.7:7777\"\n}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "// within a second or two the engine pairs them: GET the ticket again and it is CONFIRMING"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "14. GET the ticket again — CONFIRMING (the match was formed)",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{tokenW22}}"
+       }
+      ],
+      "url": {
+       "raw": "{{apiBaseUrl}}/v1/matchmaking/tickets/{{ticketW22P1}}"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the player was pulled from the queue as soon as there was room', () => pm.expect(pm.response.json().status).to.eql('CONFIRMING'));",
+         "pm.test('and the ticket names the match', () => pm.expect(pm.response.json().matchId).to.be.a('string'));",
+         "pm.environment.set('matchW22', pm.response.json().matchId);"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "15. GET /v1/capacity — the slot is gone while the match runs",
+     "request": {
+      "method": "GET",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/capacity?gameMode=1v1&region=NA"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "// free 0 while the match is CONFIRMING and after confirmation takes the slot"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "16. POST release — the slot comes back (idempotent)",
+     "request": {
+      "method": "POST",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1/allocations/{{matchW22}}/release"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('200 when the match was allocated there, 404 allocation_not_found otherwise', () => pm.expect([200, 404]).to.include(pm.response.code));",
+         "// a second call answers 404 and does not return a second slot"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "17. DELETE /v1/game-servers/gs-local-1 — drain (no new matches, running ones stay)",
+     "request": {
+      "method": "DELETE",
+      "header": [
+       {
+        "key": "Authorization",
+        "value": "Bearer {{gameServerToken}}"
+       }
+      ],
+      "url": {
+       "raw": "{{orchestratorBaseUrl}}/v1/game-servers/gs-local-1"
+      }
+     },
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 200', () => pm.response.to.have.status(200));",
+         "pm.test('the derived state is DRAINING', () => pm.expect(pm.response.json().state).to.eql('DRAINING'));",
+         "pm.test('a drain never frees slots that are in use', () => pm.expect(pm.response.json().allocated).to.be.a('number'));"
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
 }

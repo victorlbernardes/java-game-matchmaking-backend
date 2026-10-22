@@ -44,6 +44,31 @@ class DissolvePartyUseCaseTest {
         assertFalse(dissolved.active());
     }
 
+    /**
+     * A member who already cancelled left the party's tickets CANCELLED; dissolving afterwards must
+     * still work. Without the guard, the second cancellation asked the state machine for
+     * CANCELLED -> CANCELLED and threw — out of a future nobody waited for, so the client got a 200
+     * and the party was never marked dissolved.
+     */
+    @Test
+    void dissolvingAfterAMemberCancelledStillDissolves() {
+        Party party = new Party("party-2", "leader-2", List.of("leader-2", "member-2"),
+                Instant.now(), true, List.of("ticket-4", "ticket-5"));
+        await(partyStore.save(party));
+        await(ticketRepository.save(null, cancelledTicket("ticket-4", "leader-2", "party-2")));
+        await(ticketRepository.save(null, cancelledTicket("ticket-5", "member-2", "party-2")));
+
+        Party dissolved = await(useCase.execute("party-2", "leader-2"));
+
+        assertFalse(dissolved.active());
+        assertEquals(TicketState.CANCELLED, await(ticketRepository.findById("ticket-4")).status());
+    }
+
+    private static MatchmakingTicket cancelledTicket(String ticketId, String playerId, String partyId) {
+        return new MatchmakingTicket(ticketId, playerId, GameMode.ONE_V_ONE, Region.NA, 80, 50,
+                Instant.now(), TicketState.CANCELLED, 1, partyId);
+    }
+
     private static MatchmakingTicket searchingTicket(String ticketId, String playerId, String partyId) {
         return new MatchmakingTicket(ticketId, playerId, GameMode.ONE_V_ONE, Region.NA, 80, 50,
                 Instant.now(), TicketState.SEARCHING, 0, partyId);

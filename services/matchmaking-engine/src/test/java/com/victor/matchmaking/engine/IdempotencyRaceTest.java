@@ -61,28 +61,30 @@ class IdempotencyRaceTest {
                     java.time.Instant.now(), TicketState.SEARCHING, 0L, null);
 
             // Request 1: creates the ticket
-            Object result1 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
+            io.vertx.redis.client.Response result1 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                             .arg("1").arg(idemRedisKey)
                             .arg(TicketCodec.toJson(ticketA).encode())
                             .arg(ticketA.id())
                             .arg("queue:1v1:NA")
                             .arg(String.valueOf(ticketA.queuedAt().toEpochMilli()))
-                            .arg("900").arg("900"))
+                            .arg("900").arg("900").arg("0"))
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
-            assertNotNull(result1, "request 1 must return a ticketId");
-            assertEquals("ticket-race-idem-a", result1.toString(), "request 1 must create ticketA");
+            assertNotNull(result1, "request 1 must return {status, ticketId}");
+            assertEquals("OK", result1.get(0).toString(), "request 1 must be an admission");
+            assertEquals("ticket-race-idem-a", result1.get(1).toString(), "request 1 must create ticketA");
 
             // Request 2: same Idempotency-Key — the atomic script returns the EXISTING ticketId
-            Object result2 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
+            io.vertx.redis.client.Response result2 = redis.send(Request.cmd(Command.EVALSHA).arg(sha)
                             .arg("1").arg(idemRedisKey)
                             .arg(TicketCodec.toJson(ticketB).encode())
                             .arg(ticketB.id())
                             .arg("queue:1v1:NA")
                             .arg(String.valueOf(ticketB.queuedAt().toEpochMilli()))
-                            .arg("900").arg("900"))
+                            .arg("900").arg("900").arg("0"))
                     .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
-            assertNotNull(result2, "request 2 must return a ticketId");
-            assertEquals("ticket-race-idem-a", result2.toString(),
+            assertNotNull(result2, "request 2 must return {status, ticketId}");
+            assertEquals("EXISTS", result2.get(0).toString(), "request 2 is a replay");
+            assertEquals("ticket-race-idem-a", result2.get(1).toString(),
                     "request 2 must return the SAME ticketId (idempotent)");
 
             // Only ONE ticket exists in the store (not two)

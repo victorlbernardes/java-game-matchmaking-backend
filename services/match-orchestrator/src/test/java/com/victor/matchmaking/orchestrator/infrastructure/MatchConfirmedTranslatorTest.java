@@ -18,7 +18,7 @@ import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.events.MatchConfirmed;
 import com.victor.matchmaking.events.MatchConfirmedMapper;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
-import com.victor.matchmaking.orchestrator.domain.AllocationStatus;
+import com.victor.matchmaking.domain.match.AllocationStatus;
 
 /**
  * The translator is the only place that trusts nothing: it turns a record that the

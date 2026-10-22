@@ -142,7 +142,7 @@ mvn -pl services/matchmaking-api exec:java -Dexec.mainClass=com.victor.matchmaki
 mvn -pl services/matchmaking-engine exec:java -Dexec.mainClass=com.victor.matchmaking.engine.MatchmakingEngineApplication &
 mvn -pl services/match-orchestrator exec:java -Dexec.mainClass=com.victor.matchmaking.orchestrator.MatchOrchestratorApplication &
 
-python3 requests/e2e/run_e2e.py             # S11: one projection row per confirmed match
+requests/mm.sh e2e             # S11: one projection row per confirmed match
 bash requests/kafka/verify_idempotent_consumer.sh   # rewinds the group and replays everything
 ```
 

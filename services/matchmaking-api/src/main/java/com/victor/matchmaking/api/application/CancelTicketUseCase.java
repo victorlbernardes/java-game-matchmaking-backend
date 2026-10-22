@@ -45,8 +45,14 @@ public final class CancelTicketUseCase {
                     TicketStateMachine.transition(ticket.status(), TicketState.CANCELLED),
                     ticket.version() + 1,
                     ticket.partyId());
+            // The 200 is a promise about the whole party, so the party's cancellation is awaited
+            // before it is made: `onSuccess` would hand the reply back as soon as the caller's own
+            // ticket was written, and a client that read the other members in that window saw them
+            // still SEARCHING and still in the queue. The product's contract is "cancelling one
+            // member cancels the whole party" (W11); a reply that is earlier than the effect makes
+            // the contract untestable, and every assertion about it a race.
             return repository.save(null, cancelled)
-                    .onSuccess(saved -> leavePartyIfMember(cancelled.partyId()))
+                    .flatMap(saved -> leavePartyIfMember(cancelled.partyId()))
                     .map(v -> cancelled);
         });
     }
@@ -75,7 +81,11 @@ public final class CancelTicketUseCase {
     private Future<Void> cancelTicket(String ticketId) {
         return repository.findById(ticketId)
                 .flatMap(ticket -> {
-                    if (ticket == null) {
+                    // Already cancelled: a second cancellation is a no-op, not a state transition
+                    // error. It is reachable by a normal client — a member cancels their ticket
+                    // (which cancels the party) and the leader then dissolves the party — and
+                    // CANCELLED -> CANCELLED used to throw out of a future nobody waited for.
+                    if (ticket == null || ticket.status() == TicketState.CANCELLED) {
                         return Future.succeededFuture();
                     }
                     MatchmakingTicket cancelled = new MatchmakingTicket(

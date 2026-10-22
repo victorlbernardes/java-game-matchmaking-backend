@@ -14,6 +14,18 @@ public final class EventTopics {
     /** Published when a match reached its confirmations and was persisted. */
     public static final String MATCH_CONFIRMED = "matchmaking.events.match-confirmed";
 
+    /**
+     * Published when a match that started ended, with its result (W24, ADR 0035). The
+     * game server reports the result; the orchestrator makes it durable and announces it.
+     */
+    public static final String MATCH_FINISHED = "matchmaking.events.match-finished";
+
+    /**
+     * Published by the skill service after it recalculated a match's players (W24). Telemetry
+     * for whoever wants the history of ratings; the authoritative state is the table.
+     */
+    public static final String SKILL_UPDATED = "matchmaking.events.skill-updated";
+
     /** Suffix of the per-topic dead letter queue. */
     public static final String DEAD_LETTER_SUFFIX = "-dlq";
 

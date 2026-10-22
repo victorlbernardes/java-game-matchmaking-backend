@@ -97,7 +97,7 @@ Measured numbers (all measured with `mvn -B clean test` on the W11 redo branch):
   **37/37 checks green** — party of 3 + 7 solos → one 10-player match with the
   three members together; 2 parties of 3 + 4 solos → no match (party stays
   queued); cancel/remove/dissolve a member → 3/3 member tickets `CANCELLED`.
-  Runner: `requests/e2e/run_e2e.py`.
+  Runner: `requests/mm.sh e2e`.
 
 Fixes found by the E2E validation (all in this sprint's scope):
 

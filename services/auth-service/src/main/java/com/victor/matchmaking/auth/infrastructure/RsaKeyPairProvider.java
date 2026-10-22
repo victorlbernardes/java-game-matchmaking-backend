@@ -47,6 +47,11 @@ public final class RsaKeyPairProvider {
         return toJwk((RSAPublicKey) keyPair.getPublic(), null);
     }
 
+    /** Both halves in one JWK: what the service itself signs with, and what the tests need to boot it. */
+    public static JsonObject fullJwkOf(KeyPair keyPair) {
+        return toJwk((RSAPublicKey) keyPair.getPublic(), (RSAPrivateCrtKey) keyPair.getPrivate());
+    }
+
     private static JsonObject toJwk(RSAPublicKey publicKey, RSAPrivateCrtKey privateKey) {
         JsonObject jwk = new JsonObject()
                 .put("kty", "RSA")

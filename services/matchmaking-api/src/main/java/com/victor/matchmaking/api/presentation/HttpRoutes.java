@@ -8,20 +8,32 @@ import com.victor.matchmaking.api.application.CreateTicketUseCase;
 import com.victor.matchmaking.api.application.DissolvePartyUseCase;
 import com.victor.matchmaking.api.application.GetPartyUseCase;
 import com.victor.matchmaking.api.application.GetTicketUseCase;
+import com.victor.matchmaking.api.application.PlayerLatency;
+import com.victor.matchmaking.api.application.RegionPlacement;
 import com.victor.matchmaking.api.application.RemoveMemberUseCase;
 import com.victor.matchmaking.api.application.PartyUseCases;
 import com.victor.matchmaking.db.MatchRepository;
 import com.victor.matchmaking.domain.player.SkillProvider;
+import com.victor.matchmaking.domain.ticket.Region;
 import com.victor.matchmaking.redis.PartyStore;
+import com.victor.matchmaking.redis.QueueFullException;
+import com.victor.matchmaking.redis.RateLimiter;
 import com.victor.matchmaking.redis.TicketRepository;
 import com.victor.matchmaking.api.infrastructure.DeterministicSkillProvider;
 import com.victor.matchmaking.api.infrastructure.InMemoryPartyStore;
 import com.victor.matchmaking.api.infrastructure.InMemoryTicketRepository;
 import com.victor.matchmaking.redis.TicketCodec;
 import com.victor.matchmaking.redis.RedisPublisher;
+import com.victor.matchmaking.metrics.MetricNames;
 
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.ext.auth.User;
 import io.vertx.ext.auth.authentication.TokenCredentials;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.web.Router;
@@ -33,6 +45,40 @@ public final class HttpRoutes {
 
     private static final System.Logger LOG = System.getLogger("matchmaking.api.http");
 
+    /** The bucket's scope: the limit is "ticket creations per player", not per connection. */
+    private static final String RATE_LIMIT_SCOPE = "tickets";
+    private static final String HEADER_RATE_LIMIT_LIMIT = "X-RateLimit-Limit";
+    private static final String HEADER_RATE_LIMIT_REMAINING = "X-RateLimit-Remaining";
+    private static final String HEADER_RETRY_AFTER = "Retry-After";
+    /**
+     * How long a shed arrival is asked to wait. A promise would have to be derived from the
+     * drain rate and the queue depth, and it changes every tick; the honest answer is the one the
+     * client can act on - come back later, and the queue will have moved (ADR 0022).
+     */
+    private static final int QUEUE_FULL_RETRY_AFTER_SECONDS = 5;
+    /**
+     * A dependency that is unreachable is usually unreachable for a second, not a minute: the
+     * answer says "retry now", and the client that backs off politely retries once and succeeds
+     * (W18, ADR 0024).
+     */
+    private static final int DEPENDENCY_RETRY_AFTER_SECONDS = 1;
+
+    /**
+     * What the clients say when their dependency is gone, lowercased. Every entry was observed in a
+     * real outage (W18): a stopped Redis, a stopped Postgres whose pooled connection had already
+     * been established when it went away, and the two script/queue limits. A new client means a new
+     * wording — which is why a failure that matches nothing stays a 500 with the details in the log
+     * rather than being guessed at.
+     */
+    private static final java.util.List<String> UNAVAILABLE_MESSAGE_FRAGMENTS = java.util.List.of(
+            "noscript",                    // the script cache was lost (Redis restart)
+            "refused",                     // "Connection refused: host:port" / "Connection to host:5432 refused"
+            "connection has been closed",  // Vert.x pools hand back a connection the server closed
+            "connection is closed",
+            "connection reset",
+            "broken pipe",
+            "max wait queue size");        // the pool's waiting queue, bounded, is full
+
     private HttpRoutes() {
     }
 
@@ -41,32 +87,96 @@ public final class HttpRoutes {
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository) {
-        return createRouter(vertx, jwtAuth, repository, new WsHub(null), null);
+        return createRouter(vertx, jwtAuth, repository, new ConnectionRegistry(null), null);
     }
 
     public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, RedisPublisher publisher) {
-        return createRouter(vertx, jwtAuth, repository, new WsHub(publisher), null);
+        return createRouter(vertx, jwtAuth, repository, new ConnectionRegistry(publisher), null);
     }
 
-    /** Full injection used by main: caller keeps the WsHub to route Pub/Sub notifications. */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub) {
-        return createRouter(vertx, jwtAuth, repository, wsHub, null);
+    /** Full injection used by main: caller keeps the ConnectionRegistry to route Pub/Sub notifications. */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, null);
     }
 
     /** Full injection used by main when history is backed by PostgreSQL. */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository) {
-        return devRouter(vertx, jwtAuth, repository, wsHub, matchRepository);
+        return devRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository);
     }
 
     /** Full injection with the real skill provider and party store (main wiring). */
-    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
+                new SimpleMeterRegistry());
+    }
+
+    /**
+     * Main wiring plus the registry the domain KPIs are counted on. The routes count what
+     * crosses them (a ticket enqueued is an arrival, and only the boundary sees every
+     * arrival, including the ones the queue never pairs); deeper numbers come from the
+     * state itself in the engine.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
+                registry, null);
+    }
+
+    /**
+     * Main wiring plus the ingress rate limiter ({@code null} disables it, which is what tests and
+     * the in-memory wiring use). The limiter is mandatory in the real service: it is the only
+     * thing between one authenticated caller and a queue nobody can drain (ADR 0023).
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
+                registry, rateLimiter, Readiness.none());
+    }
+
+    /**
+     * Main wiring plus the readiness checks behind {@code GET /health/ready} (W18, ADR 0024).
+     * {@link Readiness#none()} means "nothing to probe" (tests and the in-memory wiring), which is
+     * an instance that is ready by definition.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider, partyStore,
+                registry, rateLimiter, readiness, RegionPlacement.all(), PlayerLatency.none());
+    }
+
+    /**
+     * Main wiring plus the region placement (W21, ADR 0039): which regions this deployment serves,
+     * the operator's declared distances, and the player's measured ones. {@code all()}+{@code none()}
+     * is a deployment with no region boundary and no probes - the behaviour of W1-W20.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement,
+            PlayerLatency latency) {
+        return createRouter(vertx, jwtAuth, repository, connectionRegistry, matchRepository, skillProvider,
+                partyStore, registry, rateLimiter, readiness, placement, latency, MatchConnections.disabled());
+    }
+
+    /**
+     * Main wiring plus the connection-info route (W23, ADR 0033): the allocation's read model and the
+     * issuer of the signed token. {@link MatchConnections#disabled()} is every older wiring, where the
+     * route does not exist - an endpoint that exists but cannot answer is worse than one that does not.
+     */
+    public static Router createRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, SkillProvider skillProvider, PartyStore partyStore,
+            MeterRegistry registry, RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement,
+            PlayerLatency latency, MatchConnections matchConnections) {
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
-                new PartyUseCases(partyStore, repository, skillProvider));
+                new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
+                new PartyUseCases(partyStore, repository, skillProvider), registry, rateLimiter, readiness,
+                placement, latency, matchConnections);
     }
 
     /**
@@ -74,20 +184,23 @@ public final class HttpRoutes {
      * party store, so a party enqueued through one route is visible to the others
      * (a party enqueue must reach the same party the create route stored).
      */
-    private static Router devRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, WsHub wsHub,
+    private static Router devRouter(Vertx vertx, JWTAuth jwtAuth, TicketRepository repository, ConnectionRegistry connectionRegistry,
             MatchRepository matchRepository) {
         PartyStore partyStore = new InMemoryPartyStore();
         SkillProvider skillProvider = new DeterministicSkillProvider();
         return buildRouter(vertx, jwtAuth,
                 new CreateTicketUseCase(repository, skillProvider, partyStore),
                 new GetTicketUseCase(repository),
-                new CancelTicketUseCase(repository, partyStore), wsHub, matchRepository,
-                new PartyUseCases(partyStore, repository, skillProvider));
+                new CancelTicketUseCase(repository, partyStore), connectionRegistry, matchRepository,
+                new PartyUseCases(partyStore, repository, skillProvider), new SimpleMeterRegistry(), null,
+                Readiness.none(), RegionPlacement.all(), PlayerLatency.none(), MatchConnections.disabled());
     }
 
     private static Router buildRouter(Vertx vertx, JWTAuth jwtAuth, CreateTicketUseCase createTicket,
-            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, WsHub wsHub,
-            MatchRepository matchRepository, PartyUseCases partyUseCases) {
+            GetTicketUseCase getTicket, CancelTicketUseCase cancelTicket, ConnectionRegistry connectionRegistry,
+            MatchRepository matchRepository, PartyUseCases partyUseCases, MeterRegistry registry,
+            RateLimiter rateLimiter, Readiness readiness, RegionPlacement placement, PlayerLatency latency,
+            MatchConnections matchConnections) {
 
         Router router = Router.router(vertx);
         router.route().handler(ctx -> {
@@ -102,9 +215,117 @@ public final class HttpRoutes {
         });
         router.route().handler(BodyHandler.create());
 
+        // Liveness, plus the name of the instance answering (W19, ADR 0026) and the regions it
+        // serves (W21, ADR 0039). With more than one instance, "it is UP" is not actionable until
+        // it can say *which* one said so - and with more than one region, not until it can say
+        // which regions are its own.
         router.get("/health").handler(ctx -> ctx.response()
                 .putHeader("content-type", "application/json")
-                .end("{\"status\":\"UP\"}"));
+                .end(new JsonObject().put("status", "UP")
+                        .put("instance", connectionRegistry.instanceId())
+                        .put("regions", regionNames(placement.served().list()))
+                        .encode()));
+
+        // Readiness, not liveness (W18, ADR 0024): whether the dependencies this instance needs
+        // are answering. Measured in W18: with Redis stopped, /health said UP while every enqueue
+        // failed - the process was fine and the service was not.
+        router.get("/health/ready").handler(ctx -> readiness.probeAll().onSuccess(probed -> {
+            boolean healthy = readiness.healthy(probed);
+            JsonObject checks = new JsonObject();
+            probed.forEach((name, up) -> checks.put(name, up ? "UP" : "DOWN"));
+            respond(ctx, healthy ? 200 : 503,
+                    new JsonObject().put("status", healthy ? "UP" : "DOWN").put("checks", checks));
+        }));
+
+        router.get("/v1/regions").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region home = homeRegionOf(user);
+            String playerId = user.subject();
+            // Only this deployment's regions have a store this endpoint may read: a region's
+            // measurements live in that region, like its queue (ADR 0039). The rest of the entry is
+            // the operator's declared distance, which is the same map everywhere.
+            java.util.Map<Region, Integer> measured = new java.util.concurrent.ConcurrentHashMap<>();
+            java.util.List<Future<Void>> reads = new java.util.ArrayList<>();
+            for (Region region : placement.served().list()) {
+                reads.add(latency.rtt(playerId, region)
+                        .recover(err -> {
+                            LOG.log(System.Logger.Level.WARNING,
+                                    "http.latency.unavailable player={0} region={1} reason={2}",
+                                    playerId, region, String.valueOf(err.getMessage()));
+                            return Future.succeededFuture(null);
+                        })
+                        .map(rtt -> {
+                            if (rtt != null) {
+                                measured.put(region, rtt);
+                            }
+                            return (Void) null;
+                        }));
+            }
+            Future.all(reads)
+                    .onSuccess(ignored -> respond(ctx, 200, directoryOf(home, placement, measured)))
+                    .onFailure(err -> failInternal(ctx, err));
+        }));
+
+        // The probe is the server's measurement, not the client's claim (W21, ADR 0039): the first
+        // request is stamped by this server, the second is timed against that stamp. The client can
+        // only make the number worse, never better.
+        router.get("/v1/regions/:region/ping").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region region = regionOfPath(ctx);
+            if (region == null) {
+                return;
+            }
+            if (!placement.served().contains(region)) {
+                refuseUnsupportedRegion(ctx, registry, placement, region);
+                return;
+            }
+            latency.issue(user.subject(), region)
+                    .onSuccess(probe -> respond(ctx, 201, new JsonObject()
+                            .put("nonce", probe.nonce())
+                            .put("region", region.name())))
+                    .onFailure(err -> shedUnavailable(ctx, registry,
+                            MetricNames.TAG_DEPENDENCY_REDIS, "latency probes unavailable", err));
+        }));
+
+        router.post("/v1/regions/:region/pong").handler(ctx -> authenticate(ctx, jwtAuth, user -> {
+            Region region = regionOfPath(ctx);
+            if (region == null) {
+                return;
+            }
+            if (!placement.served().contains(region)) {
+                refuseUnsupportedRegion(ctx, registry, placement, region);
+                return;
+            }
+            String nonce = nonceOf(ctx.body() != null ? ctx.body().asJsonObject() : null);
+            if (nonce == null) {
+                fail(ctx, 400, "nonce is required");
+                return;
+            }
+            latency.complete(user.subject(), region, nonce)
+                    .onSuccess(rtt -> {
+                        if (rtt == null) {
+                            registry.counter(MetricNames.LATENCY_PROBES,
+                                    MetricNames.TAG_RESULT, MetricNames.RESULT_INVALID_NONCE).increment();
+                            respond(ctx, 422, new JsonObject()
+                                    .put("error", "invalid_nonce")
+                                    .put("region", region.name()));
+                            return;
+                        }
+                        registry.counter(MetricNames.LATENCY_PROBES,
+                                MetricNames.TAG_RESULT, MetricNames.RESULT_MEASURED).increment();
+                        DistributionSummary.builder(MetricNames.PLAYER_RTT)
+                                .tags(MetricNames.TAG_REGION, region.name())
+                                .description("Round trip from the player to the region, timed by the server")
+                                .publishPercentileHistogram()
+                                .minimumExpectedValue(1.0)
+                                .maximumExpectedValue(1000.0)
+                                .register(registry)
+                                .record(rtt);
+                        respond(ctx, 200, new JsonObject()
+                                .put("region", region.name())
+                                .put("rttMs", rtt));
+                    })
+                    .onFailure(err -> shedUnavailable(ctx, registry,
+                            MetricNames.TAG_DEPENDENCY_REDIS, "latency probes unavailable", err));
+        }));
 
         router.get("/v1/ws").handler(ctx -> {
             String token = bearerToken(ctx);
@@ -119,10 +340,10 @@ public final class HttpRoutes {
                         ctx.request().toWebSocket()
                             .onSuccess(ws -> {
                                 String playerId = user.subject();
-                                wsHub.register(playerId, ws);
-                                ws.textMessageHandler(text -> wsHub.handleClientMessage(playerId, ws, text));
-                                ws.closeHandler(v -> wsHub.unregister(playerId, ws));
-                                ws.exceptionHandler(err -> wsHub.unregister(playerId, ws));
+                                connectionRegistry.register(playerId, ws);
+                                ws.textMessageHandler(text -> connectionRegistry.handleClientMessage(playerId, ws, text));
+                                ws.closeHandler(v -> connectionRegistry.unregister(playerId, ws));
+                                ws.exceptionHandler(err -> connectionRegistry.unregister(playerId, ws));
                             })
                             .onFailure(err -> ctx.fail(400));
                     })
@@ -131,33 +352,27 @@ public final class HttpRoutes {
         });
 
         router.post("/v1/matchmaking/tickets").handler(ctx ->
-                authenticate(ctx, jwtAuth, user -> {
+                authenticate(ctx, jwtAuth, user -> withRateLimit(ctx, user.subject(), rateLimiter, registry, () -> {
+                    CreateTicketCommand command;
                     try {
-                        CreateTicketCommand command = TicketRequestParser.parseCreate(
+                        command = TicketRequestParser.parseCreate(
                                 ctx.body() != null ? ctx.body().asJsonObject() : null);
-                        createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
-                                .onSuccess(result -> {
-                                    if (!result.created()) {
-                                        respond(ctx, 200, TicketCodec.toJson(result.ticket()));
-                                        return;
-                                    }
-                                    respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
-                                })
-                                .onFailure(err -> fail(ctx, 500, err.getMessage()));
                     } catch (IllegalArgumentException e) {
                         fail(ctx, 400, e.getMessage());
+                        return;
                     }
-                }));
+                    admitThenCreate(ctx, registry, createTicket, placement, latency, user, command);
+                })));
 
         router.get("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> getTicket.execute(ctx.pathParam("ticketId"), user.subject())
                         .onSuccess(ticket -> respond(ctx, 200, TicketCodec.toJson(ticket)))
-                        .onFailure(err -> failWithDomainError(ctx, err))));
+                        .onFailure(err -> failWithDomainError(ctx, registry, err))));
 
         router.delete("/v1/matchmaking/tickets/:ticketId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> cancelTicket.execute(ctx.pathParam("ticketId"), user.subject())
                         .onSuccess(ticket -> respond(ctx, 200, TicketCodec.toJson(ticket)))
-                        .onFailure(err -> failWithDomainError(ctx, err))));
+                        .onFailure(err -> failWithDomainError(ctx, registry, err))));
 
         router.get("/v1/players/:playerId/matches").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> {
@@ -186,27 +401,40 @@ public final class HttpRoutes {
                         // cursor is validated by the repository's codec
                         matchRepository.historyForPlayer(user.subject(), cursorParam, limit)
                                 .onSuccess(page -> respond(ctx, 200, page.toJson()))
-                                .onFailure(err -> fail(ctx, 500, "history store error: " + err.getMessage()));
+                                .onFailure(err -> {
+                                    if (isDependencyUnavailable(err)) {
+                                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_POSTGRES,
+                                                "history store unavailable", err);
+                                        return;
+                                    }
+                                    failInternal(ctx, err);
+                                });
                     } catch (IllegalArgumentException e) {
                         fail(ctx, 400, e.getMessage());
                     }
                 }));
 
+        // ---- Connection info (W23, ADR 0033) ----
+        if (matchConnections.enabled()) {
+            router.get("/v1/matches/:matchId/connection").handler(ctx ->
+                    authenticate(ctx, jwtAuth, user -> connectionInfo(ctx, user, registry, matchConnections)));
+        }
+
         // ---- Party routes (W11) ----
         router.get("/v1/parties/:partyId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> partyUseCases.getPartyUseCase().execute(ctx.pathParam("partyId"), user.subject())
                         .onSuccess(view -> respond(ctx, 200, partyViewToJson(view)))
-                        .onFailure(err -> failWithDomainError(ctx, err))));
+                        .onFailure(err -> failWithDomainError(ctx, registry, err))));
 
         router.post("/v1/parties").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> partyUseCases.createPartyUseCase().execute(user.subject())
                         .onSuccess(partyId -> respond(ctx, 201, partyCreatedToJson(partyId)))
-                        .onFailure(err -> failWithDomainError(ctx, err))));
+                        .onFailure(err -> failWithDomainError(ctx, registry, err))));
 
         router.post("/v1/parties/:partyId/members").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> partyUseCases.addMemberUseCase().execute(ctx.pathParam("partyId"), user.subject())
                         .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
-                        .onFailure(err -> failWithDomainError(ctx, err))));
+                        .onFailure(err -> failWithDomainError(ctx, registry, err))));
 
         router.delete("/v1/parties/:partyId/members/:playerId").handler(ctx ->
                 authenticate(ctx, jwtAuth, user -> {
@@ -215,7 +443,7 @@ public final class HttpRoutes {
                     partyUseCases.removeMemberUseCase()
                             .execute(ctx.pathParam("partyId"), user.subject(), targetPlayerId)
                             .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
-                            .onFailure(err -> failWithDomainError(ctx, err));
+                            .onFailure(err -> failWithDomainError(ctx, registry, err));
                 }));
 
         router.delete("/v1/parties/:partyId").handler(ctx ->
@@ -224,10 +452,248 @@ public final class HttpRoutes {
                     partyUseCases.dissolveUseCase()
                             .execute(ctx.pathParam("partyId"), user.subject())
                             .onSuccess(party -> respond(ctx, 200, partyToJson(party)))
-                            .onFailure(err -> failWithDomainError(ctx, err));
+                            .onFailure(err -> failWithDomainError(ctx, registry, err));
                 }));
 
         return router;
+    }
+
+    /**
+     * The placement decision, then the write (W21, ADR 0039).
+     *
+     * <p>Two server-side numbers are read before a ticket can enter a queue: the deployment's served
+     * set (a region this endpoint does not own is refused, not queued for nobody) and the player's
+     * distance to the target region, which is the larger of the declared matrix and the player's
+     * own probe. The client's {@code maxLatencyMs} is the ceiling; it is never the measurement.
+     */
+    private static void admitThenCreate(RoutingContext ctx, MeterRegistry registry,
+            CreateTicketUseCase createTicket, RegionPlacement placement, PlayerLatency latency,
+            User user, CreateTicketCommand command) {
+        Region target = command.region();
+        if (!placement.served().contains(target)) {
+            refuseUnsupportedRegion(ctx, registry, placement, target);
+            return;
+        }
+        Region home = homeRegionOf(user);
+        latency.rtt(user.subject(), target)
+                .recover(err -> {
+                    // Losing the measurement must not lose the request: the declared floor is still a
+                    // server-side number, and a hot state that is really down is answered by the use
+                    // case below with the 503 the degradation matrix defines (ADR 0024).
+                    LOG.log(System.Logger.Level.WARNING,
+                            "http.latency.unavailable player={0} region={1} reason={2}",
+                            user.subject(), target, String.valueOf(err.getMessage()));
+                    return Future.succeededFuture(null);
+                })
+                .onSuccess(measured -> placement
+                        .check(target, command.maxLatencyMs(), home, measured)
+                        .ifPresentOrElse(
+                                denial -> refuseLatencyBudget(ctx, registry, denial),
+                                () -> enqueue(ctx, registry, createTicket, user, command)));
+    }
+
+    private static void enqueue(RoutingContext ctx, MeterRegistry registry, CreateTicketUseCase createTicket,
+            User user, CreateTicketCommand command) {
+        createTicket.execute(user.subject(), command, ctx.request().getHeader("Idempotency-Key"))
+                .onSuccess(result -> {
+                    if (!result.created()) {
+                        respond(ctx, 200, TicketCodec.toJson(result.ticket()));
+                        return;
+                    }
+                    countEnqueuedTicket(registry, result.ticket());
+                    respond(ctx, 201, TicketCodec.toCreateResponse(result.ticket()));
+                })
+                .onFailure(err -> {
+                    if (err instanceof QueueFullException full) {
+                        shedQueueFull(ctx, registry, full);
+                        return;
+                    }
+                    if (isDependencyUnavailable(err)) {
+                        // The hot state is down: unavailable, not broken. A 500
+                        // here would tell the client to give up on a request that
+                        // works again the moment Redis is back (W18, ADR 0024).
+                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_REDIS,
+                                "hot state unavailable", err);
+                        return;
+                    }
+                    failInternal(ctx, err);
+                });
+    }
+
+    /**
+     * A region this deployment does not serve. The body lists the ones it does, so the client can
+     * re-ask the right endpoint instead of probing why.
+     */
+    private static void refuseUnsupportedRegion(RoutingContext ctx, MeterRegistry registry,
+            RegionPlacement placement, Region region) {
+        registry.counter(MetricNames.TICKETS_REJECTED,
+                MetricNames.TAG_REASON, MetricNames.REASON_REGION_UNSUPPORTED).increment();
+        LOG.log(System.Logger.Level.INFO, "http.region.refused reason=region_unsupported region={0} served={1}",
+                String.valueOf(region), placement.served());
+        respond(ctx, 422, new JsonObject()
+                .put("error", MetricNames.REASON_REGION_UNSUPPORTED)
+                .put("region", region != null ? region.name() : null)
+                .put("served", regionNames(placement.served().list())));
+    }
+
+    /**
+     * The player cannot reach the region within its own ceiling. The three numbers travel in the
+     * body - what it costs, what the operator declared and what was measured - because "too slow"
+     * without a number is not actionable for the client that has to pick the next region.
+     */
+    private static void refuseLatencyBudget(RoutingContext ctx, MeterRegistry registry,
+            RegionPlacement.Denial denial) {
+        registry.counter(MetricNames.TICKETS_REJECTED,
+                MetricNames.TAG_REASON, MetricNames.REASON_LATENCY_BUDGET).increment();
+        LOG.log(System.Logger.Level.INFO,
+                "http.region.refused reason=latency_budget region={0} rttMs={1} maxLatencyMs={2}",
+                denial.target().name(), String.valueOf(denial.rttMs()),
+                String.valueOf(denial.maxLatencyMs()));
+        respond(ctx, 422, new JsonObject()
+                .put("error", MetricNames.REASON_LATENCY_BUDGET)
+                .put("region", denial.target().name())
+                .put("rttMs", denial.rttMs())
+                .put("declaredRttMs", denial.declaredRttMs())
+                .put("measuredRttMs", denial.measuredRttMs())
+                .put("maxLatencyMs", denial.maxLatencyMs()));
+    }
+
+    /**
+     * What this endpoint knows about the regions: which ones it serves, what the operator declared
+     * between the player's home and each of them, and what the player measured here. A region this
+     * endpoint does not serve has no measurement to show - its profile lives in its own Redis, and
+     * pretending otherwise would be a number from nowhere.
+     */
+    private static JsonObject directoryOf(Region home, RegionPlacement placement,
+            java.util.Map<Region, Integer> measured) {
+        JsonArray regions = new JsonArray();
+        for (Region region : Region.values()) {
+            boolean servedHere = placement.served().contains(region);
+            Integer measuredHere = servedHere ? measured.get(region) : null;
+            regions.add(new JsonObject()
+                    .put("region", region.name())
+                    .put("served", servedHere)
+                    .put("rttMs", placement.effectiveRttMs(region, home, measuredHere))
+                    .put("declaredRttMs", placement.declaredRttMs(home, region))
+                    .put("measuredRttMs", measuredHere));
+        }
+        return new JsonObject()
+                .put("playerRegion", home != null ? home.name() : null)
+                .put("served", regionNames(placement.served().list()))
+                .put("regions", regions);
+    }
+
+    /**
+     * The account's home region, from the token's {@code region} claim (W21). It is identity, not
+     * preference: the caller cannot set it per request, which is what makes the declared distance
+     * a server-side number.
+     */
+    private static Region homeRegionOf(User user) {
+        if (user == null || user.principal() == null) {
+            return null;
+        }
+        Object claim = user.principal().getValue("region");
+        if (claim == null) {
+            return null;
+        }
+        try {
+            return Region.valueOf(String.valueOf(claim).toUpperCase(java.util.Locale.ENGLISH));
+        } catch (IllegalArgumentException unknown) {
+            return null;
+        }
+    }
+
+    private static Region regionOfPath(RoutingContext ctx) {
+        String raw = ctx.pathParam("region");
+        try {
+            return Region.valueOf(raw.toUpperCase(java.util.Locale.ENGLISH));
+        } catch (RuntimeException unknown) {
+            fail(ctx, 400, "unknown region: " + raw);
+            return null;
+        }
+    }
+
+    private static String nonceOf(JsonObject body) {
+        String nonce = body != null ? body.getString("nonce") : null;
+        return nonce != null && !nonce.isBlank() ? nonce : null;
+    }
+
+    private static JsonArray regionNames(java.util.List<Region> regions) {
+        JsonArray names = new JsonArray();
+        for (Region region : regions) {
+            names.add(region.name());
+        }
+        return names;
+    }
+
+    /**
+     * Counts an arrival: a ticket that entered a queue. Tagged by mode and region so the KPI
+     * answers "who is waiting where", and only on a real creation - an idempotent replay
+     * returns 200 and must not inflate the arrival count.
+     */
+    private static void countEnqueuedTicket(MeterRegistry registry,
+            com.victor.matchmaking.domain.ticket.MatchmakingTicket ticket) {
+        registry.counter(MetricNames.TICKETS_ENQUEUED,
+                MetricNames.TAG_MODE, ticket.gameMode().label(),
+                MetricNames.TAG_REGION, ticket.region().name()).increment();
+    }
+
+    /**
+     * Runs {@code admitted} only if the caller is under its ingress budget (ADR 0023).
+     *
+     * <p>The decision is taken before the body is parsed and before any domain write, so a
+     * throttled caller costs one Redis round-trip and nothing else. The answer carries the
+     * header a well-behaved client backs off on ({@code Retry-After}) and the ones that let it
+     * pace itself ({@code X-RateLimit-*}).
+     */
+    private static void withRateLimit(RoutingContext ctx, String playerId, RateLimiter rateLimiter,
+            MeterRegistry registry, Runnable admitted) {
+        if (rateLimiter == null) {
+            admitted.run();
+            return;
+        }
+        rateLimiter.acquire(RATE_LIMIT_SCOPE, playerId)
+                .onSuccess(decision -> {
+                    ctx.response()
+                            .putHeader(HEADER_RATE_LIMIT_LIMIT, String.valueOf(decision.limit()))
+                            .putHeader(HEADER_RATE_LIMIT_REMAINING,
+                                    String.valueOf(Math.max(0, decision.remaining())));
+                    if (decision.allowed()) {
+                        admitted.run();
+                        return;
+                    }
+                    registry.counter(MetricNames.TICKETS_REJECTED,
+                            MetricNames.TAG_REASON, MetricNames.REASON_RATE_LIMITED).increment();
+                    ctx.response().putHeader(HEADER_RETRY_AFTER,
+                            String.valueOf(Math.max(1, decision.retryAfterSeconds())));
+                    fail(ctx, 429, "rate limit exceeded: at most " + decision.limit()
+                            + " enqueue requests are admitted per burst");
+                })
+                .onFailure(err -> {
+                    // Fail open, loudly. The limiter guards the queue, and the queue has its own
+                    // gate (the admission cap); refusing every request because the limiter's own
+                    // store is unreachable would turn a guard into the outage it exists to prevent.
+                    LOG.log(System.Logger.Level.WARNING, "http.ratelimit.unavailable player={0} reason={1}",
+                            playerId, err.getMessage());
+                    admitted.run();
+                });
+    }
+
+    /**
+     * The queue is full: accept nothing more, say so in a way the client can act on (W17, ADR
+     * 0022). 503 and not 429 - this is the server asking for a moment, not the caller
+     * misbehaving - and not a 500 either: nothing failed, the system is protecting itself.
+     */
+    private static void shedQueueFull(RoutingContext ctx, MeterRegistry registry, QueueFullException full) {
+        registry.counter(MetricNames.TICKETS_REJECTED,
+                MetricNames.TAG_REASON, MetricNames.REASON_QUEUE_FULL).increment();
+        ctx.response().putHeader(HEADER_RETRY_AFTER, String.valueOf(QUEUE_FULL_RETRY_AFTER_SECONDS));
+        respond(ctx, 503, new io.vertx.core.json.JsonObject()
+                .put("error", "queue full")
+                .put("queue", full.queue())
+                .put("depth", full.depth())
+                .put("capacity", full.capacity())
+                .put("retryAfterSeconds", QUEUE_FULL_RETRY_AFTER_SECONDS));
     }
 
     private static JsonObject partyViewToJson(GetPartyUseCase.PartyView view) {
@@ -277,7 +743,7 @@ public final class HttpRoutes {
                 .onFailure(err -> fail(ctx, 401, "invalid token: " + err.getMessage()));
     }
 
-    private static void failWithDomainError(RoutingContext ctx, Throwable err) {
+    private static void failWithDomainError(RoutingContext ctx, MeterRegistry registry, Throwable err) {
         if (err instanceof GetTicketUseCase.TicketNotFoundException) {
             fail(ctx, 404, err.getMessage());
         } else if (err instanceof GetTicketUseCase.TicketForbiddenException) {
@@ -297,9 +763,157 @@ public final class HttpRoutes {
                 || err instanceof RemoveMemberUseCase.ForbiddenException
                 || err instanceof DissolvePartyUseCase.ForbiddenException) {
             fail(ctx, 403, err.getMessage());
+        } else if (isDependencyUnavailable(err)) {
+            // Every domain route reads or writes the hot state, so this is where a Redis outage
+            // lands: the same 503 the enqueue path answers, not a 500 (W18, ADR 0024).
+            shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_REDIS, "hot state unavailable", err);
         } else {
-            fail(ctx, 500, err.getMessage());
+            failInternal(ctx, err);
         }
+    }
+
+    /**
+     * True when the failure is a dependency being unreachable rather than this service being wrong
+     * (W18, ADR 0024). A dependency that is down is answered with 503 and a {@code Retry-After}; a
+     * bug is answered with 500. Collapsing the two is how a client learns to retry a typo forever,
+     * or to give up on a request that would have worked a second later.
+     *
+     * <p>Detected by type first (the Vert.x Redis client reports an unreachable server as a
+     * {@link java.net.ConnectException}) and by the clients' own wording second, because a pool that
+     * hands out a connection the server has since closed, a pool whose waiting queue is full and a
+     * script cache that lost its script all speak through messages rather than types. The wording
+     * list is deliberately short and about *transport*, never about SQL or business state: a query
+     * that fails because a column is missing must stay a 500.
+     */
+    private static boolean isDependencyUnavailable(Throwable err) {
+        for (Throwable cause = err; cause != null; cause = cause.getCause() == cause ? null : cause.getCause()) {
+            if (cause instanceof java.net.ConnectException) {
+                return true;
+            }
+            String message = cause.getMessage();
+            if (message == null) {
+                continue;
+            }
+            String normalized = message.toLowerCase(java.util.Locale.ENGLISH);
+            for (String fragment : UNAVAILABLE_MESSAGE_FRAGMENTS) {
+                if (normalized.contains(fragment)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A dependency is unreachable: 503, a {@code Retry-After}, and a body that names what is
+     * unavailable without saying where it lives (W18, ADR 0024). Measured before this existed: the
+     * client was told {@code 500 {"error":"Connection refused: localhost/127.0.0.1:6379"}} - the
+     * wrong status and a map of the internal network.
+     */
+    private static void shedUnavailable(RoutingContext ctx, MeterRegistry registry, String dependency,
+            String error, Throwable cause) {
+        registry.counter(MetricNames.DEPENDENCY_ERRORS, MetricNames.TAG_DEPENDENCY, dependency).increment();
+        LOG.log(System.Logger.Level.WARNING, "http.dependency.unavailable dependency={0} path={1} reason={2}",
+                dependency, ctx.normalizedPath(), String.valueOf(cause.getMessage()));
+        ctx.response().putHeader(HEADER_RETRY_AFTER, String.valueOf(DEPENDENCY_RETRY_AFTER_SECONDS));
+        respond(ctx, 503, new io.vertx.core.json.JsonObject()
+                .put("error", error)
+                .put("dependency", dependency)
+                .put("retryAfterSeconds", DEPENDENCY_RETRY_AFTER_SECONDS));
+    }
+
+    /**
+     * A 500 the client can read: the details go to the log, not to the body (W18, ADR 0024). A
+     * driver exception's message names hosts, ports and table shapes - useful to an operator,
+     * free reconnaissance to everyone else.
+     */
+    /**
+     * The player asks where to play (W23, ADR 0033).
+     *
+     * <p>Four answers, and the difference matters to a client: {@code 200} with an address and a
+     * signed token (the match is on a server), {@code 409 not_allocated} (confirmed, still waiting),
+     * {@code 409 match_rejected} with the reason (it will not run), {@code 409 match_finished} (it
+     * already did), and {@code 404} for a match the player is not in - which is also the answer for a
+     * match that does not exist, because the two must not be tellable apart.
+     *
+     * <p>The token is minted per request and never cached: a cached token is a client that connects
+     * after it expired and is refused with no way to tell why.
+     */
+    private static void connectionInfo(RoutingContext ctx, User user, MeterRegistry registry,
+            MatchConnections connections) {
+        String matchId = ctx.pathParam("matchId");
+        connections.repository().find(matchId, user.subject())
+                .onSuccess(found -> {
+                    if (found.isEmpty()) {
+                        countConnection(registry, MetricNames.RESULT_NOT_FOUND);
+                        fail(ctx, 404, "match_not_found");
+                        return;
+                    }
+                    var connection = found.get();
+                    switch (connection.status()) {
+                        case PENDING_ALLOCATION -> {
+                            countConnection(registry, MetricNames.RESULT_NOT_ALLOCATED);
+                            respond(ctx, 409, new JsonObject().put("error", "not_allocated")
+                                    .put("message", "the match is confirmed and no game server took it yet"));
+                        }
+                        case REJECTED -> {
+                            countConnection(registry, MetricNames.RESULT_MATCH_REJECTED);
+                            respond(ctx, 409, new JsonObject().put("error", "match_rejected")
+                                    .put("reason", connection.rejectionReason() == null
+                                            ? null
+                                            : connection.rejectionReason().wireName()));
+                        }
+                        case RELEASED -> {
+                            countConnection(registry, MetricNames.RESULT_MATCH_FINISHED);
+                            respond(ctx, 409, new JsonObject().put("error", "match_finished"));
+                        }
+                        case ALLOCATED, STARTED -> {
+                            if (connection.serverAddress() == null) {
+                                // The pool row is gone under a live allocation. The watchdog rejects
+                                // it on its next tick; until then there is no address to hand out.
+                                countConnection(registry, MetricNames.RESULT_NOT_ALLOCATED);
+                                respond(ctx, 409, new JsonObject().put("error", "not_allocated"));
+                                return;
+                            }
+                            String playerToken = bearerToken(ctx);
+                            connections.tokens().issue(playerToken, matchId, connection.team())
+                                    .onSuccess(issued -> {
+                                        countConnection(registry, MetricNames.RESULT_SERVED);
+                                        respond(ctx, 200, new JsonObject()
+                                                .put("matchId", matchId)
+                                                .put("status", connection.status().name())
+                                                .put("team", connection.team())
+                                                .put("serverAddress", connection.serverAddress())
+                                                .put("connectionToken", issued.token())
+                                                .put("expiresAt", issued.expiresAt().toString())
+                                                .put("expiresInSeconds", issued.expiresInSeconds()));
+                                    })
+                                    .onFailure(err -> {
+                                        countConnection(registry, MetricNames.RESULT_ISSUER_UNAVAILABLE);
+                                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_AUTH,
+                                                "token_issuer_unavailable", err);
+                                    });
+                        }
+                    }
+                })
+                .onFailure(err -> {
+                    if (isDependencyUnavailable(err)) {
+                        shedUnavailable(ctx, registry, MetricNames.TAG_DEPENDENCY_POSTGRES,
+                                "allocation store unavailable", err);
+                        return;
+                    }
+                    failInternal(ctx, err);
+                });
+    }
+
+    private static void countConnection(MeterRegistry registry, String result) {
+        registry.counter(MetricNames.CONNECTION_REQUESTS, MetricNames.TAG_RESULT, result).increment();
+    }
+
+    private static void failInternal(RoutingContext ctx, Throwable err) {
+        LOG.log(System.Logger.Level.ERROR, "http.internal {0} {1} reason={2}",
+                ctx.request().method().name(), ctx.normalizedPath(), String.valueOf(err.getMessage()));
+        fail(ctx, 500, "internal error");
     }
 
     private static void respond(RoutingContext ctx, int statusCode, io.vertx.core.json.JsonObject body) {

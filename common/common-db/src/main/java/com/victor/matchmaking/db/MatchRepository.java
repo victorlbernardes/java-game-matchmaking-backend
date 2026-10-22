@@ -14,6 +14,7 @@ import io.vertx.core.Vertx;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.RowSet;
+import io.vertx.sqlclient.SqlConnection;
 import io.vertx.sqlclient.Tuple;
 
 /** Durable match facts: inserts on confirmation, serves cursor-paginated history. */
@@ -29,9 +30,30 @@ public final class MatchRepository {
         return new MatchRepository(DatabasePool.connect(vertx, config));
     }
 
-    /** Inserts a match and its players. Idempotent on match id (retry-safe for W7/W8). */
+    /**
+     * Round-trips a {@code SELECT 1}: what a readiness probe needs, and nothing more (W18, ADR
+     * 0024). It asks "can this instance reach the source of truth", not "is the data good" — the
+     * answer changes the routing decision, so it must be cheap enough to ask often.
+     */
+    public Future<Void> ping() {
+        return pool.query("SELECT 1").execute().mapEmpty();
+    }
+
+    /**
+     * Inserts a match and its players in one transaction. Idempotent on match id
+     * (retry-safe for W7/W8).
+     */
     public Future<Void> save(Match match, List<MatchPlayer> players) {
-        Future<RowSet<Row>> insertMatch = pool.preparedQuery(
+        return pool.withTransaction(connection -> saveOn(connection, match, players));
+    }
+
+    /**
+     * The same insert on a connection the caller already owns, so a service can write
+     * the match together with its own rows in one transaction (the outbox of ADR 0018
+     * needs the match and its event to be one write).
+     */
+    public Future<Void> saveOn(SqlConnection connection, Match match, List<MatchPlayer> players) {
+        Future<RowSet<Row>> insertMatch = connection.preparedQuery(
                         "INSERT INTO matches (id, game_mode, region, status, created_at, started_at, finished_at) "
                                 + "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING")
                 .execute(Tuple.of(
@@ -44,7 +66,7 @@ public final class MatchRepository {
                         timestampOf(match.finishedAt())));
         return insertMatch.flatMap(v -> Future.all(
                         players.stream()
-                                .map(p -> pool.preparedQuery(
+                                .map(p -> connection.preparedQuery(
                                                 "INSERT INTO match_players (match_id, player_id, team, skill_at_match) "
                                                         + "VALUES (?, ?, ?, ?) ON CONFLICT (match_id, player_id) DO NOTHING")
                                         .execute(Tuple.of(p.matchId(), p.playerId(), p.team(), p.skillAtMatch())))
@@ -102,7 +124,8 @@ public final class MatchRepository {
         return instant != null ? Timestamp.from(instant) : null;
     }
 
-    private static Instant instantOf(Object value) {
+    /** Shared with the pool's repository: one place that knows how a TIMESTAMPTZ arrives. */
+    static Instant instantOf(Object value) {
         if (value == null) {
             return null;
         }

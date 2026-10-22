@@ -1,0 +1,30 @@
+# Prometheus (W15, ADR 0021).
+#
+# Two jobs, one per service: the matchmaking-api answers players and exposes the transport
+# and arrival KPIs, the matchmaking-engine pairs and exposes the queue and outbox KPIs. They
+# run on the host (mvn exec:java), each on its own metrics port, and the scrape reaches them
+# through host.docker.internal - that is why the metrics endpoint binds every interface in
+# the local stack and why the port is not the public one (see MetricsEndpoint).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# The SLOs and their burn-rate alerts (W16, ADR 0021). Prometheus refuses to start on a broken
+# rule file, which is the point: an objective that does not compile is worse than none.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: matchmaking-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+        labels:
+          service: matchmaking-api
+
+  - job_name: matchmaking-engine
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: matchmaking-engine

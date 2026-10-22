@@ -1,0 +1,14 @@
+apiVersion: 1
+
+# Dashboards are files, like every other piece of configuration here: the dashboard of a
+# sprint is reviewed in a pull request, not clicked together in a browser.
+providers:
+  - name: matchmaking
+    orgId: 1
+    folder: Matchmaking
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

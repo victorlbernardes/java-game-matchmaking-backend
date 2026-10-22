@@ -4,11 +4,16 @@ import java.sql.Timestamp;
 
 import com.victor.matchmaking.db.DatabaseConfig;
 import com.victor.matchmaking.db.DatabasePool;
+import com.victor.matchmaking.db.GameServerRepository;
+import com.victor.matchmaking.domain.match.AllocationStatus;
+import com.victor.matchmaking.metrics.MetricNames;
 import com.victor.matchmaking.orchestrator.application.ConfirmedMatchInbox;
+import com.victor.matchmaking.orchestrator.domain.AllocationOutcome;
 import com.victor.matchmaking.orchestrator.domain.AllocationRequest;
 import com.victor.matchmaking.orchestrator.domain.ProcessedEvent;
 import com.victor.matchmaking.orchestrator.domain.ProcessingOutcome;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.sqlclient.Pool;
@@ -25,6 +30,17 @@ import io.vertx.sqlclient.Tuple;
  * the winner's uncommitted row, waits for it, and then does nothing - which is
  * exactly the behaviour a rebalance produces, and the reason this is a database
  * guarantee instead of application logic.
+ *
+ * <p><b>The allocation is part of that effect (W22, ADR 0031).</b> The projection row and
+ * the slot it takes on a game server are written by the same transaction, for the same
+ * reason the inbox exists: a redelivery must not take a second slot, and two confirmations
+ * arriving together must not take the same last one. The row lock is what makes the second
+ * half true ({@link GameServerRepository#reserve}); this class only decides <em>where</em> in
+ * the effect it belongs, which is here — after the inbox insert has won, before the commit.
+ *
+ * <p>No capacity is not a failure: it is an answer, and the row stays
+ * {@code PENDING_ALLOCATION} (W23 closes that loop). Counting it is the whole difference
+ * between a pool that is full and a pool nobody is watching.
  */
 public final class PostgresConfirmedMatchInbox implements ConfirmedMatchInbox, AutoCloseable {
 
@@ -36,22 +52,52 @@ public final class PostgresConfirmedMatchInbox implements ConfirmedMatchInbox, A
             "INSERT INTO match_allocations (match_id, game_mode, region, player_count, status, confirmed_at) "
                     + "VALUES (?, ?, ?, ?, ?, ?)";
 
-    private final Pool pool;
+    /**
+     * The allocation's roster, with the ticket each player must be given back (W23, ADR 0032).
+     * Nothing here is a convenience copy: the requeue needs the queue member, and the connection
+     * token needs the team.
+     */
+    private static final String INSERT_ROSTER =
+            "INSERT INTO match_roster (match_id, player_id, ticket_id, team, skill_at_match) "
+                    + "VALUES (?, ?, ?, ?, ?)";
 
-    public PostgresConfirmedMatchInbox(Pool pool) {
+    private static final String MARK_ALLOCATED =
+            "UPDATE match_allocations SET status = ?, server_id = ?, allocated_at = now() WHERE match_id = ?";
+
+    private final Pool pool;
+    private final GameServerRepository servers;
+    private final MeterRegistry registry;
+
+    public PostgresConfirmedMatchInbox(Pool pool, GameServerRepository servers, MeterRegistry registry) {
         this.pool = pool;
+        this.servers = servers;
+        this.registry = registry;
     }
 
-    public static PostgresConfirmedMatchInbox connect(Vertx vertx, DatabaseConfig config) {
-        return new PostgresConfirmedMatchInbox(DatabasePool.connect(vertx, config));
+    public static PostgresConfirmedMatchInbox connect(Vertx vertx, DatabaseConfig config, MeterRegistry registry) {
+        Pool pool = DatabasePool.connect(vertx, config);
+        return new PostgresConfirmedMatchInbox(pool, new GameServerRepository(pool), registry);
     }
 
     @Override
     public Future<ProcessingOutcome> applyOnce(AllocationRequest allocation, ProcessedEvent event) {
         return pool.withTransaction(connection -> recordEvent(connection, event)
                 .compose(outcome -> outcome == ProcessingOutcome.APPLIED
-                        ? projectAllocation(connection, allocation)
-                        : Future.succeededFuture(ProcessingOutcome.DUPLICATE)));
+                        ? projectAndAllocate(connection, allocation)
+                        : Future.succeededFuture(new Applied(ProcessingOutcome.DUPLICATE, null))))
+                // Counted after the commit, never inside it: a rollback that undid the effect
+                // while the counter kept the allocation would be an instrument lying about the
+                // one question it answers.
+                .map(applied -> {
+                    if (applied.allocation() != null) {
+                        registry.counter(MetricNames.ALLOCATIONS, MetricNames.TAG_RESULT,
+                                applied.allocation() == AllocationOutcome.ALLOCATED
+                                        ? MetricNames.RESULT_ALLOCATED
+                                        : MetricNames.RESULT_NO_CAPACITY)
+                                .increment();
+                    }
+                    return applied.status();
+                });
     }
 
     @Override
@@ -83,7 +129,44 @@ public final class PostgresConfirmedMatchInbox implements ConfirmedMatchInbox, A
                 .map(ProcessingOutcome.APPLIED);
     }
 
+    private Future<Applied> projectAndAllocate(SqlConnection connection, AllocationRequest allocation) {
+        return projectAllocation(connection, allocation)
+                .compose(projected -> insertRoster(connection, allocation))
+                .compose(projected -> servers.reserve(connection, allocation.gameMode(), allocation.region()))
+                .compose(reserved -> {
+                    if (reserved.isEmpty()) {
+                        // The pool is full, draining, stale or absent. The match is still
+                        // confirmed and still projected; it simply has nowhere to run yet.
+                        // The watchdog retries it until its deadline (W23, ADR 0032).
+                        return Future.succeededFuture(
+                                new Applied(ProcessingOutcome.APPLIED, AllocationOutcome.NO_CAPACITY));
+                    }
+                    return markAllocated(connection, allocation.matchId(), reserved.get())
+                            .map(updated -> new Applied(ProcessingOutcome.APPLIED, AllocationOutcome.ALLOCATED));
+                });
+    }
+
+    /** One batch, inside the effect's transaction: a roster that lands without its projection is impossible. */
+    private Future<Void> insertRoster(SqlConnection connection, AllocationRequest allocation) {
+        java.util.List<Tuple> rows = new java.util.ArrayList<>(allocation.playerCount());
+        for (AllocationRequest.RosterEntry entry : allocation.roster()) {
+            rows.add(Tuple.of(allocation.matchId(), entry.playerId(), entry.ticketId(), entry.team(),
+                    entry.skillAtMatch()));
+        }
+        return connection.preparedQuery(INSERT_ROSTER).executeBatch(rows).map(ignored -> (Void) null);
+    }
+
+    private Future<Integer> markAllocated(SqlConnection connection, String matchId, String serverId) {
+        return connection.preparedQuery(MARK_ALLOCATED)
+                .execute(Tuple.of(AllocationStatus.ALLOCATED.name(), serverId, matchId))
+                .map(updated -> updated.rowCount());
+    }
+
     private static Timestamp timestampOf(java.time.Instant instant) {
         return Timestamp.from(instant);
+    }
+
+    /** The effect and what it did about a server; the allocation is null for a redelivery. */
+    private record Applied(ProcessingOutcome status, AllocationOutcome allocation) {
     }
 }

@@ -38,6 +38,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The harness: one jar, one language, no Python (see tools/scenarios).
+MM="$REPO_ROOT/requests/mm.sh"
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8082}"
 BASE_REF="${BASE_REF:-origin/main}"
 SUBJECT="${SUBJECT:-matchmaking.events.match-confirmed-value}"
@@ -181,40 +183,10 @@ step "4. negative control: a change the registry must refuse"
 # leave a broken contract behind if the expectation is ever wrong.
 sed "$INCOMPATIBLE_SED" "$REPO_ROOT/$EVENT_PROTO" >"$TMP_DIR/incompatible.proto"
 if ! cmp -s "$TMP_DIR/incompatible.proto" "$REPO_ROOT/$EVENT_PROTO"; then
-  cat >"$TMP_DIR/compat.py" <<'PY'
-import json
-import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-
-registry_url, subject, schema_path, types_proto = sys.argv[1:]
-# Subjects hold a path (an imported .proto); slashes must travel encoded.
-quote = lambda value: urllib.parse.quote(value, safe="")
-# The reference version is resolved from the registry, not assumed: an import that
-# has moved on would otherwise make the check compare against the wrong schema.
-with urllib.request.urlopen(
-        f"{registry_url}/subjects/{quote(types_proto)}/versions/latest", timeout=30) as response:
-    types_version = json.loads(response.read() or b"{}").get("version")
-body = {
-    "schemaType": "PROTOBUF",
-    "schema": open(schema_path).read(),
-    "references": [{"name": types_proto, "subject": types_proto, "version": types_version}],
-}
-request = urllib.request.Request(
-    f"{registry_url}/compatibility/subjects/{quote(subject)}/versions/latest",
-    data=json.dumps(body).encode(),
-    method="POST",
-    headers={"Content-Type": "application/vnd.schemaregistry.v1+json"})
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        print(json.loads(response.read() or b"{}"))
-except urllib.error.HTTPError as error:
-    print(f"HTTP {error.code}: {error.read().decode(errors='replace')[:200]}")
-PY
-  verdict="$(python3 "$TMP_DIR/compat.py" "$REGISTRY_URL" "$SUBJECT" "$TMP_DIR/incompatible.proto" "$TYPES_PROTO")"
+  verdict="$("$MM" kafka compat --registry "$REGISTRY_URL" --subject "$SUBJECT" \
+    --schema "$TMP_DIR/incompatible.proto" --types-proto "$TYPES_PROTO")"
   case "$verdict" in
-    *"'is_compatible': False"*) ok "the registry refuses the mutated contract (a field kind change): $verdict";;
+    *'"is_compatible":false'*) ok "the registry refuses the mutated contract (a field kind change): $verdict";;
     *) bad "the registry did not refuse an incompatible contract: $verdict";;
   esac
 else

@@ -127,7 +127,7 @@ mvn -B -f services/match-orchestrator/pom.xml test -Dtest=ProcessConfirmedMatchT
 
 # the two failure shapes end to end (needs the stack, the orchestrator running, and
 # something already projected: run the E2E first)
-python3 requests/e2e/run_e2e.py
+requests/mm.sh e2e
 bash requests/kafka/verify_dlq.sh
 ```
 The script creates the dead letter topic if missing, produces a poisoned record, and then

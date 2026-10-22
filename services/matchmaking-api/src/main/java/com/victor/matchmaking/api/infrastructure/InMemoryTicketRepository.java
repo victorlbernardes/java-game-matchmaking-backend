@@ -51,6 +51,37 @@ public final class InMemoryTicketRepository implements TicketRepository {
     }
 
     @Override
+    public Future<Long> queueDepth(String gameModeLabel, String regionName) {
+        long depth = ticketsById.values().stream()
+                .filter(ticket -> ticket.status() == com.victor.matchmaking.domain.ticket.TicketState.SEARCHING)
+                .filter(ticket -> ticket.gameMode().label().equals(gameModeLabel)
+                        && ticket.region().name().equals(regionName))
+                .count();
+        return Future.succeededFuture(depth);
+    }
+
+    /**
+     * In-memory counterpart of the Lua script (W23): same rule - only a ticket that was waiting on
+     * a match comes back, and it comes back with the state the queue represents.
+     */
+    @Override
+    public Future<RequeueOutcome> requeue(MatchmakingTicket ticket) {
+        MatchmakingTicket current = ticketsById.get(ticket.id());
+        if (current == null) {
+            return Future.succeededFuture(RequeueOutcome.MISSING);
+        }
+        if (current.status() != com.victor.matchmaking.domain.ticket.TicketState.CONFIRMING
+                && current.status() != com.victor.matchmaking.domain.ticket.TicketState.CONFIRMED) {
+            return Future.succeededFuture(RequeueOutcome.UNCHANGED);
+        }
+        ticketsById.put(current.id(), new MatchmakingTicket(current.id(), current.playerId(), current.gameMode(),
+                current.region(), current.maxLatencyMs(), current.skill(), current.queuedAt(),
+                com.victor.matchmaking.domain.ticket.TicketState.SEARCHING, current.version() + 1,
+                current.partyId()));
+        return Future.succeededFuture(RequeueOutcome.REQUEUED);
+    }
+
+    @Override
     public Future<List<String>> createPartyTickets(List<MatchmakingTicket> tickets) {
         if (tickets.isEmpty()) {
             return Future.succeededFuture(List.of());

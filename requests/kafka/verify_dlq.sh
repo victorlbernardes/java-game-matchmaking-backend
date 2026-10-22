@@ -26,7 +26,7 @@
 #   docker compose up -d            (kafka + schema-registry + postgres healthy)
 #   mvn -B install -DskipTests      (the services resolve their modules from ~/.m2)
 #   the orchestrator running, with at least one event already projected
-#   (python3 requests/e2e/run_e2e.py projects one in scenario S11)
+#   (requests/mm.sh e2e projects one in scenario S11)
 #
 # The dead letter topic is created here if it is missing: a service is not allowed to
 # invent topics (partition count and retention are deliberate operational choices), so
@@ -42,6 +42,9 @@
 # Exit code 0 = both failure shapes ended on the dead letter topic with the offset
 # committed and no duplicated effect.
 set -uo pipefail
+
+# The harness: one jar, one language, no Python (see tools/scenarios).
+MM="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/requests/mm.sh"
 
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -117,13 +120,31 @@ wait_for_empty_group() {
   return 1
 }
 
-# Whole dead letter topic into $DLQ_DUMP: one line per record, headers first, payload
+# The dead letter topic is shared and only grows: every run of this scenario appends to it
+# and a dead letter cannot be deleted. It used to be read as "the oldest 100 records", so
+# once the topic passed 100 records (it holds 133 now) the dump stopped containing the
+# letter this run had just produced -- and the "newest of this stage" selection below read
+# a stale one from a previous run, failing every header assertion against the wrong record.
+# Read the tail of the topic instead: the letters of interest are always the recent ones.
+DLQ_SCAN="${DLQ_SCAN:-200}"
+
+dlq_end_offset() {
+  docker exec "$KAFKA_CONTAINER" kafka-get-offsets \
+    --bootstrap-server "$BROKER_IN_CONTAINER" --topic "$DLQ_TOPIC" 2>/dev/null \
+    | awk -F: -v p="$PARTITION" '$2 == p { print $3; exit }'
+}
+
+# The dead letter topic into $DLQ_DUMP: one line per record, headers first, payload
 # last, tab separated (the console consumer's own format).
 dump_dlq() {
+  local end start
+  end="$(dlq_end_offset)"
+  [ -n "$end" ] || end=0
+  start=$(( end > DLQ_SCAN ? end - DLQ_SCAN : 0 ))
   docker exec "$KAFKA_CONTAINER" kafka-console-consumer \
     --bootstrap-server "$BROKER_IN_CONTAINER" \
-    --topic "$DLQ_TOPIC" --partition "$PARTITION" --offset earliest \
-    --max-messages 100 --timeout-ms 4000 \
+    --topic "$DLQ_TOPIC" --partition "$PARTITION" --offset "$start" \
+    --max-messages "$DLQ_SCAN" --timeout-ms 4000 \
     --property print.headers=true --property print.offset=true \
     > "$DLQ_DUMP" 2>/dev/null || true
 }
@@ -147,91 +168,17 @@ wait_for_dlq_stage() {
 # record can be dead-lettered more than once. Read in binary, so a payload that is not
 # valid UTF-8 cannot derail the parsing.
 dlq_offset_for_stage() {
-  python3 - "$DLQ_DUMP" "$1" <<'PY'
-import re
-import sys
-
-want = sys.argv[2].encode()
-offset = ""
-for raw in open(sys.argv[1], "rb"):
-    line = raw.rstrip(b"\r\n")
-    match = re.match(rb"^Offset:(\d+)\t", line)
-    if match and want in line:
-        offset = match.group(1).decode()
-print(offset)
-PY
+  "$MM" kafka dlq-offset --path "$DLQ_DUMP" --stage "$1"
 }
 
-# Assertions on the $DLQ_DUMP contents. The parsing is done by python because a payload
-# is bytes and a header value can contain anything, including commas and tabs.
+# Assertions on the $DLQ_DUMP contents. Parsed by the harness in bytes, because a
+# payload is bytes and a header value can contain anything, including commas and tabs.
 # Args: stage, original offset, original event id ("-" when unknown), original payload
 # ("-" when it cannot be compared as text).
 dlq_checks() {
   local output
-  output="$(python3 - "$DLQ_DUMP" "$1" "$2" "$3" "$4" "$TOPIC" "$GROUP" "$PARTITION" <<'PY'
-import re
-import sys
-
-path, stage, want_offset, want_event_id, want_payload, topic, group, partition = sys.argv[1:9]
-
-
-def check(name, condition, detail=""):
-    print(("CHECK_PASS:" if condition else "CHECK_FAIL:") + name + (f"  -> {detail}" if detail else ""))
-
-
-def dead_letters(path):
-    """One entry per dead letter: a line starting with Offset:, plus every line up to
-    the next one. Both a header value (an error message) and a payload can contain
-    newlines, so a record is not a line."""
-    found = []
-    for raw in open(path, "rb"):
-        line = raw.rstrip(b"\n")
-        head = re.match(rb"^Offset:(\d+)\t", line)
-        if head:
-            found.append([int(head.group(1)), line[head.end():]])
-        elif line.startswith(b"Processed a total"):
-            continue
-        elif found:
-            found[-1][1] += b"\n" + line
-    return [(offset, body.partition(b"\t")) for offset, body in found]
-
-
-letters = [(offset, headers.decode("utf-8", "replace"), payload)
-           for offset, (headers, _, payload) in dead_letters(path)]
-
-check("the dead letter topic received a record", bool(letters), f"{len(letters)} record(s)")
-stages = sorted({(re.search(r"dlq\.stage:(\w+)", headers) or [None, "?"])[1] for _, headers, _ in letters})
-matching = [letter for letter in letters if f"dlq.stage:{stage}" in letter[1]]
-check(f"a dead letter carries stage={stage}", bool(matching), "stages on the topic: " + ",".join(stages))
-
-if matching:
-    # Earlier runs leave their dead letters on the topic; the assertions are about the
-    # newest one of this stage, which is what this run produced.
-    _, headers, payload = matching[-1]
-    origin = [h for h in re.split(r",\s*", headers) if h.startswith("dlq.original")]
-    check(f"it records where the record came from (offset {want_offset})",
-          f"dlq.original-offset:{want_offset}" in headers
-          and f"dlq.original-partition:{partition}" in headers
-          and f"dlq.original-topic:{topic}" in headers, " ".join(origin))
-    check("it records which consumer group gave up on it", f"dlq.consumer-group:{group}" in headers)
-    check("it records how many attempts were made (3)", "dlq.attempts:3" in headers,
-          " ".join(h for h in re.split(r",\s*", headers) if h.startswith("dlq.attempts")))
-    check("it records the failure, class and message",
-          "dlq.error-class:" in headers and "dlq.error-message:" in headers,
-          " ".join(h for h in re.split(r",\s*", headers) if h.startswith("dlq.error")))
-    if want_event_id == "-":
-        check("it does not invent an event id for a payload that never decoded",
-              "dlq.event-id:" not in headers)
-    else:
-        check(f"it records the event id of the payload that failed ({want_event_id})",
-              f"dlq.event-id:{want_event_id}" in headers)
-    if want_payload == "-":
-        check("it carries the original payload", len(payload) > 0, f"{len(payload)} byte(s)")
-    else:
-        check("it carries the original payload verbatim", payload == want_payload.encode("utf-8"),
-              "got " + repr(payload[:80]) + ("..." if len(payload) > 80 else ""))
-PY
-)"
+  output="$("$MM" kafka dlq-checks --path "$DLQ_DUMP" --stage "$1" --offset "$2" \
+    --event-id "$3" --payload "$4" --topic "$TOPIC" --group "$GROUP" --partition "$PARTITION")"
   while IFS= read -r line; do
     case "$line" in
       CHECK_PASS:*) ok "${line#CHECK_PASS:}" ;;
@@ -264,7 +211,7 @@ fi
 if [ "${allocations_before:-0}" -gt 0 ] 2>/dev/null; then
   ok "there is a projected match for the conflicting effect of phase 2"
 else
-  bad "nothing projected yet - run the E2E first (python3 requests/e2e/run_e2e.py)"
+  bad "nothing projected yet - run the E2E first (requests/mm.sh e2e)"
 fi
 
 # The dead letter topic must exist BEFORE a record fails: an undeliverable dead letter
@@ -422,13 +369,7 @@ decoded="$(docker exec "$REGISTRY_CONTAINER" kafka-protobuf-console-consumer \
   --bootstrap-server "$BROKER_FOR_REGISTRY" --topic "$DLQ_TOPIC" --partition "$PARTITION" \
   --offset "${dlq_offset:-0}" --max-messages 1 --timeout-ms 4000 \
   --property schema.registry.url="$REGISTRY_IN_CONTAINER" 2>/dev/null | grep '^{' | head -1)"
-decoded_event_id="$(printf '%s' "$decoded" | python3 -c '
-import json
-import sys
-try:
-    print(json.load(sys.stdin).get("meta", {}).get("eventId", ""))
-except Exception:
-    print("")' 2>/dev/null)"
+decoded_event_id="$(printf '%s' "$decoded" | "$MM" json - meta.eventId 2>/dev/null || true)"
 if [ -n "$decoded_event_id" ] && [ "$decoded_event_id" = "$event_id" ]; then
   ok "the dead-lettered bytes still decode into the same event (eventId $event_id)"
 else

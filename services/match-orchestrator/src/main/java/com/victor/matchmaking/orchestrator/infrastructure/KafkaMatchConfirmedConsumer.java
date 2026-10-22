@@ -17,7 +17,7 @@ import com.victor.matchmaking.events.EventSerialization;
 import com.victor.matchmaking.events.EventTopics;
 import com.victor.matchmaking.orchestrator.application.ConfirmedMatchInbox;
 import com.victor.matchmaking.orchestrator.application.ProcessConfirmedMatch;
-import com.victor.matchmaking.orchestrator.application.RawRecord;
+import com.victor.matchmaking.events.RawRecord;
 import com.victor.matchmaking.orchestrator.application.RetryPolicy;
 
 /**
@@ -66,7 +66,7 @@ public final class KafkaMatchConfirmedConsumer implements AutoCloseable {
         this.consumer = new KafkaConsumer<>(properties(bootstrapServers, consumerGroup));
         this.deadLetters = new KafkaDeadLetterQueue(bootstrapServers, topic);
         this.processing = new ProcessConfirmedMatch(consumerGroup,
-                new MatchConfirmedTranslator(new ProtobufEventReader(schemaRegistryUrl)),
+                new MatchConfirmedTranslator(new ProtobufEventReaderWrapper(schemaRegistryUrl)),
                 inbox, this::commitUpTo, deadLetters, retryPolicy);
     }
 

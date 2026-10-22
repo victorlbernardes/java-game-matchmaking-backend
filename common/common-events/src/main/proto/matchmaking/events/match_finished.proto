@@ -1,0 +1,50 @@
+// Contract of the `matchmaking.events.match-finished` topic - one file per event type,
+// one topic per event type (ADR 0016). The subject in the Schema Registry is
+// `matchmaking.events.match-finished-value` (TopicNameStrategy).
+syntax = "proto3";
+
+package matchmaking.events;
+
+import "matchmaking/common/types.proto";
+
+option java_package = "com.victor.matchmaking.events";
+option java_outer_classname = "MatchFinishedEvent";
+option java_multiple_files = true;
+
+// A match that started has ended, and this is its result.
+//
+// It is the input of the skill recalculation (W24, ADR 0035) and the reason the match
+// history can say when a match ended: the game server is the only process that knows
+// who won, and this is how it tells the rest of the system.
+//
+// The payload carries a skill snapshot (`skill_at_match`) as the matchmaker saw it, not
+// the player's current skill: a consumer that resolves the current value would read a
+// number changed by somebody else's match, and the recalculation would stop being a
+// function of the match it is reacting to.
+message MatchFinished {
+  matchmaking.common.EventMetadata meta = 1;
+  string match_id = 2;
+  matchmaking.common.GameMode game_mode = 3;
+  matchmaking.common.Region region = 4;
+  Winner winner = 5;
+  repeated MatchPlayerResult players = 6;
+}
+
+// The result of the match. A draw is a result, not the absence of one: both teams get
+// half a point, and a consumer that cannot tell a draw from "no result" would have to
+// guess what to do with the rating.
+enum Winner {
+  WINNER_UNSPECIFIED = 0;   // refused by every consumer: a finished match has a result
+  WINNER_TEAM_1 = 1;
+  WINNER_TEAM_2 = 2;
+  WINNER_DRAW = 3;
+}
+
+// One player of the finished match, with the team and the skill the matchmaker used.
+// A recalculation needs both: the team says whether the player won, the skill anchors
+// the rating of a player the skill service has never seen.
+message MatchPlayerResult {
+  string player_id = 1;
+  int32 team = 2;           // 1 or 2 (the domain labels them A/B)
+  int32 skill_at_match = 3;
+}

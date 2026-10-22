@@ -1,0 +1,97 @@
+{
+  "label": "after",
+  "players": 400,
+  "concurrency": 64,
+  "mode": "1v1",
+  "region": "NA",
+  "skill": 61,
+  "logins": {
+    "count": 400,
+    "seconds": 1.3,
+    "per_second": 308.6
+  },
+  "enqueue": {
+    "count": 400,
+    "seconds": 1.51,
+    "per_second": 265.0,
+    "p50_ms": 242.3,
+    "p95_ms": 358.8,
+    "p99_ms": 389.5,
+    "max_ms": 407.1
+  },
+  "drain": {
+    "peak_depth": 190,
+    "seconds": 3.04,
+    "completed": true,
+    "players_per_second": 62.5,
+    "matches_per_second": 31.23,
+    "peak_players_per_second": 89.4,
+    "observed_players_per_second": 89.2,
+    "observed_matches_per_second": 44.13
+  },
+  "wait": {
+    "p50_s": 1.2309563588317758,
+    "p95_s": 1.738439143,
+    "p99_s": 1.7793435934,
+    "queued_players_per_second_effective": 62.5
+  },
+  "matches": {
+    "enqueued_metric": 0.0,
+    "formed": 200.0,
+    "confirmed": 200.0,
+    "dissolved_timeout": 0.0,
+    "confirm_rate": 1.0,
+    "confirmed_by_client": 200,
+    "notifications_received": 800,
+    "pending_notifications_received": 400,
+    "confirmations_sent": 400
+  },
+  "resources": {
+    "engine_cpu_peak": 0.12157153519627806,
+    "system_cpu_peak": 0.9215686274509803,
+    "heap_used_peak_mb": 77.2,
+    "redis_ops_peak": 2480,
+    "redis_memory_mb": 2.2,
+    "postgres_tx_in_run": 834,
+    "postgres_tx_per_second": 66.4
+  },
+  "outbox": {
+    "publish_lag_s": 0.0,
+    "oldest_pending_s": 0.0
+  },
+  "events": {
+    "matches_rows": 200,
+    "events": 200,
+    "distinct_matches": 200,
+    "duplicate_events": 0
+  },
+  "errors": [],
+  "samples": [
+    {
+      "t": 0.4,
+      "depth": 190,
+      "oldest_wait_s": 1.5,
+      "engine_cpu": 0.12157153519627806,
+      "system_cpu": 0.9215686274509803,
+      "heap_mb": 35.181732177734375,
+      "redis_ops": 2480,
+      "formed": 4530.0,
+      "confirmed": 4502.0,
+      "dissolved_timeout": 24.0,
+      "outbox_pending": 0.0
+    },
+    {
+      "t": 2.53,
+      "depth": 0,
+      "oldest_wait_s": 0.0,
+      "engine_cpu": 0.053136631410635744,
+      "system_cpu": 0.7057038834951457,
+      "heap_mb": 77.18173217773438,
+      "redis_ops": 966,
+      "formed": 4624.0,
+      "confirmed": 4600.0,
+      "dissolved_timeout": 24.0,
+      "outbox_pending": 15.0
+    }
+  ]
+}
